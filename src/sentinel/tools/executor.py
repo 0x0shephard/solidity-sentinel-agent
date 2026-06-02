@@ -74,6 +74,7 @@ class ToolExecutor:
             record.status = parsed_output.status
         record.output_hash = _json_hash(parsed_output.model_dump(mode="json"))
         self._record_call(state, record, start_timer)
+        state.setdefault("last_outputs", {})[tool.full_name] = parsed_output.model_dump(mode="json")
         return parsed_output
 
     def _record_call(self, state: AuditState, record: ToolCallRecord, start_timer: float) -> None:
@@ -81,4 +82,3 @@ class ToolExecutor:
         record.latency_ms = int((time.perf_counter() - start_timer) * 1000)
         state["tool_call_count"] = state.get("tool_call_count", 0) + 1
         state.setdefault("tool_ledger", []).append(record)
-

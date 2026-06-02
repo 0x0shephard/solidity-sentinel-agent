@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Literal
@@ -76,7 +77,10 @@ def check_slither_available(inp: RepoPathInput, state) -> CommandToolOutput:
     slither = shutil.which("slither")
     if slither is None:
         return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["slither", "--version"], message="slither is not installed")
-    return _command_output(run_command(["slither", "--version"], cwd=inp.repo_path, timeout=15), ok_message=f"slither found at {slither}")
+    artifact_home = Path(state.get("run_dir", "runs/tmp")) / "artifacts" / "slither-home"
+    artifact_home.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "HOME": str(artifact_home)}
+    return _command_output(run_command(["slither", "--version"], cwd=inp.repo_path, timeout=15, env=env), ok_message=f"slither found at {slither}")
 
 
 def foundry_build(inp: RepoPathInput, state) -> CommandToolOutput:

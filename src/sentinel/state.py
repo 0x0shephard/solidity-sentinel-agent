@@ -35,6 +35,7 @@ class AuditState(TypedDict, total=False):
     findings: list[Finding]
     artifacts: list[ArtifactRef]
     errors: list[str]
+    last_outputs: dict[str, dict]
 
 
 class ResearchState(TypedDict, total=False):
@@ -74,5 +75,5 @@ def initial_audit_state(run_id: str, repo: str, objective: str, run_dir: str) ->
         "findings": [],
         "artifacts": [],
         "errors": [],
+        "last_outputs": {},
     }
-
