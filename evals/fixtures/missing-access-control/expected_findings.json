@@ -1,0 +1,8 @@
+{
+  "id": "missing-access-control-emergency-withdraw",
+  "vulnerability_class": "missing_access_control",
+  "affected_file_contains": "Vault.sol",
+  "affected_function": "emergencyWithdraw",
+  "minimum_severity": "high"
+}
+

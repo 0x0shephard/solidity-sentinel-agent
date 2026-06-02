@@ -143,7 +143,11 @@ def rank_hypotheses(state: AuditState) -> AuditState:
         "research.rank_hypotheses",
         {
             "objective": state["objective"],
-            "static_facts": state.get("static_facts", {}).get("functions", []),
+            "static_facts": [
+                *state.get("static_facts", {}).get("functions", []),
+                *state.get("static_facts", {}).get("external_calls", []),
+                *state.get("static_facts", {}).get("access_control", []),
+            ],
         },
     )
     _run_tool(state, "research.summarize_known_pattern", {"topic": "missing access control"})

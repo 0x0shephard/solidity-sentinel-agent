@@ -27,6 +27,23 @@ class ResearchNoteOutput(BaseModel):
 
 
 def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
+    functions = {fact.get("function"): fact for fact in inp.static_facts if fact.get("function")}
+    external_calls = [fact for fact in inp.static_facts if ".transfer(" in fact.get("text", "") or ".call(" in fact.get("text", "")]
+    access_text = " ".join(fact.get("text", "") for fact in inp.static_facts).lower()
+    for function_name, function_fact in functions.items():
+        suspicious_name = function_name and any(term in function_name.lower() for term in ["emergency", "withdraw", "sweep", "drain"])
+        if suspicious_name and external_calls and "onlyowner" not in access_text and "hasrole" not in access_text:
+            hypothesis = VulnerabilityHypothesis(
+                id="hyp-1",
+                title=f"Missing access control candidate in {function_name}",
+                vulnerability_class="missing_access_control",
+                affected_files=[function_fact.get("file_path", "unknown")],
+                affected_functions=[function_name],
+                evidence_summary=f"{function_name} appears sensitive and the collected facts did not show an authorization guard.",
+                confidence=0.72,
+            )
+            return RankHypothesesOutput(status=ToolStatus.OK, hypotheses=[hypothesis])
+
     hypothesis = VulnerabilityHypothesis(
         id="hyp-1",
         title="Manual review candidate",
@@ -47,4 +64,3 @@ def register(registry) -> None:
         RegisteredTool(namespace="research", name="summarize_known_pattern", description="Summarize a known vulnerability pattern.", input_model=ResearchNoteInput, output_model=ResearchNoteOutput, fn=summarize_known_pattern, side_effects=[SideEffect.NONE]),
     ]:
         registry.register(tool)
-
