@@ -6,9 +6,12 @@ import uuid
 
 from langgraph.graph import END, START, StateGraph
 
-from sentinel.artifacts import ensure_run_dir, write_json
+from sentinel.artifacts import ensure_run_dir, write_json, write_text
 from sentinel.graphs.research import DEFAULT_RESEARCH_TOOLS, run_research_subgraph
 from sentinel.llm.provider import get_planner
+from sentinel.observability.logging import log_event
+from sentinel.observability.tracing import trace_span
+from sentinel.reporting import build_report_document, create_findings_from_state, render_markdown_report
 from sentinel.schemas.common import CompletedStep, PlanStep
 from sentinel.schemas.research import VulnerabilityHypothesis
 from sentinel.state import AuditState, initial_audit_state, initial_research_state
@@ -74,6 +77,7 @@ def plan_with_llm(state: AuditState) -> AuditState:
 
 def initialize_run(state: AuditState) -> AuditState:
     ensure_run_dir(state["run_dir"])
+    log_event(state["run_dir"], run_id=state["run_id"], event="run_started", status="running")
     state["current_focus"] = "inspect_repo"
     state["plan"] = [
         PlanStep(id="inspect_repo", description="Inspect repository files and Solidity contracts"),
@@ -198,8 +202,26 @@ def finish(state: AuditState) -> AuditState:
     repo_path = state["repo_path"]
     _run_tool(state, "repo.list_files", {"repo_path": repo_path, "max_files": 50})
     _run_tool(state, "static.extract_functions", {"repo_path": repo_path})
-    write_json(Path(state["run_dir"]) / "state.json", state)
+    state["findings"] = create_findings_from_state(state)
+    report = build_report_document(state)
+    write_json(Path(state["run_dir"]) / "report.json", report.model_dump(mode="json"))
+    write_text(Path(state["run_dir"]) / "report.md", render_markdown_report(report))
+    log_event(
+        state["run_dir"],
+        run_id=state["run_id"],
+        event="report_generated",
+        status="ok",
+        finding_count=len(state["findings"]),
+    )
     state["current_focus"] = "done"
+    write_json(Path(state["run_dir"]) / "state.json", state)
+    log_event(
+        state["run_dir"],
+        run_id=state["run_id"],
+        event="run_finished",
+        status="completed",
+        tool_call_count=state.get("tool_call_count", 0),
+    )
     return state
 
 
@@ -232,5 +254,7 @@ def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bo
     actual_run_id = run_id or make_run_id()
     run_dir = str(Path("runs") / actual_run_id)
     state = initial_audit_state(run_id=actual_run_id, repo=repo, objective=objective, run_dir=run_dir)
-    result = build_parent_graph(use_llm_planner=not mock_llm).invoke(state)
+    ensure_run_dir(run_dir)
+    with trace_span("audit.run", run_dir, run_id=actual_run_id, repo=repo, mock_llm=mock_llm):
+        result = build_parent_graph(use_llm_planner=not mock_llm).invoke(state)
     return result

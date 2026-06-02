@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from sentinel.graphs.parent import build_parent_graph, run_audit
 from sentinel.state import initial_audit_state
@@ -41,6 +42,11 @@ def test_parent_graph_compiles_and_finishes(tmp_path):
     assert result["subgraph_results"]
     assert result["subgraph_results"][0].hypothesis_id == "hyp-1"
     assert (run_dir / "state.json").exists()
+    assert (run_dir / "report.json").exists()
+    assert (run_dir / "report.md").exists()
+    assert (run_dir / "tool_ledger.jsonl").exists()
+    assert (run_dir / "logs.jsonl").exists()
+    assert (run_dir / "trace.jsonl").exists()
 
 
 def test_run_audit_parent_graph_returns_state(tmp_path, monkeypatch):
@@ -54,4 +60,8 @@ def test_run_audit_parent_graph_returns_state(tmp_path, monkeypatch):
     assert result["current_focus"] == "done"
     assert result["tool_call_count"] >= 20
     assert result["subgraph_results"]
+    assert result["findings"]
     assert Path("runs/fixed-run/state.json").exists()
+    report = json.loads(Path("runs/fixed-run/report.json").read_text(encoding="utf-8"))
+    assert report["run_id"] == "fixed-run"
+    assert report["tool_call_count"] >= 20
