@@ -2,10 +2,13 @@ import typer
 
 from sentinel.evals.runner import FIXTURES, run_all, run_fixture, write_eval_summary
 from sentinel.graphs.parent import run_audit
+from sentinel.tools import build_default_registry
 
 app = typer.Typer(help="Solidity Sentinel CLI")
 eval_app = typer.Typer(help="Run fixture evaluations")
+tools_app = typer.Typer(help="Inspect registered tools")
 app.add_typer(eval_app, name="eval")
+app.add_typer(tools_app, name="tools")
 
 
 @app.callback()
@@ -28,6 +31,29 @@ def audit(
     typer.echo(f"Current focus: {state['current_focus']}")
     typer.echo(f"State: {state['run_dir']}/state.json")
     typer.echo(f"Report: {state['run_dir']}/report.md")
+
+
+@tools_app.command("list")
+def tools_list(json_output: bool = typer.Option(False, "--json", help="Emit JSON metadata.")) -> None:
+    """List registered Sentinel tools."""
+
+    import json
+
+    tools = [tool.public_dict() for tool in build_default_registry().list()]
+    if json_output:
+        typer.echo(json.dumps(tools, indent=2))
+        return
+    for tool in tools:
+        typer.echo(f"{tool['name']}: {tool['description']}")
+
+
+@tools_app.command("show")
+def tools_show(tool_name: str) -> None:
+    """Show metadata for one registered tool."""
+
+    import json
+
+    typer.echo(json.dumps(build_default_registry().get(tool_name).public_dict(), indent=2))
 
 
 @eval_app.callback(invoke_without_command=True)

@@ -71,11 +71,67 @@ def find_access_control_terms(inp: RepoPathInput, state) -> StaticFactsOutput:
     return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
 
 
+def extract_inheritance(inp: RepoPathInput, state) -> StaticFactsOutput:
+    facts = []
+    for path in _solidity_files(inp.repo_path):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in re.finditer(r"\bcontract\s+(\w+)\s+is\s+([^{]+)", text):
+            facts.append({"file_path": str(path.relative_to(inp.repo_path)), "contract": match.group(1), "inherits": [item.strip() for item in match.group(2).split(",")]})
+    return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
+
+
+def extract_modifiers(inp: RepoPathInput, state) -> StaticFactsOutput:
+    facts = []
+    for path in _solidity_files(inp.repo_path):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in re.finditer(r"\bmodifier\s+(\w+)", text):
+            facts.append({"file_path": str(path.relative_to(inp.repo_path)), "modifier": match.group(1)})
+    return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
+
+
 def extract_external_calls(inp: RepoPathInput, state) -> StaticFactsOutput:
     facts = []
     for path in _solidity_files(inp.repo_path):
         for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
             if any(term in line for term in [".call(", ".delegatecall(", ".transfer(", ".send("]):
+                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "text": line.strip()})
+    return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
+
+
+def extract_delegatecalls(inp: RepoPathInput, state) -> StaticFactsOutput:
+    facts = []
+    for path in _solidity_files(inp.repo_path):
+        for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+            if ".delegatecall(" in line:
+                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "text": line.strip()})
+    return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
+
+
+def extract_token_transfers(inp: RepoPathInput, state) -> StaticFactsOutput:
+    facts = []
+    for path in _solidity_files(inp.repo_path):
+        for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+            if ".transfer(" in line or ".transferFrom(" in line:
+                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "text": line.strip()})
+    return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
+
+
+def extract_storage_writes(inp: RepoPathInput, state) -> StaticFactsOutput:
+    facts = []
+    assignment = re.compile(r"(?<![=!<>])=(?!=)|\+=|-=")
+    for path in _solidity_files(inp.repo_path):
+        for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+            stripped = line.strip()
+            if assignment.search(stripped) and not stripped.startswith(("require", "assert", "if ", "for ")):
+                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "text": stripped})
+    return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
+
+
+def find_oracle_patterns(inp: RepoPathInput, state) -> StaticFactsOutput:
+    facts = []
+    for path in _solidity_files(inp.repo_path):
+        for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+            if any(term in line.lower() for term in ["oracle", "latestanswer", "latestrounddata", "getprice", "price"]):
                 facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "text": line.strip()})
     return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
 
@@ -137,9 +193,15 @@ def parse_slither(inp: ParseSlitherInput, state) -> ParseSlitherOutput:
 def register(registry) -> None:
     for tool in [
         RegisteredTool(namespace="static", name="extract_contracts", description="Extract Solidity contract declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_contracts, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="extract_inheritance", description="Extract Solidity inheritance declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_inheritance, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_functions", description="Extract Solidity function declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_functions, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="extract_modifiers", description="Extract Solidity modifier declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_modifiers, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="find_access_control_terms", description="Find access-control related source terms.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=find_access_control_terms, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_external_calls", description="Extract low-level/external call sites.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_external_calls, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="extract_delegatecalls", description="Extract delegatecall sites.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_delegatecalls, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="extract_token_transfers", description="Extract token transfer patterns.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_token_transfers, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="extract_storage_writes", description="Extract likely storage write lines.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_storage_writes, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="find_oracle_patterns", description="Find oracle and price-read patterns.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=find_oracle_patterns, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="run_slither", description="Run Slither and write JSON artifact.", input_model=RepoPathInput, output_model=RunSlitherOutput, fn=run_slither, side_effects=[SideEffect.EXECUTE_LOCAL]),
         RegisteredTool(namespace="static", name="parse_slither", description="Parse Slither JSON artifact into typed findings.", input_model=ParseSlitherInput, output_model=ParseSlitherOutput, fn=parse_slither, side_effects=[SideEffect.READ_FILES]),
     ]:

@@ -5,12 +5,12 @@ from sentinel.tools import build_default_registry
 from sentinel.tools.registry import ToolRegistry
 
 
-def test_default_registry_has_initial_tools_across_four_namespaces():
+def test_default_registry_has_sixty_plus_tools_across_seven_namespaces():
     registry = build_default_registry()
     namespaces = {tool.namespace for tool in registry.list()}
 
-    assert len(registry) >= 18
-    assert namespaces == {"repo", "build", "static", "research"}
+    assert len(registry) >= 60
+    assert namespaces == {"repo", "build", "static", "research", "dynamic", "report", "memory"}
 
 
 def test_registry_lookup_and_namespace_filtering():

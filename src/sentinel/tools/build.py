@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import shutil as shutil_module
 from pathlib import Path
 from typing import Literal
 
@@ -33,6 +34,10 @@ class CommandToolOutput(BaseModel):
     stderr: str = ""
     timed_out: bool = False
     message: str | None = None
+
+
+class FoundryTestMatchInput(RepoPathInput):
+    match: str
 
 
 def _command_output(result: CommandResult, ok_message: str | None = None) -> CommandToolOutput:
@@ -95,13 +100,68 @@ def foundry_test(inp: RepoPathInput, state) -> CommandToolOutput:
     return _command_output(run_command(["forge", "test"], cwd=inp.repo_path, timeout=120))
 
 
+def install_dependencies(inp: RepoPathInput, state) -> BuildToolOutput:
+    root = Path(inp.repo_path)
+    if (root / "package-lock.json").exists() and shutil.which("npm"):
+        result = run_command(["npm", "ci"], cwd=inp.repo_path, timeout=300)
+        return BuildToolOutput(status=ToolStatus.OK if result.return_code == 0 else ToolStatus.ERROR, data=result.model_dump(mode="json"))
+    if (root / "package.json").exists() and shutil.which("npm"):
+        result = run_command(["npm", "install"], cwd=inp.repo_path, timeout=300)
+        return BuildToolOutput(status=ToolStatus.OK if result.return_code == 0 else ToolStatus.ERROR, data=result.model_dump(mode="json"))
+    if (root / "foundry.toml").exists() and shutil.which("forge"):
+        result = run_command(["forge", "install"], cwd=inp.repo_path, timeout=300)
+        return BuildToolOutput(status=ToolStatus.OK if result.return_code == 0 else ToolStatus.ERROR, data=result.model_dump(mode="json"))
+    return BuildToolOutput(status=ToolStatus.UNAVAILABLE, message="No supported dependency install command was available.")
+
+
+def foundry_test_match(inp: FoundryTestMatchInput, state) -> CommandToolOutput:
+    if shutil.which("forge") is None:
+        return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["forge", "test", "--match-test", inp.match], message="forge is not installed")
+    return _command_output(run_command(["forge", "test", "--match-test", inp.match], cwd=inp.repo_path, timeout=120))
+
+
+def foundry_coverage(inp: RepoPathInput, state) -> CommandToolOutput:
+    if shutil.which("forge") is None:
+        return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["forge", "coverage"], message="forge is not installed")
+    return _command_output(run_command(["forge", "coverage"], cwd=inp.repo_path, timeout=120))
+
+
+def hardhat_compile(inp: RepoPathInput, state) -> CommandToolOutput:
+    if shutil.which("npx") is None:
+        return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["npx", "hardhat", "compile"], message="npx is not installed")
+    return _command_output(run_command(["npx", "hardhat", "compile"], cwd=inp.repo_path, timeout=120))
+
+
+def hardhat_test(inp: RepoPathInput, state) -> CommandToolOutput:
+    if shutil.which("npx") is None:
+        return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["npx", "hardhat", "test"], message="npx is not installed")
+    return _command_output(run_command(["npx", "hardhat", "test"], cwd=inp.repo_path, timeout=120))
+
+
+def clean(inp: RepoPathInput, state) -> BuildToolOutput:
+    root = Path(inp.repo_path)
+    removed = []
+    for name in ["out", "cache", "artifacts", "coverage"]:
+        target = root / name
+        if target.exists() and target.is_dir():
+            shutil_module.rmtree(target)
+            removed.append(name)
+    return BuildToolOutput(status=ToolStatus.OK, data={"removed": removed})
+
+
 def register(registry) -> None:
     for tool in [
         RegisteredTool(namespace="build", name="detect_framework", description="Detect Solidity project framework.", input_model=RepoPathInput, output_model=DetectFrameworkOutput, fn=detect_framework, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="build", name="detect_solc", description="Detect Solidity pragma versions.", input_model=RepoPathInput, output_model=BuildToolOutput, fn=detect_solc, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="build", name="install_dependencies", description="Install project dependencies when explicitly enabled.", input_model=RepoPathInput, output_model=BuildToolOutput, fn=install_dependencies, side_effects=[SideEffect.EXECUTE_LOCAL]),
         RegisteredTool(namespace="build", name="check_foundry_available", description="Check Foundry availability.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=check_foundry_available, side_effects=[SideEffect.EXECUTE_LOCAL]),
         RegisteredTool(namespace="build", name="check_slither_available", description="Check Slither availability.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=check_slither_available, side_effects=[SideEffect.EXECUTE_LOCAL]),
         RegisteredTool(namespace="build", name="foundry_build", description="Run forge build in a Foundry repository.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=foundry_build, side_effects=[SideEffect.EXECUTE_LOCAL]),
         RegisteredTool(namespace="build", name="foundry_test", description="Run forge test in a Foundry repository.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=foundry_test, side_effects=[SideEffect.EXECUTE_LOCAL]),
+        RegisteredTool(namespace="build", name="foundry_test_match", description="Run forge test for a named test.", input_model=FoundryTestMatchInput, output_model=CommandToolOutput, fn=foundry_test_match, side_effects=[SideEffect.EXECUTE_LOCAL]),
+        RegisteredTool(namespace="build", name="foundry_coverage", description="Run forge coverage.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=foundry_coverage, side_effects=[SideEffect.EXECUTE_LOCAL]),
+        RegisteredTool(namespace="build", name="hardhat_compile", description="Run hardhat compile.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=hardhat_compile, side_effects=[SideEffect.EXECUTE_LOCAL]),
+        RegisteredTool(namespace="build", name="hardhat_test", description="Run hardhat test.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=hardhat_test, side_effects=[SideEffect.EXECUTE_LOCAL]),
+        RegisteredTool(namespace="build", name="clean", description="Clean build artifacts when explicitly enabled.", input_model=RepoPathInput, output_model=BuildToolOutput, fn=clean, side_effects=[SideEffect.WRITE_FILES]),
     ]:
         registry.register(tool)
