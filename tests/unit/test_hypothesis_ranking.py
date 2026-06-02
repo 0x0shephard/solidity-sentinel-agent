@@ -20,6 +20,32 @@ def test_rank_hypotheses_detects_reentrancy_from_call_before_state_write():
     assert output.hypotheses[0].affected_functions == ["withdraw"]
 
 
+def test_rank_hypotheses_uses_slither_detector_when_available():
+    output = rank_hypotheses(
+        RankHypothesesInput(
+            objective="Find reentrancy bugs",
+            static_facts=[
+                {"file_path": "src/ReentrantVault.sol", "function": "withdraw"},
+                {
+                    "check": "reentrancy-eth",
+                    "impact": "High",
+                    "confidence": "Medium",
+                    "description": "Reentrancy in ReentrantVault.withdraw()",
+                    "source_files": ["src/ReentrantVault.sol"],
+                    "functions": ["withdraw"],
+                    "elements": [],
+                },
+            ],
+        ),
+        {},
+    )
+
+    assert output.status == ToolStatus.OK
+    assert output.hypotheses[0].vulnerability_class == "reentrancy"
+    assert output.hypotheses[0].affected_files == ["src/ReentrantVault.sol"]
+    assert output.hypotheses[0].confidence > 0.7
+
+
 def test_rank_hypotheses_detects_unchecked_token_transfer():
     output = rank_hypotheses(
         RankHypothesesInput(

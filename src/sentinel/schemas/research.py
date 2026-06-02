@@ -11,6 +11,8 @@ class SlitherFinding(BaseModel):
     confidence: str | None = None
     description: str
     elements: list[dict] = Field(default_factory=list)
+    source_files: list[str] = Field(default_factory=list)
+    functions: list[str] = Field(default_factory=list)
 
 
 class VulnerabilityHypothesis(BaseModel):
@@ -36,4 +38,3 @@ class ResearchSubgraphResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     limitations: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
-

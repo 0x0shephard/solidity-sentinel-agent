@@ -75,7 +75,13 @@ def test_parse_slither_json(tmp_path):
                             "impact": "High",
                             "confidence": "Medium",
                             "description": "Possible reentrancy",
-                            "elements": [{"name": "withdraw"}],
+                            "elements": [
+                                {
+                                    "name": "withdraw",
+                                    "type": "function",
+                                    "source_mapping": {"filename_relative": "src/Vault.sol"},
+                                }
+                            ],
                         }
                     ]
                 },
@@ -89,4 +95,5 @@ def test_parse_slither_json(tmp_path):
     assert output.status == ToolStatus.OK
     assert output.finding_count == 1
     assert output.findings[0].check == "reentrancy-eth"
-
+    assert output.findings[0].source_files == ["src/Vault.sol"]
+    assert output.findings[0].functions == ["withdraw"]

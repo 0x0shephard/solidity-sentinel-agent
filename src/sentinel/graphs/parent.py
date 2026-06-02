@@ -125,6 +125,9 @@ def run_static_analysis(state: AuditState) -> AuditState:
     _run_tool(state, "static.extract_external_calls", {"repo_path": repo_path})
     _run_tool(state, "static.extract_token_transfers", {"repo_path": repo_path})
     _run_tool(state, "static.extract_storage_writes", {"repo_path": repo_path})
+    slither_output = _run_tool(state, "static.run_slither", {"repo_path": repo_path})
+    if getattr(slither_output, "raw_json_path", None):
+        _run_tool(state, "static.parse_slither", {"raw_json_path": slither_output.raw_json_path})
     _run_tool(state, "repo.search_text", {"repo_path": repo_path, "query": "owner"})
     _run_tool(state, "repo.search_text", {"repo_path": repo_path, "query": "transfer"})
     _run_tool(state, "repo.search_text", {"repo_path": repo_path, "query": "call("})
@@ -136,6 +139,7 @@ def run_static_analysis(state: AuditState) -> AuditState:
         "external_calls": state["last_outputs"].get("static.extract_external_calls", {}).get("facts", []),
         "token_transfers": state["last_outputs"].get("static.extract_token_transfers", {}).get("facts", []),
         "storage_writes": state["last_outputs"].get("static.extract_storage_writes", {}).get("facts", []),
+        "slither_findings": state["last_outputs"].get("static.parse_slither", {}).get("findings", []),
     }
     state["current_focus"] = "rank_hypotheses"
     return state
@@ -152,6 +156,7 @@ def rank_hypotheses(state: AuditState) -> AuditState:
                 *state.get("static_facts", {}).get("external_calls", []),
                 *state.get("static_facts", {}).get("token_transfers", []),
                 *state.get("static_facts", {}).get("storage_writes", []),
+                *state.get("static_facts", {}).get("slither_findings", []),
                 *state.get("static_facts", {}).get("access_control", []),
             ],
         },

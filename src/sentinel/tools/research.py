@@ -37,6 +37,20 @@ class ResearchGenericOutput(BaseModel):
 
 
 SENSITIVE_FUNCTION_TERMS = ("emergency", "withdraw", "sweep", "drain", "claim", "redeem", "pay", "send")
+SLITHER_CLASS_MAP = {
+    "reentrancy": "reentrancy",
+    "reentrancy-benign": "reentrancy",
+    "reentrancy-eth": "reentrancy",
+    "reentrancy-no-eth": "reentrancy",
+    "reentrancy-unlimited-gas": "reentrancy",
+    "unchecked-lowlevel": "unchecked_transfer",
+    "unchecked-send": "unchecked_transfer",
+    "unchecked-transfer": "unchecked_transfer",
+    "arbitrary-send": "missing_access_control",
+    "arbitrary-send-erc20": "missing_access_control",
+    "arbitrary-send-erc20-permit": "missing_access_control",
+    "suicidal": "missing_access_control",
+}
 
 
 def _facts_with_key(facts: list[dict], key: str) -> list[dict]:
@@ -74,6 +88,60 @@ def _is_unchecked_token_transfer(fact: dict) -> bool:
     if compact.startswith("to.transfer(") or "address(this).balance" in compact:
         return False
     return True
+
+
+def _slither_confidence_score(finding: dict) -> float:
+    impact = str(finding.get("impact") or "").lower()
+    confidence = str(finding.get("confidence") or "").lower()
+    score = 0.6
+    if impact == "high":
+        score += 0.15
+    elif impact == "medium":
+        score += 0.08
+    if confidence == "high":
+        score += 0.1
+    elif confidence == "medium":
+        score += 0.05
+    return min(score, 0.9)
+
+
+def _class_from_slither_check(check: str) -> str | None:
+    normalized = check.lower()
+    if normalized in SLITHER_CLASS_MAP:
+        return SLITHER_CLASS_MAP[normalized]
+    for prefix, vulnerability_class in SLITHER_CLASS_MAP.items():
+        if normalized.startswith(prefix):
+            return vulnerability_class
+    return None
+
+
+def _detect_slither_finding(functions: list[dict], slither_findings: list[dict]) -> VulnerabilityHypothesis | None:
+    for finding in slither_findings:
+        check = str(finding.get("check", "unknown"))
+        vulnerability_class = _class_from_slither_check(check)
+        if not vulnerability_class:
+            continue
+
+        source_files = [str(file_path) for file_path in finding.get("source_files", [])]
+        affected_functions = [str(function) for function in finding.get("functions", [])]
+        if not affected_functions and source_files:
+            function_fact = _sensitive_function_for_file(functions, source_files[0])
+            if function_fact:
+                affected_functions = [str(function_fact.get("function"))]
+        if not affected_functions:
+            affected_functions = ["unknown"]
+
+        title_class = vulnerability_class.replace("_", " ")
+        return VulnerabilityHypothesis(
+            id="hyp-1",
+            title=f"Slither {title_class} candidate: {check}",
+            vulnerability_class=vulnerability_class,
+            affected_files=source_files,
+            affected_functions=affected_functions,
+            evidence_summary=f"Slither detector {check} reported: {finding.get('description', '').strip()}",
+            confidence=_slither_confidence_score(finding),
+        )
+    return None
 
 
 def _detect_reentrancy(functions: list[dict], external_calls: list[dict], storage_writes: list[dict]) -> VulnerabilityHypothesis | None:
@@ -157,6 +225,7 @@ def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
     external_calls = _facts_containing(inp.static_facts, (".transfer(", ".call(", ".call{", ".send(", ".delegatecall(", ".delegatecall{"))
     token_transfers = _facts_containing(inp.static_facts, (".transfer(", ".transferFrom("))
     storage_writes = [fact for fact in inp.static_facts if "line" in fact and ("=" in fact.get("text", "") or "+=" in fact.get("text", "") or "-=" in fact.get("text", ""))]
+    slither_findings = _facts_with_key(inp.static_facts, "check")
     access_facts = [
         fact
         for fact in inp.static_facts
@@ -164,6 +233,7 @@ def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
     ]
 
     for detector in [
+        lambda: _detect_slither_finding(functions, slither_findings),
         lambda: _detect_reentrancy(functions, external_calls, storage_writes),
         lambda: _detect_unchecked_transfer(functions, token_transfers),
         lambda: _detect_missing_access_control(functions, external_calls, access_facts),

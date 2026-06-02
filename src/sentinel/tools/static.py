@@ -42,6 +42,40 @@ class ParseSlitherOutput(BaseModel):
     message: str | None = None
 
 
+def _normalize_slither_path(filename: str | None) -> str | None:
+    if not filename:
+        return None
+    path = Path(filename)
+    parts = path.parts
+    if "src" in parts:
+        return str(Path(*parts[parts.index("src") :]))
+    if "contracts" in parts:
+        return str(Path(*parts[parts.index("contracts") :]))
+    return path.name
+
+
+def _extract_slither_locations(elements: list[dict]) -> tuple[list[str], list[str]]:
+    files: list[str] = []
+    functions: list[str] = []
+    for element in elements:
+        source_mapping = element.get("source_mapping") or {}
+        filename = _normalize_slither_path(source_mapping.get("filename_relative") or source_mapping.get("filename_absolute"))
+        if filename and filename not in files:
+            files.append(filename)
+
+        element_type = str(element.get("type", "")).lower()
+        name = element.get("name")
+        if name and "function" in element_type and str(name) not in functions:
+            functions.append(str(name).split("(")[0])
+
+        parent = element.get("parent") or {}
+        parent_type = str(parent.get("type", "")).lower()
+        parent_name = parent.get("name")
+        if parent_name and "function" in parent_type and str(parent_name) not in functions:
+            functions.append(str(parent_name).split("(")[0])
+    return files, functions
+
+
 def _solidity_files(repo_path: str) -> list[Path]:
     return [path for path in Path(repo_path).rglob("*.sol") if path.is_file() and "out" not in path.parts and "cache" not in path.parts]
 
@@ -178,6 +212,7 @@ def parse_slither(inp: ParseSlitherInput, state) -> ParseSlitherOutput:
 
     findings = []
     for detector in data.get("results", {}).get("detectors", []):
+        source_files, functions = _extract_slither_locations(detector.get("elements", []))
         findings.append(
             SlitherFinding(
                 check=detector.get("check", "unknown"),
@@ -185,6 +220,8 @@ def parse_slither(inp: ParseSlitherInput, state) -> ParseSlitherOutput:
                 confidence=detector.get("confidence"),
                 description=detector.get("description", ""),
                 elements=detector.get("elements", []),
+                source_files=source_files,
+                functions=functions,
             )
         )
     return ParseSlitherOutput(status=ToolStatus.OK, findings=findings, finding_count=len(findings))
