@@ -9,7 +9,7 @@ def test_default_registry_has_initial_tools_across_four_namespaces():
     registry = build_default_registry()
     namespaces = {tool.namespace for tool in registry.list()}
 
-    assert len(registry) >= 12
+    assert len(registry) >= 18
     assert namespaces == {"repo", "build", "static", "research"}
 
 
@@ -38,4 +38,3 @@ def test_scoped_registry_contains_only_allowed_tools():
     scoped = build_default_registry().scoped(["repo.list_files", "research.rank_hypotheses"])
 
     assert [tool.full_name for tool in scoped.list()] == ["repo.list_files", "research.rank_hypotheses"]
-
