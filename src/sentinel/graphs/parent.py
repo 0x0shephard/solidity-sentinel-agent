@@ -7,6 +7,7 @@ import uuid
 from langgraph.graph import END, START, StateGraph
 
 from sentinel.artifacts import ensure_run_dir, write_json
+from sentinel.llm.provider import get_planner
 from sentinel.schemas.common import CompletedStep, PlanStep
 from sentinel.state import AuditState, initial_audit_state
 from sentinel.tools import build_default_registry
@@ -29,6 +30,44 @@ def _run_tool(state: AuditState, tool_name: str, raw_input: dict):
     output = _executor().execute(tool_name, raw_input, state)
     _record_step(state, tool_name, f"{tool_name} returned {getattr(output, 'status', 'ok')}")
     return output
+
+
+def _tool_prompt(state: AuditState) -> str:
+    return (
+        f"Objective: {state['objective']}\n"
+        f"Repository path: {state['repo_path']}\n"
+        f"Current focus: {state.get('current_focus', 'initialize')}\n"
+        f"Compressed context: {state.get('compressed_context', '')}\n\n"
+        "Return a concise plan for the next safe audit tools to run. "
+        "Prefer repo/build/static/research tools. Include repo_path in inputs when needed."
+    )
+
+
+def plan_with_llm(state: AuditState) -> AuditState:
+    registry = build_default_registry()
+    planner = get_planner(mock=False)
+    plan = planner.plan(_tool_prompt(state), [tool.public_dict() for tool in registry.list()])
+    valid_names = {tool.full_name for tool in registry.list()}
+    executed = []
+    executor = ToolExecutor(registry)
+    for decision in plan.decisions[:8]:
+        if decision.tool_name not in valid_names:
+            state.setdefault("errors", []).append(f"LLM selected unknown tool: {decision.tool_name}")
+            continue
+        tool = registry.get(decision.tool_name)
+        tool_input = dict(decision.tool_input)
+        if "repo_path" in tool.input_model.model_fields and "repo_path" not in tool_input:
+            tool_input["repo_path"] = state["repo_path"]
+        required = {name for name, field in tool.input_model.model_fields.items() if field.is_required()}
+        if not required.issubset(tool_input):
+            state.setdefault("errors", []).append(f"LLM omitted required input for {decision.tool_name}")
+            continue
+        output = executor.execute(decision.tool_name, tool_input, state)
+        _record_step(state, decision.tool_name, f"{decision.tool_name} selected by LLM: {decision.rationale}")
+        executed.append({"tool_name": decision.tool_name, "status": getattr(output, "status", "ok")})
+    state["last_outputs"]["llm.plan_with_llm"] = {"executed": executed}
+    state["current_focus"] = "inspect_repo"
+    return state
 
 
 def initialize_run(state: AuditState) -> AuditState:
@@ -133,9 +172,10 @@ def finish(state: AuditState) -> AuditState:
     return state
 
 
-def build_parent_graph():
+def build_parent_graph(use_llm_planner: bool = False):
     graph = StateGraph(AuditState)
     graph.add_node("initialize_run", initialize_run)
+    graph.add_node("plan_with_llm", plan_with_llm)
     graph.add_node("inspect_repo", inspect_repo)
     graph.add_node("detect_framework", detect_framework)
     graph.add_node("run_static_analysis", run_static_analysis)
@@ -144,7 +184,8 @@ def build_parent_graph():
     graph.add_node("finish", finish)
 
     graph.add_edge(START, "initialize_run")
-    graph.add_edge("initialize_run", "inspect_repo")
+    graph.add_edge("initialize_run", "plan_with_llm" if use_llm_planner else "inspect_repo")
+    graph.add_edge("plan_with_llm", "inspect_repo")
     graph.add_edge("inspect_repo", "detect_framework")
     graph.add_edge("detect_framework", "run_static_analysis")
     graph.add_edge("run_static_analysis", "rank_hypotheses")
@@ -154,10 +195,9 @@ def build_parent_graph():
     return graph.compile()
 
 
-def run_audit(repo: str, objective: str, run_id: str | None = None) -> AuditState:
+def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bool = True) -> AuditState:
     actual_run_id = run_id or make_run_id()
     run_dir = str(Path("runs") / actual_run_id)
     state = initial_audit_state(run_id=actual_run_id, repo=repo, objective=objective, run_dir=run_dir)
-    result = build_parent_graph().invoke(state)
+    result = build_parent_graph(use_llm_planner=not mock_llm).invoke(state)
     return result
-

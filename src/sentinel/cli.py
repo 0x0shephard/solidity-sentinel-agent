@@ -18,7 +18,7 @@ def audit(
 ) -> None:
     """Run the parent LangGraph audit path."""
 
-    state = run_audit(repo=repo, objective=objective)
+    state = run_audit(repo=repo, objective=objective, mock_llm=mock_llm)
     typer.echo(f"Run ID: {state['run_id']}")
     typer.echo("Status: completed")
     typer.echo(f"Tool calls: {state['tool_call_count']}")
