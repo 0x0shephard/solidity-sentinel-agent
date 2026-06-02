@@ -7,9 +7,11 @@ import uuid
 from langgraph.graph import END, START, StateGraph
 
 from sentinel.artifacts import ensure_run_dir, write_json
+from sentinel.graphs.research import DEFAULT_RESEARCH_TOOLS, run_research_subgraph
 from sentinel.llm.provider import get_planner
 from sentinel.schemas.common import CompletedStep, PlanStep
-from sentinel.state import AuditState, initial_audit_state
+from sentinel.schemas.research import VulnerabilityHypothesis
+from sentinel.state import AuditState, initial_audit_state, initial_research_state
 from sentinel.tools import build_default_registry
 from sentinel.tools.executor import ToolExecutor
 
@@ -143,8 +145,37 @@ def rank_hypotheses(state: AuditState) -> AuditState:
     _run_tool(state, "research.summarize_known_pattern", {"topic": "missing access control"})
     _run_tool(state, "research.summarize_known_pattern", {"topic": "reentrancy"})
     state["hypotheses"] = [
-        hypothesis for hypothesis in state["last_outputs"].get("research.rank_hypotheses", {}).get("hypotheses", [])
+        VulnerabilityHypothesis.model_validate(hypothesis)
+        for hypothesis in state["last_outputs"].get("research.rank_hypotheses", {}).get("hypotheses", [])
     ]
+    state["current_focus"] = "research_subgraph"
+    return state
+
+
+def research_subgraph(state: AuditState) -> AuditState:
+    hypotheses = state.get("hypotheses", [])
+    if not hypotheses:
+        state.setdefault("errors", []).append("No hypothesis available for research subgraph.")
+        state["current_focus"] = "summarize_context"
+        return state
+
+    hypothesis = hypotheses[0]
+    selected_snippets = [
+        *state.get("static_facts", {}).get("functions", [])[:3],
+        *state.get("static_facts", {}).get("external_calls", [])[:3],
+    ]
+    subgraph_state = initial_research_state(
+        subgraph_run_id=f"{state['run_id']}-research-1",
+        parent_run_id=state["run_id"],
+        objective=state["objective"],
+        hypothesis=hypothesis,
+        selected_snippets=selected_snippets,
+        allowed_tool_names=DEFAULT_RESEARCH_TOOLS,
+    )
+    result = run_research_subgraph(subgraph_state)
+    state.setdefault("subgraph_results", []).append(result)
+    state["last_outputs"]["research.subgraph"] = result.model_dump(mode="json")
+    _record_step(state, "research.subgraph", f"Research subgraph returned {result.status}")
     state["current_focus"] = "summarize_context"
     return state
 
@@ -180,6 +211,7 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_node("detect_framework", detect_framework)
     graph.add_node("run_static_analysis", run_static_analysis)
     graph.add_node("rank_hypotheses", rank_hypotheses)
+    graph.add_node("research_subgraph", research_subgraph)
     graph.add_node("summarize_context", summarize_context)
     graph.add_node("finish", finish)
 
@@ -189,7 +221,8 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_edge("inspect_repo", "detect_framework")
     graph.add_edge("detect_framework", "run_static_analysis")
     graph.add_edge("run_static_analysis", "rank_hypotheses")
-    graph.add_edge("rank_hypotheses", "summarize_context")
+    graph.add_edge("rank_hypotheses", "research_subgraph")
+    graph.add_edge("research_subgraph", "summarize_context")
     graph.add_edge("summarize_context", "finish")
     graph.add_edge("finish", END)
     return graph.compile()

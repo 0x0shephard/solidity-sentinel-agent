@@ -38,6 +38,8 @@ def test_parent_graph_compiles_and_finishes(tmp_path):
     assert result["current_focus"] == "done"
     assert result["tool_call_count"] >= 20
     assert result["compressed_context"]
+    assert result["subgraph_results"]
+    assert result["subgraph_results"][0].hypothesis_id == "hyp-1"
     assert (run_dir / "state.json").exists()
 
 
@@ -51,5 +53,5 @@ def test_run_audit_parent_graph_returns_state(tmp_path, monkeypatch):
     assert result["run_id"] == "fixed-run"
     assert result["current_focus"] == "done"
     assert result["tool_call_count"] >= 20
+    assert result["subgraph_results"]
     assert Path("runs/fixed-run/state.json").exists()
-

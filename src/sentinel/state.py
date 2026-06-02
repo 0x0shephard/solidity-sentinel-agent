@@ -77,3 +77,29 @@ def initial_audit_state(run_id: str, repo: str, objective: str, run_dir: str) ->
         "errors": [],
         "last_outputs": {},
     }
+
+
+def initial_research_state(
+    subgraph_run_id: str,
+    parent_run_id: str,
+    objective: str,
+    hypothesis: VulnerabilityHypothesis,
+    selected_snippets: list[dict],
+    allowed_tool_names: list[str],
+) -> ResearchState:
+    """Create isolated state for the research subgraph.
+
+    Notice what is absent: repo path, parent tool ledger, parent artifacts,
+    parent static facts, and parent errors. The subgraph receives only scoped
+    research context.
+    """
+
+    return {
+        "subgraph_run_id": subgraph_run_id,
+        "parent_run_id": parent_run_id,
+        "objective": objective,
+        "hypothesis": hypothesis,
+        "selected_snippets": selected_snippets,
+        "allowed_tool_names": allowed_tool_names,
+        "notes": [],
+    }
