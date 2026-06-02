@@ -1,0 +1,5 @@
+{
+  "vulnerability_class": "unchecked_transfer",
+  "affected_file_contains": "UnsafeTokenVault.sol",
+  "affected_function": "withdraw"
+}

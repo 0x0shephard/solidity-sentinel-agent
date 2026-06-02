@@ -13,7 +13,12 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
 
     hypothesis = hypotheses[0]
     research = subgraph_results[0] if subgraph_results else None
-    severity = "high" if hypothesis.vulnerability_class in {"missing_access_control", "reentrancy"} else "info"
+    severity_by_class = {
+        "missing_access_control": "high",
+        "reentrancy": "high",
+        "unchecked_transfer": "medium",
+    }
+    severity = severity_by_class.get(hypothesis.vulnerability_class, "info")
     evidence = [
         Evidence(
             kind="research_subgraph" if research else "static_analysis",
@@ -98,4 +103,3 @@ def render_markdown_report(report: ReportDocument) -> str:
                 lines.append(f"- {limitation}")
         lines.append("")
     return "\n".join(lines)
-

@@ -93,7 +93,7 @@ def extract_external_calls(inp: RepoPathInput, state) -> StaticFactsOutput:
     facts = []
     for path in _solidity_files(inp.repo_path):
         for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
-            if any(term in line for term in [".call(", ".delegatecall(", ".transfer(", ".send("]):
+            if any(term in line for term in [".call(", ".call{", ".delegatecall(", ".delegatecall{", ".transfer(", ".send("]):
                 facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "text": line.strip()})
     return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
 

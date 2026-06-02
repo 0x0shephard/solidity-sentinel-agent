@@ -123,6 +123,8 @@ def run_static_analysis(state: AuditState) -> AuditState:
     _run_tool(state, "static.extract_functions", {"repo_path": repo_path})
     _run_tool(state, "static.find_access_control_terms", {"repo_path": repo_path})
     _run_tool(state, "static.extract_external_calls", {"repo_path": repo_path})
+    _run_tool(state, "static.extract_token_transfers", {"repo_path": repo_path})
+    _run_tool(state, "static.extract_storage_writes", {"repo_path": repo_path})
     _run_tool(state, "repo.search_text", {"repo_path": repo_path, "query": "owner"})
     _run_tool(state, "repo.search_text", {"repo_path": repo_path, "query": "transfer"})
     _run_tool(state, "repo.search_text", {"repo_path": repo_path, "query": "call("})
@@ -132,6 +134,8 @@ def run_static_analysis(state: AuditState) -> AuditState:
         "functions": state["last_outputs"].get("static.extract_functions", {}).get("facts", []),
         "access_control": state["last_outputs"].get("static.find_access_control_terms", {}).get("facts", []),
         "external_calls": state["last_outputs"].get("static.extract_external_calls", {}).get("facts", []),
+        "token_transfers": state["last_outputs"].get("static.extract_token_transfers", {}).get("facts", []),
+        "storage_writes": state["last_outputs"].get("static.extract_storage_writes", {}).get("facts", []),
     }
     state["current_focus"] = "rank_hypotheses"
     return state
@@ -146,6 +150,8 @@ def rank_hypotheses(state: AuditState) -> AuditState:
             "static_facts": [
                 *state.get("static_facts", {}).get("functions", []),
                 *state.get("static_facts", {}).get("external_calls", []),
+                *state.get("static_facts", {}).get("token_transfers", []),
+                *state.get("static_facts", {}).get("storage_writes", []),
                 *state.get("static_facts", {}).get("access_control", []),
             ],
         },

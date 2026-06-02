@@ -9,7 +9,7 @@ from sentinel.evals.scoring import score_run
 from sentinel.graphs.parent import run_audit
 
 
-FIXTURES = ["missing-access-control"]
+FIXTURES = ["missing-access-control", "unchecked-transfer", "reentrancy-toy"]
 
 
 def fixture_dir(name: str) -> Path:
@@ -38,4 +38,3 @@ def write_eval_summary(scores: list) -> Path:
             lines.append(f"  - {note}")
     write_text(out_dir / "eval_summary.md", "\n".join(lines) + "\n")
     return out_dir
-
