@@ -339,6 +339,7 @@ def rag_retrieve_context(state: AuditState) -> AuditState:
                 parent_run_id=state["run_id"],
                 hypothesis=hypothesis,
                 targeted_rag=_model_or_mapping_json(state.get("targeted_rag")),
+                run_dir=state["run_dir"],
             )
         )
         state["rag_context_bundles"][hypothesis.id] = bundle

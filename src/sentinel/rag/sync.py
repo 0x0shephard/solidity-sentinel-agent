@@ -14,6 +14,8 @@ from sentinel.schemas.rag import SoloditSyncState
 
 def _fresh(settings: Settings) -> bool:
     state_path = rag_paths(settings)["sync_state"]
+    if not rag_paths(settings)["index_metadata"].exists():
+        return False
     if not state_path.exists():
         return False
     try:
@@ -37,6 +39,8 @@ def sync_solodit(stale_ok: bool = True, settings: Settings | None = None) -> Sol
         data = json.loads(paths["sync_state"].read_text(encoding="utf-8"))
         return SoloditSyncState.model_validate({**data, "status": ToolStatus.OK, "stale_ok": True})
     if not cfg.solodit_api_key:
+        if rag_index_available(cfg) and not paths["index_metadata"].exists():
+            HistoricalFindingStore(cfg).build(load_findings(cfg))
         status = ToolStatus.SKIPPED if rag_index_available(cfg) else ToolStatus.UNAVAILABLE
         state = SoloditSyncState(status=status, finding_count=len(load_findings(cfg)), cache_path=str(paths["raw"]), normalized_path=str(paths["normalized"]), chroma_path=str(paths["chroma"]), message="SOLODIT_API_KEY is not configured", stale_ok=rag_index_available(cfg))
         paths["sync_state"].write_text(json.dumps(state.model_dump(mode="json"), indent=2) + "\n", encoding="utf-8")
@@ -49,6 +53,8 @@ def sync_solodit(stale_ok: bool = True, settings: Settings | None = None) -> Sol
         state = SoloditSyncState(status=ToolStatus.OK, finding_count=len(normalized), page_count=page_count, cache_path=str(paths["raw"]), normalized_path=str(paths["normalized"]), chroma_path=chroma_path)
     except SentinelError as exc:
         if stale_ok and rag_index_available(cfg):
+            if not paths["index_metadata"].exists():
+                HistoricalFindingStore(cfg).build(load_findings(cfg))
             state = SoloditSyncState(status=ToolStatus.OK, finding_count=len(load_findings(cfg)), cache_path=str(paths["raw"]), normalized_path=str(paths["normalized"]), chroma_path=str(paths["chroma"]), message=f"Using stale RAG cache after sync failure: {exc}", stale_ok=True)
         else:
             state = SoloditSyncState(status=ToolStatus.UNAVAILABLE, cache_path=str(paths["raw"]), normalized_path=str(paths["normalized"]), chroma_path=str(paths["chroma"]), message=str(exc))

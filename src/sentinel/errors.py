@@ -41,3 +41,6 @@ class SubgraphIsolationError(SentinelError):
 class EvaluationFailure(SentinelError):
     """Evaluation harness failed."""
 
+
+class RAGIndexIncompatibleError(SentinelError):
+    """RAG index metadata is incompatible with the active embedding configuration."""

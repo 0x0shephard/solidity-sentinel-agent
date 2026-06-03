@@ -1,0 +1,41 @@
+{
+  "fixture_name": "hawk-high-rag-eval",
+  "queries": [
+    {
+      "query_id": "q1",
+      "hypothesis_class": "upgradeability",
+      "query": "UUPS upgrade flow calls _authorizeUpgrade but does not execute upgradeTo or upgradeToAndCall implementation slot unchanged",
+      "root_cause_terms": ["UUPS", "_authorizeUpgrade", "upgradeTo", "implementation slot"],
+      "expected_vulnerability_classes": ["upgradeability", "access-control", "proxy-upgrade"],
+      "expected_terms": ["authorizeUpgrade", "upgradeTo", "implementation", "UUPS"],
+      "relevant_finding_ids": []
+    },
+    {
+      "query_id": "q2",
+      "hypothesis_class": "accounting",
+      "query": "percentage distribution math pays amount to every recipient without dividing by recipient count total payout exceeds configured share",
+      "root_cause_terms": ["percentage", "distribution", "recipient count", "overpayment"],
+      "expected_vulnerability_classes": ["accounting", "reward-distribution"],
+      "expected_terms": ["distribution", "percentage", "overpayment", "accounting"],
+      "relevant_finding_ids": []
+    },
+    {
+      "query_id": "q3",
+      "hypothesis_class": "storage_layout",
+      "query": "upgradeable implementation storage layout mismatch between old and new implementation corrupts proxy state",
+      "root_cause_terms": ["storage layout", "upgradeable", "proxy state"],
+      "expected_vulnerability_classes": ["storage_layout", "upgradeability"],
+      "expected_terms": ["storage", "layout", "upgrade", "proxy"],
+      "relevant_finding_ids": []
+    },
+    {
+      "query_id": "q4",
+      "hypothesis_class": "business_logic",
+      "query": "configured cutoff score is written but not enforced during graduation lifecycle allowing ineligible users to pass",
+      "root_cause_terms": ["cutoff", "not enforced", "lifecycle"],
+      "expected_vulnerability_classes": ["business_logic", "access-control"],
+      "expected_terms": ["cutoff", "score", "enforced", "lifecycle"],
+      "relevant_finding_ids": []
+    }
+  ]
+}

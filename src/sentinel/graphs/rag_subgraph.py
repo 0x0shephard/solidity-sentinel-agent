@@ -25,6 +25,7 @@ RAG_TOOL_NAMES = [
 class RAGState(TypedDict, total=False):
     subgraph_run_id: str
     parent_run_id: str
+    run_dir: str
     hypothesis: VulnerabilityHypothesis
     queries: list
     matches_by_query: dict
@@ -38,10 +39,11 @@ class RAGState(TypedDict, total=False):
     bundle: RAGContextBundle
 
 
-def initial_rag_state(subgraph_run_id: str, parent_run_id: str, hypothesis: VulnerabilityHypothesis, targeted_rag: dict | None = None) -> RAGState:
+def initial_rag_state(subgraph_run_id: str, parent_run_id: str, hypothesis: VulnerabilityHypothesis, targeted_rag: dict | None = None, run_dir: str = "") -> RAGState:
     return {
         "subgraph_run_id": subgraph_run_id,
         "parent_run_id": parent_run_id,
+        "run_dir": run_dir,
         "hypothesis": hypothesis,
         "queries": [],
         "matches_by_query": {},
@@ -61,7 +63,7 @@ def _executor() -> ToolExecutor:
 def _tool_state(state: RAGState) -> dict:
     return {
         "run_id": state["subgraph_run_id"],
-        "run_dir": "",
+        "run_dir": state.get("run_dir", ""),
         "tool_call_count": 0,
         "tool_ledger": [],
         "last_outputs": {},

@@ -34,6 +34,7 @@ class Settings(BaseModel):
     rag_filter_languages: list[str] = Field(default_factory=lambda: ["Solidity"])
     rag_filter_impacts: list[str] = Field(default_factory=lambda: ["HIGH", "MEDIUM"])
     rag_quality_score: int = Field(default=2, ge=0, le=5)
+    rag_auto_rebuild: bool = False
     langsmith_tracing: bool = False
     langsmith_api_key: str | None = None
     langsmith_project: str = "solidity-sentinel-agent"
@@ -63,6 +64,7 @@ def get_settings() -> Settings:
         rag_filter_languages=split_csv("SENTINEL_RAG_FILTER_LANGUAGES", "Solidity"),
         rag_filter_impacts=split_csv("SENTINEL_RAG_FILTER_IMPACTS", "HIGH,MEDIUM"),
         rag_quality_score=int(os.getenv("SENTINEL_RAG_QUALITY_SCORE", "2")),
+        rag_auto_rebuild=os.getenv("SENTINEL_RAG_AUTO_REBUILD", "false").lower() in {"1", "true", "yes", "on"},
         langsmith_tracing=os.getenv("LANGSMITH_TRACING", "false").lower() in {"1", "true", "yes", "on"},
         langsmith_api_key=os.getenv("LANGSMITH_API_KEY") or None,
         langsmith_project=os.getenv("LANGSMITH_PROJECT", "solidity-sentinel-agent"),

@@ -70,6 +70,24 @@ sentinel rag sync
 
 The sync calls `POST /findings` with `X-Cyfrin-API-Key`, caches raw and normalized findings under `data/rag`, and builds a Chroma index when `chromadb` and `langchain-chroma` are installed. Audits use stale-ok sync: a stale cache can be used if live refresh fails.
 
+Every Chroma index writes an `index_metadata.json` fingerprint with the embedding model, embedding dimension, corpus hash, canonical text version, chunking version, document count, and collection name. Retrieval refuses to use an index if the active `SENTINEL_RAG_EMBED_MODEL` or canonical document versions do not match the metadata.
+
+Rebuild indexes after changing embedding models:
+
+```bash
+sentinel rag rebuild --scope global
+sentinel rag rebuild --scope repo --repo Test/2025-05-hawk-high
+sentinel rag rebuild --scope all --repo Test/2025-05-hawk-high
+```
+
+Automatic rebuild can be enabled when you want incompatible indexes repaired during retrieval:
+
+```env
+SENTINEL_RAG_AUTO_REBUILD=true
+```
+
+Solodit findings are embedded as deterministic multi-view documents: summary, root cause, impact, recommendation, and exploit-precondition views. Query text is canonicalized from the structured hypothesis, root-cause terms, exploit preconditions, affected component, and local evidence.
+
 ## LangSmith
 
 LangSmith is the primary tracing surface when enabled:

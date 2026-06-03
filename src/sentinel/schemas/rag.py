@@ -72,6 +72,28 @@ class HistoricalFindingSearchOutput(BaseModel):
     message: str | None = None
 
 
+class EmbeddingModelInfo(BaseModel):
+    model_name: str
+    dimension: int
+    provider: str
+    max_seq_length: int | None = None
+    normalize_embeddings: bool = True
+
+
+class RAGIndexMetadata(BaseModel):
+    embedding_model: str
+    embedding_dim: int
+    embedding_provider: str
+    normalized_corpus_version: str
+    chunking_version: str
+    canonical_text_version: str
+    created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    finding_count: int
+    document_count: int
+    source_cache_hash: str
+    chroma_collection_name: str
+
+
 class RepoRAGSearchIntent(BaseModel):
     intent_id: str
     query: str

@@ -2,7 +2,7 @@ from sentinel.config import Settings
 from sentinel.rag.store import HistoricalFindingStore, write_findings
 from sentinel.rag.targeted import build_repo_rag_profile, build_targeted_rag
 from sentinel.schemas.common import ToolStatus
-from sentinel.schemas.rag import HistoricalFinding
+from sentinel.schemas.rag import EmbeddingModelInfo, HistoricalFinding
 
 
 def _static_facts():
@@ -55,6 +55,11 @@ def test_targeted_rag_builds_repo_cache_from_global_fallback(tmp_path, monkeypat
         _finding("accounting-1", "Percentage payout loop overpays", "bursary wage percentage payout missing division by recipients", "accounting"),
     ]
     write_findings(settings, [], global_findings)
+    HistoricalFindingStore(settings)._write_metadata(
+        global_findings,
+        document_count=len(global_findings) * 5,
+        model_info=EmbeddingModelInfo(model_name=settings.rag_embed_model, dimension=384, provider="sentence_transformers"),
+    )
 
     def fake_build(self, findings):
         return str(self.root / "chroma")

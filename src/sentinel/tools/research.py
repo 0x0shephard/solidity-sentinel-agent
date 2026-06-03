@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from sentinel.artifacts import append_jsonl
 from sentinel.config import get_settings
+from sentinel.rag.canonical import build_canonical_query_text
 from sentinel.rag.checklist import build_solodit_checklists_from_cache, write_generated_checklists
 from sentinel.rag.ranking import rank_matches
 from sentinel.rag.store import HistoricalFindingStore
@@ -557,21 +559,68 @@ def targeted_solodit_context(inp: TargetedRAGInput, state) -> TargetedRAGOutput:
 def retrieve_historical_findings(inp: HistoricalFindingQuery, state) -> HistoricalFindingSearchOutput:
     settings = get_settings()
     candidates = []
+    used_targeted_cache = False
+    used_global_cache = False
     targeted = state.get("targeted_rag") or {}
     repo_id = targeted.get("repo_id") if isinstance(targeted, dict) else getattr(targeted, "repo_id", None)
     targeted_status = targeted.get("status") if isinstance(targeted, dict) else getattr(targeted, "status", None)
     if repo_id and str(targeted_status).lower().endswith("ok"):
         targeted_root = repo_profile_root(settings, str(repo_id))
-        candidates.extend(HistoricalFindingStore(settings, root=targeted_root).search(inp, candidate_k=30))
+        targeted_candidates = HistoricalFindingStore(settings, root=targeted_root).search(inp, candidate_k=30)
+        candidates.extend(targeted_candidates)
+        used_targeted_cache = bool(targeted_candidates)
     seen_ids = {finding.id for finding, _ in candidates}
-    for finding, score in HistoricalFindingStore(settings).search(inp):
+    global_candidates = HistoricalFindingStore(settings).search(inp)
+    used_global_cache = bool(global_candidates)
+    for finding, score in global_candidates:
         if finding.id not in seen_ids:
             candidates.append((finding, score))
             seen_ids.add(finding.id)
     matches = rank_matches(inp, candidates)
     if matches:
         state.setdefault("historical_findings", []).extend(matches)
+    _record_retrieval_telemetry(
+        state,
+        query=inp,
+        raw_candidate_count=len(candidates),
+        final_candidate_count=len(matches),
+        top_score=matches[0].final_score if matches else 0.0,
+        used_targeted_cache=used_targeted_cache,
+        used_global_cache=used_global_cache,
+    )
     return HistoricalFindingSearchOutput(status=ToolStatus.OK, matches=matches)
+
+
+def _record_retrieval_telemetry(
+    state,
+    query: HistoricalFindingQuery,
+    raw_candidate_count: int,
+    final_candidate_count: int,
+    top_score: float,
+    used_targeted_cache: bool,
+    used_global_cache: bool,
+) -> None:
+    import hashlib
+
+    run_dir = state.get("run_dir")
+    if not run_dir:
+        return
+    record = {
+        "run_id": state.get("run_id"),
+        "hypothesis_id": state.get("hypothesis_id"),
+        "embedding_model": get_settings().rag_embed_model,
+        "query_text_hash": hashlib.sha256(query.query.encode("utf-8")).hexdigest(),
+        "query_intent": state.get("query_intent"),
+        "top_k": query.top_k,
+        "raw_candidate_count": raw_candidate_count,
+        "final_candidate_count": final_candidate_count,
+        "top_score": round(float(top_score), 4),
+        "retrieval_grade": state.get("retrieval_grade"),
+        "used_targeted_cache": used_targeted_cache,
+        "used_global_cache": used_global_cache,
+        "repair_attempted": bool(state.get("repair_attempted", False)),
+    }
+    append_jsonl(f"{run_dir}/retrieval_telemetry.jsonl", record)
 
 
 def expand_rag_queries(inp: RAGQueriesInput, state) -> RAGQueriesOutput:
@@ -591,7 +640,15 @@ def expand_rag_queries(inp: RAGQueriesInput, state) -> RAGQueriesOutput:
     queries = []
     seen = set()
     for intent, query in seeds:
-        cleaned = " ".join(query.split())
+        cleaned = build_canonical_query_text(
+            hyp,
+            intent,
+            source_evidence=[item.source_text for item in hyp.evidence_lines[:3]],
+            root_cause_terms=hyp.root_cause_terms,
+            exploit_precondition_terms=hyp.exploit_precondition_terms,
+        )
+        if not cleaned:
+            cleaned = " ".join(query.split())
         if not cleaned or cleaned.lower() in seen:
             continue
         seen.add(cleaned.lower())
@@ -611,6 +668,8 @@ def expand_rag_queries(inp: RAGQueriesInput, state) -> RAGQueriesOutput:
 def retrieve_multi_query(inp: MultiQueryRetrievalInput, state) -> MultiQueryRetrievalOutput:
     matches_by_query: dict[str, list[HistoricalFindingMatch]] = {}
     for query in inp.queries:
+        state["hypothesis_id"] = query.hypothesis_id
+        state["query_intent"] = query.intent
         output = retrieve_historical_findings(
             HistoricalFindingQuery(
                 query=query.query,
