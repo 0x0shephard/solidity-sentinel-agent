@@ -84,6 +84,7 @@ def export_artifacts(inp: ReportGenericInput, state) -> ReportGenericOutput:
                 "logs.jsonl",
                 "artifacts/validation-tests/*.t.sol",
                 "artifacts/validation-compile-result.json",
+                "artifacts/validation-run-result.json",
             ],
         },
     )

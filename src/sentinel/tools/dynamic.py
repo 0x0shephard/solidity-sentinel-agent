@@ -30,6 +30,18 @@ class ValidationCompileInput(RepoPathInput):
     artifact_paths: list[str] = Field(default_factory=list)
 
 
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _clean_output(text: str) -> str:
+    return ANSI_ESCAPE.sub("", text)
+
+
+def _test_contract_name(path: str) -> str:
+    name = Path(path).name
+    return name[: -len(".t.sol")] if name.endswith(".t.sol") else Path(path).stem
+
+
 def _contract_name_from_file(file_path: str) -> str:
     return Path(file_path).stem or "Target"
 
@@ -242,6 +254,43 @@ def _copy_repo_for_validation(repo_path: str, worktree: Path) -> None:
     shutil.copytree(repo_path, worktree, ignore=ignore)
 
 
+def _prepare_validation_worktree(inp: ValidationCompileInput, state) -> tuple[DynamicGenericOutput | None, Path | None, list[str]]:
+    artifact_paths = _validation_artifact_paths(inp, state)
+    if not artifact_paths:
+        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="No Foundry validation test artifacts available."), None, []
+    missing = [str(path) for path in artifact_paths if not path.exists()]
+    if missing:
+        return DynamicGenericOutput(status=ToolStatus.ERROR, message="Validation artifact path not found.", data={"missing": missing}), None, []
+    if shutil.which("forge") is None:
+        return DynamicGenericOutput(status=ToolStatus.UNAVAILABLE, message="forge is not installed"), None, []
+
+    run_dir = Path(state.get("run_dir", "runs/tmp"))
+    worktree = run_dir / "artifacts" / "validation-worktree"
+    _copy_repo_for_validation(inp.repo_path, worktree)
+    test_dir = worktree / "test"
+    test_dir.mkdir(parents=True, exist_ok=True)
+
+    copied_tests = []
+    for artifact_path in artifact_paths:
+        target_path = test_dir / artifact_path.name
+        shutil.copy2(artifact_path, target_path)
+        copied_tests.append(str(target_path))
+    return None, worktree, copied_tests
+
+
+def _classify_validation_run(return_code: int | None, stdout: str, stderr: str, timed_out: bool) -> str:
+    combined = f"{stdout}\n{stderr}"
+    if timed_out:
+        return "validation_timeout"
+    if "panicked (crashed)" in combined or "Attempted to create a NULL object" in combined:
+        return "validation_runtime_error"
+    if return_code == 0:
+        return "security_invariant_held_or_test_passed"
+    if re.search(r"(\d+)\s+failed", combined, flags=re.IGNORECASE) or "Failing tests" in combined or "[FAIL" in combined:
+        return "security_invariant_violation_or_test_needs_review"
+    return "validation_execution_failed"
+
+
 def create_poc_test(inp: PocInput, state) -> DynamicGenericOutput:
     hypothesis = inp.hypothesis or (state.get("hypotheses") or [None])[0]
     affected_function = getattr(hypothesis, "affected_functions", [])[:1]
@@ -364,27 +413,13 @@ def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
 
 
 def compile_validation_artifacts(inp: ValidationCompileInput, state) -> DynamicGenericOutput:
-    artifact_paths = _validation_artifact_paths(inp, state)
-    if not artifact_paths:
-        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="No Foundry validation test artifacts available to compile.")
-    missing = [str(path) for path in artifact_paths if not path.exists()]
-    if missing:
-        return DynamicGenericOutput(status=ToolStatus.ERROR, message="Validation artifact path not found.", data={"missing": missing})
-    if shutil.which("forge") is None:
-        return DynamicGenericOutput(status=ToolStatus.UNAVAILABLE, message="forge is not installed")
-
+    early_output, worktree, copied_tests = _prepare_validation_worktree(inp, state)
+    if early_output is not None:
+        if early_output.status == ToolStatus.SKIPPED:
+            early_output.message = "No Foundry validation test artifacts available to compile."
+        return early_output
+    assert worktree is not None
     run_dir = Path(state.get("run_dir", "runs/tmp"))
-    worktree = run_dir / "artifacts" / "validation-worktree"
-    _copy_repo_for_validation(inp.repo_path, worktree)
-    test_dir = worktree / "test"
-    test_dir.mkdir(parents=True, exist_ok=True)
-
-    copied_tests = []
-    for artifact_path in artifact_paths:
-        target_path = test_dir / artifact_path.name
-        shutil.copy2(artifact_path, target_path)
-        copied_tests.append(str(target_path))
-
     result = run_command(["forge", "build"], cwd=str(worktree), timeout=120)
     manifest_path = run_dir / "artifacts" / "validation-compile-result.json"
     manifest = {
@@ -392,8 +427,8 @@ def compile_validation_artifacts(inp: ValidationCompileInput, state) -> DynamicG
         "worktree": str(worktree),
         "copied_tests": copied_tests,
         "return_code": result.return_code,
-        "stdout": result.stdout[-8000:],
-        "stderr": result.stderr[-8000:],
+        "stdout": _clean_output(result.stdout[-8000:]),
+        "stderr": _clean_output(result.stderr[-8000:]),
         "timed_out": result.timed_out,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -411,6 +446,41 @@ def compile_validation_artifacts(inp: ValidationCompileInput, state) -> DynamicG
     )
 
 
+def run_validation_artifacts(inp: ValidationCompileInput, state) -> DynamicGenericOutput:
+    early_output, worktree, copied_tests = _prepare_validation_worktree(inp, state)
+    if early_output is not None:
+        if early_output.status == ToolStatus.SKIPPED:
+            early_output.message = "No Foundry validation test artifacts available to run."
+        return early_output
+    assert worktree is not None
+    run_dir = Path(state.get("run_dir", "runs/tmp"))
+    test_names = [_test_contract_name(path) for path in copied_tests]
+    result = run_command(["forge", "test", "--match-contract", "Sentinel"], cwd=str(worktree), timeout=120)
+    classification = _classify_validation_run(result.return_code, result.stdout, result.stderr, result.timed_out)
+    manifest_path = run_dir / "artifacts" / "validation-run-result.json"
+    manifest = {
+        "command": result.command,
+        "worktree": str(worktree),
+        "copied_tests": copied_tests,
+        "matched_contract_prefix": "Sentinel",
+        "test_names": test_names,
+        "return_code": result.return_code,
+        "stdout": _clean_output(result.stdout[-8000:]),
+        "stderr": _clean_output(result.stderr[-8000:]),
+        "timed_out": result.timed_out,
+        "classification": classification,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    state.setdefault("artifacts", []).append(
+        ArtifactRef(
+            kind="validation_run_result",
+            path=str(manifest_path),
+            description=f"Result of executing generated validation tests in a temporary worktree: {classification}.",
+        )
+    )
+    return DynamicGenericOutput(status=ToolStatus.OK, message=f"Validation run classified as {classification}.", data=manifest)
+
+
 def register(registry) -> None:
     specs = [
         ("create_poc_test", "Create a PoC test plan.", PocInput, create_poc_test),
@@ -423,9 +493,10 @@ def register(registry) -> None:
         ("spawn_poc_subagent", "Spawn a PoC planning subagent.", PocInput, spawn_poc_subagent),
         ("generate_validation_artifacts", "Generate reviewable Foundry validation test artifacts under the run directory.", PocInput, generate_validation_artifacts),
         ("compile_validation_artifacts", "Compile generated validation tests in a non-mutating temporary worktree.", ValidationCompileInput, compile_validation_artifacts),
+        ("run_validation_artifacts", "Run generated validation tests in a non-mutating temporary worktree and classify the result.", ValidationCompileInput, run_validation_artifacts),
     ]
     for name, description, input_model, fn in specs:
-        if name == "compile_validation_artifacts":
+        if name in {"compile_validation_artifacts", "run_validation_artifacts"}:
             side_effects = [SideEffect.WRITE_FILES, SideEffect.EXECUTE_LOCAL]
         elif name in {"patch_poc_test", "generate_validation_artifacts"}:
             side_effects = [SideEffect.WRITE_FILES]

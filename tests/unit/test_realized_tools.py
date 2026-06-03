@@ -118,6 +118,80 @@ def test_dynamic_compile_validation_artifact_uses_temporary_worktree(monkeypatch
     assert any(artifact.kind == "validation_compile_result" for artifact in state["artifacts"])
 
 
+def test_dynamic_run_validation_artifact_classifies_failure(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "foundry.toml").write_text("[profile.default]\nsrc = 'src'\n", encoding="utf-8")
+    (repo / "src" / "Vault.sol").write_text("pragma solidity ^0.8.20; contract Vault {}\n", encoding="utf-8")
+    run_dir = tmp_path / "runs" / "run-1"
+    state = initial_audit_state("run-1", str(repo), "Find bugs", str(run_dir))
+    state["hypotheses"] = [
+        VulnerabilityHypothesis(
+            id="hyp-1",
+            title="Manual review",
+            vulnerability_class="manual_review",
+            affected_files=["src/Vault.sol"],
+            affected_functions=["check"],
+            evidence_summary="Review target",
+            confidence=0.3,
+        )
+    ]
+
+    def fake_which(name):
+        return "/fake/forge" if name == "forge" else None
+
+    def fake_run(command, cwd, timeout=60, env=None):
+        return CommandResult(command=command, cwd=str(cwd), return_code=1, stdout="[FAIL: invariant violated] test_check()", stderr="1 failed")
+
+    monkeypatch.setattr("sentinel.tools.dynamic.shutil.which", fake_which)
+    monkeypatch.setattr("sentinel.tools.dynamic.run_command", fake_run)
+    executor = ToolExecutor(build_default_registry())
+
+    executor.execute("dynamic.generate_validation_artifacts", {"repo_path": str(repo)}, state)
+    executed = executor.execute("dynamic.run_validation_artifacts", {"repo_path": str(repo)}, state)
+
+    manifest = run_dir / "artifacts" / "validation-run-result.json"
+    assert executed.status == ToolStatus.OK
+    assert executed.data["command"] == ["forge", "test", "--match-contract", "Sentinel"]
+    assert executed.data["classification"] == "security_invariant_violation_or_test_needs_review"
+    assert executed.data["test_names"] == ["SentinelManualReviewcheckTest"]
+    assert manifest.exists()
+    assert not (repo / "test").exists()
+    assert any(artifact.kind == "validation_run_result" for artifact in state["artifacts"])
+
+
+def test_dynamic_run_validation_artifact_classifies_runtime_error(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "foundry.toml").write_text("[profile.default]\nsrc = 'src'\n", encoding="utf-8")
+    (repo / "src" / "Vault.sol").write_text("pragma solidity ^0.8.20; contract Vault {}\n", encoding="utf-8")
+    state = initial_audit_state("run-1", str(repo), "Find bugs", str(tmp_path / "runs" / "run-1"))
+    state["hypotheses"] = [
+        VulnerabilityHypothesis(
+            id="hyp-1",
+            title="Manual review",
+            vulnerability_class="manual_review",
+            affected_files=["src/Vault.sol"],
+            affected_functions=["check"],
+            evidence_summary="Review target",
+            confidence=0.3,
+        )
+    ]
+
+    monkeypatch.setattr("sentinel.tools.dynamic.shutil.which", lambda name: "/fake/forge")
+    monkeypatch.setattr(
+        "sentinel.tools.dynamic.run_command",
+        lambda command, cwd, timeout=60, env=None: CommandResult(command=command, cwd=str(cwd), return_code=-1, stdout="", stderr="The application panicked (crashed). Attempted to create a NULL object."),
+    )
+    executor = ToolExecutor(build_default_registry())
+
+    executor.execute("dynamic.generate_validation_artifacts", {"repo_path": str(repo)}, state)
+    executed = executor.execute("dynamic.run_validation_artifacts", {"repo_path": str(repo)}, state)
+
+    assert executed.status == ToolStatus.OK
+    assert executed.data["classification"] == "validation_runtime_error"
+
+
 def test_dynamic_parse_and_classify_test_output():
     state = initial_audit_state("run-1", ".", "Find bugs", "runs/run-1")
     executor = ToolExecutor(build_default_registry())
