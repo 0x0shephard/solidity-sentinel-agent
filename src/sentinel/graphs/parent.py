@@ -271,6 +271,7 @@ def finish(state: AuditState) -> AuditState:
     _run_tool(state, "repo.list_files", {"repo_path": repo_path, "max_files": 50})
     _run_tool(state, "static.extract_functions", {"repo_path": repo_path})
     _run_tool(state, "dynamic.generate_validation_artifacts", {"repo_path": repo_path})
+    _run_tool(state, "dynamic.compile_validation_artifacts", {"repo_path": repo_path})
     state["findings"] = create_findings_from_state(state)
     report = build_report_document(state)
     write_json(Path(state["run_dir"]) / "report.json", report.model_dump(mode="json"))

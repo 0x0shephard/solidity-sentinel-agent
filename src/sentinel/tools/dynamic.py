@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from pathlib import Path
@@ -23,6 +24,10 @@ class PocInput(RepoPathInput):
     hypothesis: VulnerabilityHypothesis | None = None
     test_file: str = "test/SentinelGenerated.t.sol"
     test_name: str = "testSentinelGenerated"
+
+
+class ValidationCompileInput(RepoPathInput):
+    artifact_paths: list[str] = Field(default_factory=list)
 
 
 def _contract_name_from_file(file_path: str) -> str:
@@ -59,18 +64,18 @@ def _missing_access_control_test(hypothesis: VulnerabilityHypothesis) -> str:
             "}",
             "",
             f"contract SentinelMissingAccessControl{target_function}Test {{",
-            '    Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));',
+            '    Vm internal constant VM = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));',
             f"    {target_contract} internal target;",
             "    address internal attacker = address(0xA11CE);",
             "",
             "    function setUp() public {",
             f"        target = new {target_contract}();",
-            "        vm.deal(address(target), 1 ether);",
+            "        VM.deal(address(target), 1 ether);",
             "    }",
             "",
             f"    function test_{target_function}_rejectsUnauthorizedCaller() public {{",
-            "        vm.prank(attacker);",
-            "        vm.expectRevert();",
+            "        VM.prank(attacker);",
+            "        VM.expectRevert();",
             f"        target.{target_function}(payable(attacker));",
             "    }",
             "}",
@@ -115,7 +120,7 @@ def _reentrancy_test(hypothesis: VulnerabilityHypothesis) -> str:
             "}",
             "",
             f"contract SentinelReentrancy{target_function}Test {{",
-            '    Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));',
+            '    Vm internal constant VM = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));',
             f"    {target_contract} internal target;",
             "    SentinelReentrancyAttacker internal attacker;",
             "",
@@ -123,11 +128,11 @@ def _reentrancy_test(hypothesis: VulnerabilityHypothesis) -> str:
             f"        target = new {target_contract}();",
             "        attacker = new SentinelReentrancyAttacker(target);",
             "        target.deposit{value: 5 ether}();",
-            "        vm.deal(address(attacker), 1 ether);",
+            "        VM.deal(address(attacker), 1 ether);",
             "    }",
             "",
             f"    function test_{target_function}_cannotBeReentered() public {{",
-            "        vm.expectRevert();",
+            "        VM.expectRevert();",
             "        attacker.attack{value: 1 ether}();",
             "    }",
             "}",
@@ -166,7 +171,7 @@ def _unchecked_transfer_test(hypothesis: VulnerabilityHypothesis) -> str:
             "}",
             "",
             f"contract SentinelUncheckedTransfer{target_function}Test {{",
-            '    Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));',
+            '    Vm internal constant VM = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));',
             "    SentinelFalseReturnToken internal token;",
             f"    {target_contract} internal target;",
             "",
@@ -177,7 +182,7 @@ def _unchecked_transfer_test(hypothesis: VulnerabilityHypothesis) -> str:
             "    }",
             "",
             f"    function test_{target_function}_handlesFalseTransferReturn() public {{",
-            "        vm.expectRevert();",
+            "        VM.expectRevert();",
             f"        target.{target_function}(1 ether);",
             "    }",
             "}",
@@ -215,6 +220,26 @@ def _validation_test_content(hypothesis: VulnerabilityHypothesis) -> str:
     if hypothesis.vulnerability_class == "unchecked_transfer":
         return _unchecked_transfer_test(hypothesis)
     return _generic_validation_test(hypothesis)
+
+
+def _validation_artifact_paths(inp: ValidationCompileInput, state) -> list[Path]:
+    raw_paths = inp.artifact_paths or [
+        artifact.path
+        for artifact in state.get("artifacts", [])
+        if artifact.kind == "foundry_validation_test" and artifact.path.endswith(".t.sol")
+    ]
+    return [Path(path) if Path(path).is_absolute() else Path(path).resolve() for path in raw_paths]
+
+
+def _copy_repo_for_validation(repo_path: str, worktree: Path) -> None:
+    if worktree.exists():
+        shutil.rmtree(worktree)
+
+    def ignore(_directory: str, names: list[str]) -> set[str]:
+        ignored_names = {".git", "out", "cache", "node_modules", "runs", ".venv", "__pycache__"}
+        return {name for name in names if name in ignored_names}
+
+    shutil.copytree(repo_path, worktree, ignore=ignore)
 
 
 def create_poc_test(inp: PocInput, state) -> DynamicGenericOutput:
@@ -338,6 +363,54 @@ def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
     return DynamicGenericOutput(status=ToolStatus.OK, data=data)
 
 
+def compile_validation_artifacts(inp: ValidationCompileInput, state) -> DynamicGenericOutput:
+    artifact_paths = _validation_artifact_paths(inp, state)
+    if not artifact_paths:
+        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="No Foundry validation test artifacts available to compile.")
+    missing = [str(path) for path in artifact_paths if not path.exists()]
+    if missing:
+        return DynamicGenericOutput(status=ToolStatus.ERROR, message="Validation artifact path not found.", data={"missing": missing})
+    if shutil.which("forge") is None:
+        return DynamicGenericOutput(status=ToolStatus.UNAVAILABLE, message="forge is not installed")
+
+    run_dir = Path(state.get("run_dir", "runs/tmp"))
+    worktree = run_dir / "artifacts" / "validation-worktree"
+    _copy_repo_for_validation(inp.repo_path, worktree)
+    test_dir = worktree / "test"
+    test_dir.mkdir(parents=True, exist_ok=True)
+
+    copied_tests = []
+    for artifact_path in artifact_paths:
+        target_path = test_dir / artifact_path.name
+        shutil.copy2(artifact_path, target_path)
+        copied_tests.append(str(target_path))
+
+    result = run_command(["forge", "build"], cwd=str(worktree), timeout=120)
+    manifest_path = run_dir / "artifacts" / "validation-compile-result.json"
+    manifest = {
+        "command": result.command,
+        "worktree": str(worktree),
+        "copied_tests": copied_tests,
+        "return_code": result.return_code,
+        "stdout": result.stdout[-8000:],
+        "stderr": result.stderr[-8000:],
+        "timed_out": result.timed_out,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    state.setdefault("artifacts", []).append(
+        ArtifactRef(
+            kind="validation_compile_result",
+            path=str(manifest_path),
+            description="Result of compiling generated validation tests in a temporary worktree.",
+        )
+    )
+    return DynamicGenericOutput(
+        status=ToolStatus.OK if result.return_code == 0 else ToolStatus.ERROR,
+        message="Validation artifacts compiled successfully." if result.return_code == 0 else "Validation artifact compile failed.",
+        data=manifest,
+    )
+
+
 def register(registry) -> None:
     specs = [
         ("create_poc_test", "Create a PoC test plan.", PocInput, create_poc_test),
@@ -349,7 +422,15 @@ def register(registry) -> None:
         ("classify_test_result", "Classify test result.", DynamicGenericOutput, classify_test_result),
         ("spawn_poc_subagent", "Spawn a PoC planning subagent.", PocInput, spawn_poc_subagent),
         ("generate_validation_artifacts", "Generate reviewable Foundry validation test artifacts under the run directory.", PocInput, generate_validation_artifacts),
+        ("compile_validation_artifacts", "Compile generated validation tests in a non-mutating temporary worktree.", ValidationCompileInput, compile_validation_artifacts),
     ]
     for name, description, input_model, fn in specs:
-        side_effect = SideEffect.WRITE_FILES if name in {"patch_poc_test", "generate_validation_artifacts"} else SideEffect.EXECUTE_LOCAL if name.startswith("run_") else SideEffect.NONE
-        registry.register(RegisteredTool(namespace="dynamic", name=name, description=description, input_model=input_model, output_model=DynamicGenericOutput, fn=fn, side_effects=[side_effect]))
+        if name == "compile_validation_artifacts":
+            side_effects = [SideEffect.WRITE_FILES, SideEffect.EXECUTE_LOCAL]
+        elif name in {"patch_poc_test", "generate_validation_artifacts"}:
+            side_effects = [SideEffect.WRITE_FILES]
+        elif name.startswith("run_"):
+            side_effects = [SideEffect.EXECUTE_LOCAL]
+        else:
+            side_effects = [SideEffect.NONE]
+        registry.register(RegisteredTool(namespace="dynamic", name=name, description=description, input_model=input_model, output_model=DynamicGenericOutput, fn=fn, side_effects=side_effects))

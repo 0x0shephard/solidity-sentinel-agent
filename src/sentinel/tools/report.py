@@ -71,7 +71,22 @@ def generate_repro_steps(inp: ReportGenericInput, state) -> ReportGenericOutput:
 
 def export_artifacts(inp: ReportGenericInput, state) -> ReportGenericOutput:
     run_dir = state.get("run_dir")
-    return ReportGenericOutput(status=ToolStatus.OK, data={"run_dir": run_dir, "artifacts": ["state.json", "report.json", "report.md", "tool_ledger.jsonl", "trace.jsonl", "logs.jsonl"]})
+    return ReportGenericOutput(
+        status=ToolStatus.OK,
+        data={
+            "run_dir": run_dir,
+            "artifacts": [
+                "state.json",
+                "report.json",
+                "report.md",
+                "tool_ledger.jsonl",
+                "trace.jsonl",
+                "logs.jsonl",
+                "artifacts/validation-tests/*.t.sol",
+                "artifacts/validation-compile-result.json",
+            ],
+        },
+    )
 
 
 def register(registry) -> None:

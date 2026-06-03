@@ -45,6 +45,10 @@ def test_parent_graph_compiles_and_finishes(tmp_path):
     assert (run_dir / "report.json").exists()
     assert (run_dir / "report.md").exists()
     assert list((run_dir / "artifacts" / "validation-tests").glob("*.t.sol"))
+    compile_status = result["last_outputs"]["dynamic.compile_validation_artifacts"]["status"]
+    assert compile_status in {"ok", "error", "unavailable"}
+    if compile_status != "unavailable":
+        assert (run_dir / "artifacts" / "validation-compile-result.json").exists()
     assert (run_dir / "tool_ledger.jsonl").exists()
     assert (run_dir / "logs.jsonl").exists()
     assert (run_dir / "trace.jsonl").exists()
@@ -66,4 +70,6 @@ def test_run_audit_parent_graph_returns_state(tmp_path, monkeypatch):
     report = json.loads(Path("runs/fixed-run/report.json").read_text(encoding="utf-8"))
     assert report["run_id"] == "fixed-run"
     assert report["tool_call_count"] >= 20
-    assert report["artifacts"]
+    assert any(artifact["kind"] == "foundry_validation_test" for artifact in report["artifacts"])
+    if result["last_outputs"]["dynamic.compile_validation_artifacts"]["status"] != "unavailable":
+        assert any(artifact["kind"] == "validation_compile_result" for artifact in report["artifacts"])
