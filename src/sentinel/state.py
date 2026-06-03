@@ -4,7 +4,7 @@ from typing import TypedDict
 
 from sentinel.schemas.common import ArtifactRef, CompletedStep, PlanStep, ToolCallRecord
 from sentinel.schemas.report import Finding
-from sentinel.schemas.research import ResearchSubgraphResult, VulnerabilityHypothesis
+from sentinel.schemas.research import ResearchRefinement, ResearchSubgraphResult, VulnerabilityHypothesis
 
 
 class AuditState(TypedDict, total=False):
@@ -36,6 +36,7 @@ class AuditState(TypedDict, total=False):
     artifacts: list[ArtifactRef]
     errors: list[str]
     last_outputs: dict[str, dict]
+    use_llm_refiner: bool
 
 
 class ResearchState(TypedDict, total=False):
@@ -47,8 +48,10 @@ class ResearchState(TypedDict, total=False):
     hypothesis: VulnerabilityHypothesis
     selected_snippets: list[dict]
     allowed_tool_names: list[str]
+    use_llm_refiner: bool
     notes: list[str]
     evidence_records: list[dict]
+    llm_refinement: ResearchRefinement
     result: ResearchSubgraphResult
 
 
@@ -77,6 +80,7 @@ def initial_audit_state(run_id: str, repo: str, objective: str, run_dir: str) ->
         "artifacts": [],
         "errors": [],
         "last_outputs": {},
+        "use_llm_refiner": False,
     }
 
 
@@ -87,6 +91,7 @@ def initial_research_state(
     hypothesis: VulnerabilityHypothesis,
     selected_snippets: list[dict],
     allowed_tool_names: list[str],
+    use_llm_refiner: bool = False,
 ) -> ResearchState:
     """Create isolated state for the research subgraph.
 
@@ -102,5 +107,6 @@ def initial_research_state(
         "hypothesis": hypothesis,
         "selected_snippets": selected_snippets,
         "allowed_tool_names": allowed_tool_names,
+        "use_llm_refiner": use_llm_refiner,
         "notes": [],
     }

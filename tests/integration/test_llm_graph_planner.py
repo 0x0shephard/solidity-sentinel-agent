@@ -2,6 +2,7 @@ from pathlib import Path
 
 from sentinel.llm.base import ToolDecision, ToolPlan
 from sentinel.graphs.parent import run_audit
+from sentinel.schemas.research import ResearchRefinement
 
 
 class FakePlanner:
@@ -13,6 +14,11 @@ class FakePlanner:
                 ToolDecision(tool_name="repo.read_file", tool_input={}, rationale="missing required file_path"),
             ]
         )
+
+
+class FakeRefiner:
+    def refine(self, prompt):
+        return ResearchRefinement(likely_impact="Fake refined impact.")
 
 
 def _write_fixture_repo(path: Path) -> None:
@@ -29,6 +35,7 @@ def test_real_mode_graph_uses_planner_and_keeps_guardrails(monkeypatch, tmp_path
     _write_fixture_repo(repo)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("sentinel.graphs.parent.get_planner", lambda mock=False: FakePlanner())
+    monkeypatch.setattr("sentinel.graphs.research.llm_provider.get_research_refiner", lambda mock=False: FakeRefiner())
 
     state = run_audit(str(repo), "Find bugs", run_id="llm-run", mock_llm=False)
 
@@ -37,4 +44,3 @@ def test_real_mode_graph_uses_planner_and_keeps_guardrails(monkeypatch, tmp_path
     assert "LLM omitted required input for repo.read_file" in state["errors"]
     assert any(record.tool_name == "repo.list_files" for record in state["tool_ledger"])
     assert Path("runs/llm-run/state.json").exists()
-

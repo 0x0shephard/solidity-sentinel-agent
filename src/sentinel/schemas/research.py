@@ -39,3 +39,11 @@ class ResearchSubgraphResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     limitations: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+
+class ResearchRefinement(BaseModel):
+    likely_impact: str | None = None
+    exploit_preconditions: list[str] = Field(default_factory=list)
+    recommended_tests: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    confidence_delta: float = Field(default=0.0, ge=-0.2, le=0.2)

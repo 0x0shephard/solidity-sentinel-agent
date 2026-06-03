@@ -242,6 +242,7 @@ def research_subgraph(state: AuditState) -> AuditState:
         hypothesis=hypothesis,
         selected_snippets=selected_snippets,
         allowed_tool_names=DEFAULT_RESEARCH_TOOLS,
+        use_llm_refiner=state.get("use_llm_refiner", False),
     )
     result = run_research_subgraph(subgraph_state)
     state.setdefault("subgraph_results", []).append(result)
@@ -321,6 +322,7 @@ def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bo
     actual_run_id = run_id or make_run_id()
     run_dir = str(Path("runs") / actual_run_id)
     state = initial_audit_state(run_id=actual_run_id, repo=repo, objective=objective, run_dir=run_dir)
+    state["use_llm_refiner"] = not mock_llm
     ensure_run_dir(run_dir)
     with trace_span("audit.run", run_dir, run_id=actual_run_id, repo=repo, mock_llm=mock_llm):
         result = build_parent_graph(use_llm_planner=not mock_llm).invoke(state)

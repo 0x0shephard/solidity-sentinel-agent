@@ -7,7 +7,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
 from sentinel.errors import NonRetryableExternalError
-from sentinel.llm.base import BasePlanner, ToolPlan
+from sentinel.llm.base import BasePlanner, BaseResearchRefiner, ToolPlan
+from sentinel.schemas.research import ResearchRefinement
 
 
 def extract_json_object(text: str) -> str:
@@ -43,3 +44,28 @@ class OllamaPlanner(BasePlanner):
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
         return ToolPlan.model_validate_json(extract_json_object(content))
 
+
+class OllamaResearchRefiner(BaseResearchRefiner):
+    def __init__(self, model: str, base_url: str, llm: ChatOllama | None = None) -> None:
+        self.llm = llm or ChatOllama(model=model, base_url=base_url, temperature=0.0, format="json")
+
+    def refine(self, prompt: str) -> ResearchRefinement:
+        response = self.llm.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "You are Solidity Sentinel's research refiner. Return only JSON. "
+                        "Use this schema: "
+                        '{"likely_impact":"...",'
+                        '"exploit_preconditions":["..."],'
+                        '"recommended_tests":["..."],'
+                        '"limitations":["..."],'
+                        '"confidence_delta":0.0}. '
+                        "Do not invent files, line numbers, or functions not present in the evidence."
+                    )
+                ),
+                HumanMessage(content=prompt),
+            ]
+        )
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        return ResearchRefinement.model_validate_json(extract_json_object(content))

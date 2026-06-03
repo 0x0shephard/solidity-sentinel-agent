@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+
 from langgraph.graph import END, START, StateGraph
 
+from sentinel.llm import provider as llm_provider
 from sentinel.schemas.common import ToolStatus
-from sentinel.schemas.research import ResearchSubgraphResult
+from sentinel.schemas.research import ResearchRefinement, ResearchSubgraphResult
 from sentinel.state import ResearchState
 
 
@@ -71,6 +74,21 @@ def _evidence_records(snippets: list[dict]) -> list[dict]:
     return records[:6]
 
 
+def _refinement_prompt(state: ResearchState) -> str:
+    hypothesis = state["hypothesis"]
+    evidence = state.get("evidence_records", [])
+    payload = {
+        "objective": state["objective"],
+        "hypothesis": hypothesis.model_dump(mode="json"),
+        "evidence": evidence,
+        "instruction": (
+            "Refine the impact, exploit preconditions, and regression tests. "
+            "Use only the supplied evidence. If exploitability is uncertain, say what remains uncertain."
+        ),
+    }
+    return json.dumps(payload, indent=2)
+
+
 def validate_scope(state: ResearchState) -> ResearchState:
     allowed = set(state.get("allowed_tool_names", []))
     forbidden = [name for name in allowed if not name.startswith("research.")]
@@ -94,10 +112,33 @@ def analyze_hypothesis(state: ResearchState) -> ResearchState:
     return state
 
 
+def refine_with_llm(state: ResearchState) -> ResearchState:
+    if not state.get("use_llm_refiner", False):
+        state.setdefault("notes", []).append("LLM research refinement disabled; using deterministic refinement.")
+        return state
+    try:
+        refinement = llm_provider.get_research_refiner(mock=False).refine(_refinement_prompt(state))
+    except Exception as exc:
+        state.setdefault("notes", []).append(f"LLM research refinement unavailable: {type(exc).__name__}: {exc}")
+        return state
+    state["llm_refinement"] = refinement
+    state.setdefault("notes", []).append("LLM research refinement applied.")
+    return state
+
+
 def create_result(state: ResearchState) -> ResearchState:
     hypothesis = state["hypothesis"]
     functions = hypothesis.affected_functions
     files = hypothesis.affected_files
+    deterministic_impact = _impact_for_class(hypothesis.vulnerability_class, functions)
+    deterministic_tests = _tests_for_class(hypothesis.vulnerability_class, functions)
+    deterministic_limitations = ["Research subgraph is deterministic; exploitability still requires targeted validation on the full project."]
+    refinement = state.get("llm_refinement") or ResearchRefinement()
+    likely_impact = refinement.likely_impact or deterministic_impact
+    recommended_tests = refinement.recommended_tests or deterministic_tests
+    exploit_preconditions = refinement.exploit_preconditions or (["Attacker can reach the affected function"] if functions else [])
+    limitations = refinement.limitations or deterministic_limitations
+    confidence = min(0.95, max(0.0, hypothesis.confidence + 0.1 + refinement.confidence_delta))
     result = ResearchSubgraphResult(
         status=ToolStatus.OK,
         subgraph_run_id=state["subgraph_run_id"],
@@ -105,12 +146,12 @@ def create_result(state: ResearchState) -> ResearchState:
         refined_title=hypothesis.title,
         vulnerability_class=hypothesis.vulnerability_class,
         evidence=state.get("evidence_records", []),
-        exploit_preconditions=["Attacker can reach the affected function"] if functions else [],
-        likely_impact=_impact_for_class(hypothesis.vulnerability_class, functions),
+        exploit_preconditions=exploit_preconditions,
+        likely_impact=likely_impact,
         evidence_to_collect=[*files, *functions],
-        recommended_tests=_tests_for_class(hypothesis.vulnerability_class, functions),
-        confidence=min(0.95, hypothesis.confidence + 0.1),
-        limitations=["Research subgraph is deterministic; exploitability still requires targeted validation on the full project."],
+        recommended_tests=recommended_tests,
+        confidence=confidence,
+        limitations=limitations,
         notes=state.get("notes", []),
     )
     state["result"] = result
@@ -121,11 +162,13 @@ def build_research_graph():
     graph = StateGraph(ResearchState)
     graph.add_node("validate_scope", validate_scope)
     graph.add_node("analyze_hypothesis", analyze_hypothesis)
+    graph.add_node("refine_with_llm", refine_with_llm)
     graph.add_node("create_result", create_result)
 
     graph.add_edge(START, "validate_scope")
     graph.add_edge("validate_scope", "analyze_hypothesis")
-    graph.add_edge("analyze_hypothesis", "create_result")
+    graph.add_edge("analyze_hypothesis", "refine_with_llm")
+    graph.add_edge("refine_with_llm", "create_result")
     graph.add_edge("create_result", END)
     return graph.compile()
 

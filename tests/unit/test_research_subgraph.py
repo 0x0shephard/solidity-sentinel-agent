@@ -1,6 +1,6 @@
 from sentinel.graphs.research import build_research_graph, run_research_subgraph
 from sentinel.schemas.common import ToolStatus
-from sentinel.schemas.research import ResearchSubgraphResult, VulnerabilityHypothesis
+from sentinel.schemas.research import ResearchRefinement, ResearchSubgraphResult, VulnerabilityHypothesis
 from sentinel.state import initial_research_state
 
 
@@ -51,6 +51,37 @@ def test_research_subgraph_removes_forbidden_tools_from_scope():
     assert isinstance(result, ResearchSubgraphResult)
     assert result.status == ToolStatus.OK
     assert any("Rejected non-research tools" in note for note in result.notes)
+
+
+def test_research_subgraph_applies_llm_refinement(monkeypatch):
+    class FakeRefiner:
+        def refine(self, prompt):
+            assert "emergencyWithdraw" in prompt
+            return ResearchRefinement(
+                likely_impact="A non-owner can drain the vault balance.",
+                exploit_preconditions=["Vault holds ETH", "Caller can reach emergencyWithdraw"],
+                recommended_tests=["Assert non-owner emergencyWithdraw reverts."],
+                limitations=["Requires confirming intended admin model."],
+                confidence_delta=0.05,
+            )
+
+    monkeypatch.setattr("sentinel.graphs.research.llm_provider.get_research_refiner", lambda mock=False: FakeRefiner())
+    state = initial_research_state(
+        subgraph_run_id="sub-1",
+        parent_run_id="parent-1",
+        objective="Find bugs",
+        hypothesis=_hypothesis(),
+        selected_snippets=[{"kind": "external_calls", "file_path": "src/Vault.sol", "line": 16, "function": "emergencyWithdraw", "text": "to.transfer(address(this).balance);"}],
+        allowed_tool_names=["research.summarize_known_pattern"],
+        use_llm_refiner=True,
+    )
+
+    result = run_research_subgraph(state)
+
+    assert result.likely_impact == "A non-owner can drain the vault balance."
+    assert result.recommended_tests == ["Assert non-owner emergencyWithdraw reverts."]
+    assert result.confidence == 0.75
+    assert "LLM research refinement applied." in result.notes
 
 
 def test_research_state_does_not_include_parent_audit_fields():
