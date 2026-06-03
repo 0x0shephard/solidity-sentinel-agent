@@ -35,6 +35,8 @@ class AuditState(TypedDict, total=False):
     findings: list[Finding]
     artifacts: list[ArtifactRef]
     errors: list[str]
+    warnings: list[str]
+    historical_findings: list[dict]
     last_outputs: dict[str, dict]
     use_llm_refiner: bool
 
@@ -51,6 +53,8 @@ class ResearchState(TypedDict, total=False):
     use_llm_refiner: bool
     notes: list[str]
     evidence_records: list[dict]
+    historical_findings: list[dict]
+    subagent_tool_ledger: list[ToolCallRecord]
     llm_refinement: ResearchRefinement
     result: ResearchSubgraphResult
 
@@ -79,6 +83,8 @@ def initial_audit_state(run_id: str, repo: str, objective: str, run_dir: str) ->
         "findings": [],
         "artifacts": [],
         "errors": [],
+        "warnings": [],
+        "historical_findings": [],
         "last_outputs": {},
         "use_llm_refiner": False,
     }
@@ -109,4 +115,6 @@ def initial_research_state(
         "allowed_tool_names": allowed_tool_names,
         "use_llm_refiner": use_llm_refiner,
         "notes": [],
+        "historical_findings": [],
+        "subagent_tool_ledger": [],
     }

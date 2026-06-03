@@ -28,6 +28,7 @@ class OllamaPlanner(BasePlanner):
         self.llm = llm or ChatOllama(model=model, base_url=base_url, temperature=0.0, format="json")
 
     def plan(self, prompt: str, tools: list[dict]) -> ToolPlan:
+        tool_catalog = json.dumps(tools, indent=2, default=str)[:120_000]
         response = self.llm.invoke(
             [
                 SystemMessage(
@@ -35,10 +36,10 @@ class OllamaPlanner(BasePlanner):
                         "You are Solidity Sentinel's planner. Return only JSON. "
                         "Use exactly this schema: "
                         '{"decisions":[{"tool_name":"repo.list_files","tool_input":{"repo_path":"..."},"rationale":"why"}]}. '
-                        "Do not invent tool names."
+                        "Choose only from the provided tool catalog. Respect side effects, schemas, and chaining hints."
                     )
                 ),
-                HumanMessage(content=prompt),
+                HumanMessage(content=f"{prompt}\n\nTool catalog:\n{tool_catalog}"),
             ]
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)

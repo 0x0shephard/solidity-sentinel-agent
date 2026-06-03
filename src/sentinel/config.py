@@ -18,26 +18,52 @@ class Settings(BaseModel):
     """
 
     runs_dir: Path = Path("runs")
-    llm_provider: LLMProviderName = "ollama"
-    model: str = "qwen2.5-coder:7b"
+    llm_provider: LLMProviderName = "huggingface"
+    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
     ollama_base_url: str = "http://localhost:11434"
     hf_token: str | None = None
     hf_base_url: str = "https://router.huggingface.co/v1"
     max_tool_calls: int = Field(default=40, ge=1)
     context_summary_interval: int = Field(default=6, ge=1)
+    solodit_api_url: str = "https://solodit.cyfrin.io/api/v1/solodit"
+    solodit_api_key: str | None = None
+    rag_dir: Path = Path("data/rag")
+    rag_embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    rag_stale_after_hours: int = Field(default=24, ge=1)
+    rag_default_page_size: int = Field(default=100, ge=1, le=100)
+    rag_filter_languages: list[str] = Field(default_factory=lambda: ["Solidity"])
+    rag_filter_impacts: list[str] = Field(default_factory=lambda: ["HIGH", "MEDIUM"])
+    rag_quality_score: int = Field(default=2, ge=0, le=5)
+    langsmith_tracing: bool = False
+    langsmith_api_key: str | None = None
+    langsmith_project: str = "solidity-sentinel-agent"
 
 
 def get_settings() -> Settings:
     """Read settings from the process environment."""
 
+    def split_csv(name: str, default: str) -> list[str]:
+        return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
+
     return Settings(
         runs_dir=Path(os.getenv("SENTINEL_RUNS_DIR", "runs")),
-        llm_provider=os.getenv("SENTINEL_LLM_PROVIDER", "ollama"),  # type: ignore[arg-type]
-        model=os.getenv("SENTINEL_MODEL", "qwen2.5-coder:7b"),
+        llm_provider=os.getenv("SENTINEL_LLM_PROVIDER", "huggingface"),  # type: ignore[arg-type]
+        model=os.getenv("SENTINEL_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct"),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         hf_token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN"),
         hf_base_url=os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1"),
         max_tool_calls=int(os.getenv("SENTINEL_MAX_TOOL_CALLS", "40")),
         context_summary_interval=int(os.getenv("SENTINEL_CONTEXT_SUMMARY_INTERVAL", "6")),
+        solodit_api_url=os.getenv("SOLODIT_API_URL", "https://solodit.cyfrin.io/api/v1/solodit"),
+        solodit_api_key=os.getenv("SOLODIT_API_KEY") or None,
+        rag_dir=Path(os.getenv("SENTINEL_RAG_DIR", "data/rag")),
+        rag_embed_model=os.getenv("SENTINEL_RAG_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+        rag_stale_after_hours=int(os.getenv("SENTINEL_RAG_STALE_AFTER_HOURS", "24")),
+        rag_default_page_size=int(os.getenv("SENTINEL_RAG_DEFAULT_PAGE_SIZE", "100")),
+        rag_filter_languages=split_csv("SENTINEL_RAG_FILTER_LANGUAGES", "Solidity"),
+        rag_filter_impacts=split_csv("SENTINEL_RAG_FILTER_IMPACTS", "HIGH,MEDIUM"),
+        rag_quality_score=int(os.getenv("SENTINEL_RAG_QUALITY_SCORE", "2")),
+        langsmith_tracing=os.getenv("LANGSMITH_TRACING", "false").lower() in {"1", "true", "yes", "on"},
+        langsmith_api_key=os.getenv("LANGSMITH_API_KEY") or None,
+        langsmith_project=os.getenv("LANGSMITH_PROJECT", "solidity-sentinel-agent"),
     )
-

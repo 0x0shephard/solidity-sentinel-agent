@@ -1,15 +1,16 @@
 from sentinel.config import get_settings
 
 
-def test_settings_read_ollama_defaults(monkeypatch):
+def test_settings_read_huggingface_defaults(monkeypatch):
     monkeypatch.delenv("SENTINEL_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("SENTINEL_MODEL", raising=False)
 
     settings = get_settings()
 
-    assert settings.llm_provider == "ollama"
-    assert settings.model == "qwen2.5-coder:7b"
+    assert settings.llm_provider == "huggingface"
+    assert settings.model == "Qwen/Qwen2.5-Coder-7B-Instruct"
     assert settings.ollama_base_url == "http://localhost:11434"
+    assert settings.rag_embed_model == "sentence-transformers/all-MiniLM-L6-v2"
 
 
 def test_settings_support_huggingface(monkeypatch):
@@ -22,4 +23,3 @@ def test_settings_support_huggingface(monkeypatch):
     assert settings.llm_provider == "huggingface"
     assert settings.model == "Qwen/Qwen2.5-Coder-7B-Instruct"
     assert settings.hf_token == "test-token"
-

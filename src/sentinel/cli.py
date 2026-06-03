@@ -2,13 +2,16 @@ import typer
 
 from sentinel.evals.runner import FIXTURES, run_all, run_fixture, write_eval_summary
 from sentinel.graphs.parent import run_audit
+from sentinel.rag.sync import sync_solodit
 from sentinel.tools import build_default_registry
 
 app = typer.Typer(help="Solidity Sentinel CLI")
 eval_app = typer.Typer(help="Run fixture evaluations")
 tools_app = typer.Typer(help="Inspect registered tools")
+rag_app = typer.Typer(help="Manage Solodit RAG cache")
 app.add_typer(eval_app, name="eval")
 app.add_typer(tools_app, name="tools")
+app.add_typer(rag_app, name="rag")
 
 
 @app.callback()
@@ -31,6 +34,20 @@ def audit(
     typer.echo(f"Current focus: {state['current_focus']}")
     typer.echo(f"State: {state['run_dir']}/state.json")
     typer.echo(f"Report: {state['run_dir']}/report.md")
+
+
+@rag_app.command("sync")
+def rag_sync(stale_ok: bool = typer.Option(True, "--stale-ok/--strict", help="Use stale cache if live Solodit sync fails.")) -> None:
+    """Synchronize Solodit findings into the local RAG cache."""
+
+    result = sync_solodit(stale_ok=stale_ok)
+    typer.echo(f"Status: {result.status.value}")
+    typer.echo(f"Findings: {result.finding_count}")
+    typer.echo(f"Pages: {result.page_count}")
+    if result.message:
+        typer.echo(f"Message: {result.message}")
+    if result.chroma_path:
+        typer.echo(f"Chroma: {result.chroma_path}")
 
 
 @tools_app.command("list")
@@ -72,3 +89,7 @@ def eval_main(
     for score in scores:
         typer.echo(f"{score.fixture}: {score.score:.0f}/100")
     typer.echo(f"Summary: {out_dir}")
+
+
+if __name__ == "__main__":
+    app()

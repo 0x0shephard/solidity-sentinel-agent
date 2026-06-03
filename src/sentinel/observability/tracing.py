@@ -2,14 +2,26 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from pathlib import Path
 import uuid
 
-from sentinel.artifacts import append_jsonl
+from sentinel.config import get_settings
 
 
 @contextmanager
 def trace_span(name: str, run_dir: str | None = None, **attrs):
+    settings = get_settings()
+    if settings.langsmith_tracing and settings.langsmith_api_key:
+        try:
+            from langsmith.run_helpers import trace
+
+            with trace(name, run_type="chain", inputs=attrs, project_name=settings.langsmith_project) as run:
+                try:
+                    yield run
+                except Exception:
+                    raise
+            return
+        except Exception:
+            pass
     span = {
         "trace_id": attrs.get("trace_id") or str(uuid.uuid4()),
         "span_id": str(uuid.uuid4()),
@@ -28,6 +40,3 @@ def trace_span(name: str, run_dir: str | None = None, **attrs):
         raise
     finally:
         span["end_time"] = datetime.now(UTC).isoformat()
-        if run_dir:
-            append_jsonl(Path(run_dir) / "trace.jsonl", span)
-

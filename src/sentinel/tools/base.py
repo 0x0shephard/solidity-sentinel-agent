@@ -27,6 +27,8 @@ class RegisteredTool(BaseModel):
     side_effects: list[SideEffect] = Field(default_factory=lambda: [SideEffect.NONE])
     requires_network: bool = False
     examples: list[dict[str, Any]] = Field(default_factory=list)
+    chaining_hints: list[str] = Field(default_factory=list)
+    execution_kind: str = "deterministic"
 
     @property
     def full_name(self) -> str:
@@ -40,10 +42,13 @@ class RegisteredTool(BaseModel):
             "namespace": self.namespace,
             "description": self.description,
             "input_schema": self.input_model.__name__,
+            "input_json_schema": self.input_model.model_json_schema(),
             "output_schema": self.output_model.__name__,
+            "output_json_schema": self.output_model.model_json_schema(),
             "risk_level": self.risk_level.value,
             "side_effects": [effect.value for effect in self.side_effects],
             "requires_network": self.requires_network,
             "examples": self.examples,
+            "chaining_hints": self.chaining_hints,
+            "execution_kind": self.execution_kind,
         }
-

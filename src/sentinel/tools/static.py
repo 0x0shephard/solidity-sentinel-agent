@@ -271,7 +271,7 @@ def register(registry) -> None:
         RegisteredTool(namespace="static", name="extract_token_transfers", description="Extract token transfer patterns.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_token_transfers, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_storage_writes", description="Extract likely storage write lines.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_storage_writes, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="find_oracle_patterns", description="Find oracle and price-read patterns.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=find_oracle_patterns, side_effects=[SideEffect.READ_FILES]),
-        RegisteredTool(namespace="static", name="run_slither", description="Run Slither and write JSON artifact.", input_model=RepoPathInput, output_model=RunSlitherOutput, fn=run_slither, side_effects=[SideEffect.EXECUTE_LOCAL]),
+        RegisteredTool(namespace="static", name="run_slither", description="Run Slither and write JSON artifact.", input_model=RepoPathInput, output_model=RunSlitherOutput, fn=run_slither, side_effects=[SideEffect.EXECUTE_LOCAL], chaining_hints=["Use raw_json_path as static.parse_slither.raw_json_path."]),
         RegisteredTool(namespace="static", name="parse_slither", description="Parse Slither JSON artifact into typed findings.", input_model=ParseSlitherInput, output_model=ParseSlitherOutput, fn=parse_slither, side_effects=[SideEffect.READ_FILES]),
     ]:
         registry.register(tool)

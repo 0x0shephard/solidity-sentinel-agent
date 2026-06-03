@@ -54,8 +54,8 @@ def test_parent_graph_compiles_and_finishes(tmp_path):
     if run_status not in {"skipped", "unavailable"}:
         assert (run_dir / "artifacts" / "validation-run-result.json").exists()
     assert (run_dir / "tool_ledger.jsonl").exists()
-    assert (run_dir / "logs.jsonl").exists()
-    assert (run_dir / "trace.jsonl").exists()
+    assert not (run_dir / "logs.jsonl").exists()
+    assert not (run_dir / "trace.jsonl").exists()
 
 
 def test_run_audit_parent_graph_returns_state(tmp_path, monkeypatch):

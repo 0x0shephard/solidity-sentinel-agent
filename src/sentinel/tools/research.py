@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from sentinel.config import get_settings
+from sentinel.rag.ranking import rank_matches
+from sentinel.rag.store import HistoricalFindingStore
+from sentinel.rag.sync import sync_solodit
 from sentinel.schemas.common import SideEffect, ToolStatus
+from sentinel.schemas.rag import HistoricalFindingQuery, HistoricalFindingSearchOutput, RagSyncOutput
 from sentinel.schemas.research import VulnerabilityHypothesis
 from sentinel.tools.base import RegisteredTool
 
@@ -264,6 +269,45 @@ def retrieve_similar_cases(inp: ResearchGenericInput, state) -> ResearchGenericO
     return ResearchGenericOutput(status=ToolStatus.OK, data={"similar_cases": ["SWC-105", "SWC-107", "unchecked ERC20 return values"]})
 
 
+def solodit_sync(inp: ResearchGenericInput, state) -> RagSyncOutput:
+    stale_ok = bool(inp.data.get("stale_ok", True))
+    result = sync_solodit(stale_ok=stale_ok)
+    state.setdefault("last_outputs", {})["research.solodit_sync"] = result.model_dump(mode="json")
+    if result.message:
+        state.setdefault("warnings", []).append(result.message)
+    return RagSyncOutput(status=result.status, state=result)
+
+
+def retrieve_historical_findings(inp: HistoricalFindingQuery, state) -> HistoricalFindingSearchOutput:
+    settings = get_settings()
+    candidates = HistoricalFindingStore(settings).search(inp)
+    matches = rank_matches(inp, candidates)
+    if matches:
+        state.setdefault("historical_findings", []).extend(matches)
+    return HistoricalFindingSearchOutput(status=ToolStatus.OK, matches=matches)
+
+
+def compare_to_known_bug(inp: HistoricalFindingQuery, state) -> HistoricalFindingSearchOutput:
+    output = retrieve_historical_findings(inp, state)
+    for match in output.matches:
+        match.relevance_reason = f"Known-bug comparison: {match.relevance_reason}"
+    return output
+
+
+def challenge_finding(inp: HistoricalFindingQuery, state) -> ResearchGenericOutput:
+    local_evidence = state.get("static_facts", {})
+    has_local_evidence = any(local_evidence.get(group) for group in ["functions", "external_calls", "token_transfers", "storage_writes", "slither_findings", "access_control"])
+    warning = None if has_local_evidence else "Historical findings are not local evidence; collect target-repo evidence before reporting."
+    return ResearchGenericOutput(
+        status=ToolStatus.OK,
+        data={
+            "query": inp.query,
+            "has_local_evidence": has_local_evidence,
+            "challenge": warning or "Historical matches may support prioritization, but the report must cite local source facts.",
+        },
+    )
+
+
 def map_to_vulnerability_class(inp: ResearchGenericInput, state) -> ResearchGenericOutput:
     text = " ".join(str(value) for value in inp.data.values()).lower()
     vuln_class = "missing_access_control" if "owner" in text or "access" in text else "manual_review"
@@ -282,6 +326,10 @@ def register(registry) -> None:
     for tool in [
         RegisteredTool(namespace="research", name="search_local_vuln_db", description="Search local vulnerability class memory.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=search_local_vuln_db, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="retrieve_similar_cases", description="Retrieve similar vulnerability cases.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=retrieve_similar_cases, side_effects=[SideEffect.NONE]),
+        RegisteredTool(namespace="research", name="solodit_sync", description="Synchronize Solodit historical findings into the local RAG cache.", input_model=ResearchGenericInput, output_model=RagSyncOutput, fn=solodit_sync, side_effects=[SideEffect.EXTERNAL_NETWORK]),
+        RegisteredTool(namespace="research", name="retrieve_historical_findings", description="Retrieve and hybrid-rank Solodit historical findings.", input_model=HistoricalFindingQuery, output_model=HistoricalFindingSearchOutput, fn=retrieve_historical_findings, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="research", name="compare_to_known_bug", description="Compare local hypothesis text to known historical findings.", input_model=HistoricalFindingQuery, output_model=HistoricalFindingSearchOutput, fn=compare_to_known_bug, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="research", name="challenge_finding", description="Challenge whether historical matches are supported by local target evidence.", input_model=HistoricalFindingQuery, output_model=ResearchGenericOutput, fn=challenge_finding, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="map_to_vulnerability_class", description="Map evidence to vulnerability class.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=map_to_vulnerability_class, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="rank_hypotheses", description="Rank candidate vulnerability hypotheses.", input_model=RankHypothesesInput, output_model=RankHypothesesOutput, fn=rank_hypotheses, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="summarize_known_pattern", description="Summarize a known vulnerability pattern.", input_model=ResearchNoteInput, output_model=ResearchNoteOutput, fn=summarize_known_pattern, side_effects=[SideEffect.NONE]),

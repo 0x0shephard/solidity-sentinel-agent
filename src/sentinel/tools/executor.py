@@ -10,6 +10,7 @@ import uuid
 from pydantic import BaseModel, ValidationError
 
 from sentinel.artifacts import append_jsonl
+from sentinel.config import get_settings
 from sentinel.errors import ToolExecutionError, ToolValidationError
 from sentinel.observability.logging import log_event
 from sentinel.observability.tracing import trace_span
@@ -36,6 +37,9 @@ class ToolExecutor:
 
     def execute(self, tool_name: str, raw_input: dict, state: AuditState) -> BaseModel:
         tool = self.registry.get(tool_name)
+        max_tool_calls = get_settings().max_tool_calls
+        if state.get("tool_call_count", 0) >= max_tool_calls:
+            raise ToolExecutionError(f"Tool call budget exceeded: {max_tool_calls}")
         run_dir = state.get("run_dir")
         started_at = datetime.now(UTC)
         start_timer = time.perf_counter()

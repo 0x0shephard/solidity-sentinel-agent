@@ -8,10 +8,15 @@ from sentinel.llm import provider as llm_provider
 from sentinel.schemas.common import ToolStatus
 from sentinel.schemas.research import ResearchRefinement, ResearchSubgraphResult
 from sentinel.state import ResearchState
+from sentinel.tools import build_default_registry
+from sentinel.tools.executor import ToolExecutor
 
 
 DEFAULT_RESEARCH_TOOLS = [
     "research.summarize_known_pattern",
+    "research.retrieve_historical_findings",
+    "research.compare_to_known_bug",
+    "research.challenge_finding",
 ]
 
 
@@ -99,6 +104,11 @@ def validate_scope(state: ResearchState) -> ResearchState:
     return state
 
 
+def _scoped_executor(state: ResearchState) -> ToolExecutor:
+    registry = build_default_registry().scoped(state.get("allowed_tool_names", DEFAULT_RESEARCH_TOOLS))
+    return ToolExecutor(registry)
+
+
 def analyze_hypothesis(state: ResearchState) -> ResearchState:
     hypothesis = state["hypothesis"]
     snippets = state.get("selected_snippets", [])
@@ -109,6 +119,40 @@ def analyze_hypothesis(state: ResearchState) -> ResearchState:
         state.setdefault("notes", []).append(f"No snippets were provided for {hypothesis.id}; confidence remains conservative.")
         state["evidence_records"] = []
     state.setdefault("notes", []).append(f"Mapped hypothesis class: {hypothesis.vulnerability_class}.")
+    return state
+
+
+def retrieve_historical_context(state: ResearchState) -> ResearchState:
+    hypothesis = state["hypothesis"]
+    query = " ".join(
+        [
+            state["objective"],
+            hypothesis.title,
+            hypothesis.evidence_summary,
+            " ".join(hypothesis.affected_functions),
+            " ".join(hypothesis.affected_files),
+        ]
+    )
+    executor = _scoped_executor(state)
+    tool_state = {
+        "run_id": state["subgraph_run_id"],
+        "run_dir": "",
+        "tool_call_count": 0,
+        "tool_ledger": [],
+        "last_outputs": {},
+        "static_facts": {},
+    }
+    try:
+        output = executor.execute(
+            "research.retrieve_historical_findings",
+            {"query": query, "vulnerability_class": hypothesis.vulnerability_class, "top_k": 3},
+            tool_state,
+        )
+        state["historical_findings"] = output.model_dump(mode="json").get("matches", [])
+        state["subagent_tool_ledger"] = tool_state.get("tool_ledger", [])
+        state.setdefault("notes", []).append(f"Retrieved {len(state['historical_findings'])} historical finding match(es).")
+    except Exception as exc:
+        state.setdefault("notes", []).append(f"Historical retrieval unavailable: {type(exc).__name__}: {exc}")
     return state
 
 
@@ -153,6 +197,8 @@ def create_result(state: ResearchState) -> ResearchState:
         confidence=confidence,
         limitations=limitations,
         notes=state.get("notes", []),
+        historical_findings=state.get("historical_findings", []),
+        subagent_tool_ledger=[record.model_dump(mode="json") if hasattr(record, "model_dump") else record for record in state.get("subagent_tool_ledger", [])],
     )
     state["result"] = result
     return state
@@ -162,12 +208,14 @@ def build_research_graph():
     graph = StateGraph(ResearchState)
     graph.add_node("validate_scope", validate_scope)
     graph.add_node("analyze_hypothesis", analyze_hypothesis)
+    graph.add_node("retrieve_historical_context", retrieve_historical_context)
     graph.add_node("refine_with_llm", refine_with_llm)
     graph.add_node("create_result", create_result)
 
     graph.add_edge(START, "validate_scope")
     graph.add_edge("validate_scope", "analyze_hypothesis")
-    graph.add_edge("analyze_hypothesis", "refine_with_llm")
+    graph.add_edge("analyze_hypothesis", "retrieve_historical_context")
+    graph.add_edge("retrieve_historical_context", "refine_with_llm")
     graph.add_edge("refine_with_llm", "create_result")
     graph.add_edge("create_result", END)
     return graph.compile()

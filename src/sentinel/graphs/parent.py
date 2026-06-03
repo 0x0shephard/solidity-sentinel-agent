@@ -11,6 +11,7 @@ from sentinel.graphs.research import DEFAULT_RESEARCH_TOOLS, run_research_subgra
 from sentinel.llm.provider import get_planner
 from sentinel.observability.logging import log_event
 from sentinel.observability.tracing import trace_span
+from sentinel.rag.sync import sync_solodit
 from sentinel.reporting import build_report_document, create_findings_from_state, render_markdown_report
 from sentinel.schemas.common import CompletedStep, PlanStep
 from sentinel.schemas.research import VulnerabilityHypothesis
@@ -93,14 +94,39 @@ def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: Vulnerabili
 
 
 def _tool_prompt(state: AuditState) -> str:
+    remaining_budget = max(0, 40 - state.get("tool_call_count", 0))
+    rag_context = state.get("last_outputs", {}).get("research.retrieve_historical_findings", {})
     return (
         f"Objective: {state['objective']}\n"
         f"Repository path: {state['repo_path']}\n"
         f"Current focus: {state.get('current_focus', 'initialize')}\n"
         f"Compressed context: {state.get('compressed_context', '')}\n\n"
+        f"Remaining approximate tool budget: {remaining_budget}\n"
+        f"Available RAG context: {rag_context}\n\n"
         "Return a concise plan for the next safe audit tools to run. "
-        "Prefer repo/build/static/research tools. Include repo_path in inputs when needed."
+        "Prefer repo/build/static/research tools. Include repo_path in inputs when needed. "
+        "Use output_references when one tool output should feed another input."
     )
+
+
+def _resolve_output_references(state: AuditState, tool_input: dict, references: list[dict]) -> dict:
+    resolved = dict(tool_input)
+    for ref in references:
+        from_tool = ref.get("from_tool")
+        path = str(ref.get("path", ""))
+        target_input = ref.get("target_input")
+        if not from_tool or not path or not target_input:
+            continue
+        value = state.get("last_outputs", {}).get(from_tool)
+        for part in path.split("."):
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                value = None
+                break
+        if value is not None:
+            resolved[target_input] = value
+    return resolved
 
 
 def plan_with_llm(state: AuditState) -> AuditState:
@@ -115,7 +141,7 @@ def plan_with_llm(state: AuditState) -> AuditState:
             state.setdefault("errors", []).append(f"LLM selected unknown tool: {decision.tool_name}")
             continue
         tool = registry.get(decision.tool_name)
-        tool_input = dict(decision.tool_input)
+        tool_input = _resolve_output_references(state, dict(decision.tool_input), decision.output_references)
         if "repo_path" in tool.input_model.model_fields and "repo_path" not in tool_input:
             tool_input["repo_path"] = state["repo_path"]
         required = {name for name, field in tool.input_model.model_fields.items() if field.is_required()}
@@ -141,6 +167,15 @@ def initialize_run(state: AuditState) -> AuditState:
         PlanStep(id="rank_hypotheses", description="Create early vulnerability hypotheses"),
         PlanStep(id="finish", description="Persist state artifacts"),
     ]
+    return state
+
+
+def maybe_sync_solodit_rag(state: AuditState) -> AuditState:
+    result = sync_solodit(stale_ok=True)
+    state["last_outputs"]["research.solodit_sync"] = {"status": result.status.value, "state": result.model_dump(mode="json")}
+    if result.message:
+        state.setdefault("warnings", []).append(result.message)
+    state["current_focus"] = "inspect_repo"
     return state
 
 
@@ -226,6 +261,24 @@ def rank_hypotheses(state: AuditState) -> AuditState:
     return state
 
 
+def rag_retrieve_context(state: AuditState) -> AuditState:
+    hypotheses = state.get("hypotheses", [])
+    if not hypotheses:
+        return state
+    hypothesis = hypotheses[0]
+    query = " ".join([state["objective"], hypothesis.title, hypothesis.evidence_summary, " ".join(hypothesis.affected_functions)])
+    try:
+        _run_tool(
+            state,
+            "research.retrieve_historical_findings",
+            {"query": query, "vulnerability_class": hypothesis.vulnerability_class, "top_k": 5},
+        )
+    except Exception as exc:
+        state.setdefault("warnings", []).append(f"RAG retrieval unavailable: {type(exc).__name__}: {exc}")
+    state["current_focus"] = "research_subgraph"
+    return state
+
+
 def research_subgraph(state: AuditState) -> AuditState:
     hypotheses = state.get("hypotheses", [])
     if not hypotheses:
@@ -299,22 +352,26 @@ def finish(state: AuditState) -> AuditState:
 def build_parent_graph(use_llm_planner: bool = False):
     graph = StateGraph(AuditState)
     graph.add_node("initialize_run", initialize_run)
+    graph.add_node("maybe_sync_solodit_rag", maybe_sync_solodit_rag)
     graph.add_node("plan_with_llm", plan_with_llm)
     graph.add_node("inspect_repo", inspect_repo)
     graph.add_node("detect_framework", detect_framework)
     graph.add_node("run_static_analysis", run_static_analysis)
     graph.add_node("rank_hypotheses", rank_hypotheses)
+    graph.add_node("rag_retrieve_context", rag_retrieve_context)
     graph.add_node("research_subgraph", research_subgraph)
     graph.add_node("summarize_context", summarize_context)
     graph.add_node("finish", finish)
 
     graph.add_edge(START, "initialize_run")
-    graph.add_edge("initialize_run", "plan_with_llm" if use_llm_planner else "inspect_repo")
+    graph.add_edge("initialize_run", "maybe_sync_solodit_rag")
+    graph.add_edge("maybe_sync_solodit_rag", "plan_with_llm" if use_llm_planner else "inspect_repo")
     graph.add_edge("plan_with_llm", "inspect_repo")
     graph.add_edge("inspect_repo", "detect_framework")
     graph.add_edge("detect_framework", "run_static_analysis")
     graph.add_edge("run_static_analysis", "rank_hypotheses")
-    graph.add_edge("rank_hypotheses", "research_subgraph")
+    graph.add_edge("rank_hypotheses", "rag_retrieve_context")
+    graph.add_edge("rag_retrieve_context", "research_subgraph")
     graph.add_edge("research_subgraph", "summarize_context")
     graph.add_edge("summarize_context", "finish")
     graph.add_edge("finish", END)

@@ -3,6 +3,7 @@ import pytest
 from sentinel.config import Settings
 from sentinel.errors import ConfigurationError, NonRetryableExternalError
 from sentinel.llm.base import ToolDecision, ToolPlan
+from sentinel.llm.huggingface import HuggingFacePlanner
 from sentinel.llm.ollama import extract_json_object
 from sentinel.llm.provider import get_planner, get_research_refiner
 
@@ -38,6 +39,16 @@ def test_huggingface_provider_requires_token():
 def test_huggingface_research_refiner_requires_token():
     with pytest.raises(ConfigurationError):
         get_research_refiner(Settings(llm_provider="huggingface", model="Qwen/Qwen2.5-Coder-7B-Instruct"), mock=False)
+
+
+def test_huggingface_planner_allows_default_router_base_url():
+    planner = HuggingFacePlanner(
+        model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        token="test-token",
+        base_url="https://router.huggingface.co/v1",
+    )
+
+    assert planner.llm.model_id == "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 
 def test_tool_plan_schema():

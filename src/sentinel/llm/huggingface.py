@@ -10,27 +10,46 @@ from sentinel.llm.ollama import extract_json_object
 from sentinel.schemas.research import ResearchRefinement
 
 
+DEFAULT_HF_ROUTER_URL = "https://router.huggingface.co/v1"
+
+
+def _endpoint_kwargs(model: str, base_url: str | None) -> dict:
+    """Build HuggingFaceEndpoint kwargs without mixing model and endpoint_url.
+
+    The LangChain HuggingFaceEndpoint class treats `endpoint_url` as a
+    dedicated endpoint alternative to `model`, not as a generic base URL.
+    Passing both raises a Pydantic validation error. The default HF router path
+    works with `model`; a custom non-router URL is treated as a dedicated
+    endpoint.
+    """
+
+    if base_url and base_url.rstrip("/") != DEFAULT_HF_ROUTER_URL.rstrip("/"):
+        return {"endpoint_url": base_url}
+    return {"model": model}
+
+
 class HuggingFacePlanner(BasePlanner):
     def __init__(self, model: str, token: str, base_url: str | None = None, llm: ChatHuggingFace | None = None) -> None:
         endpoint = HuggingFaceEndpoint(
-            model=model,
+            **_endpoint_kwargs(model, base_url),
             huggingfacehub_api_token=token,
-            endpoint_url=base_url,
             temperature=0.0,
             max_new_tokens=1024,
         )
         self.llm = llm or ChatHuggingFace(llm=endpoint, model_id=model, temperature=0.0)
 
     def plan(self, prompt: str, tools: list[dict]) -> ToolPlan:
+        tool_catalog = json.dumps(tools, indent=2, default=str)[:120_000]
         response = self.llm.invoke(
             [
                 SystemMessage(
                     content=(
                         "You are Solidity Sentinel's planner. Return only JSON with key decisions. "
-                        "Each decision must include tool_name, tool_input, and rationale. Do not invent tool names."
+                        "Each decision must include tool_name, tool_input, and rationale. "
+                        "Choose only from the provided tool catalog and respect schemas, risks, side effects, and chaining hints."
                     )
                 ),
-                HumanMessage(content=prompt),
+                HumanMessage(content=f"{prompt}\n\nTool catalog:\n{tool_catalog}"),
             ]
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
@@ -40,9 +59,8 @@ class HuggingFacePlanner(BasePlanner):
 class HuggingFaceResearchRefiner(BaseResearchRefiner):
     def __init__(self, model: str, token: str, base_url: str | None = None, llm: ChatHuggingFace | None = None) -> None:
         endpoint = HuggingFaceEndpoint(
-            model=model,
+            **_endpoint_kwargs(model, base_url),
             huggingfacehub_api_token=token,
-            endpoint_url=base_url,
             temperature=0.0,
             max_new_tokens=1024,
         )

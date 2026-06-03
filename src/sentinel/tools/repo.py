@@ -6,6 +6,7 @@ import shutil
 from pydantic import BaseModel, Field
 
 from sentinel.reliability.subprocess import run_command
+from sentinel.errors import SandboxViolationError
 from sentinel.schemas.common import SideEffect, ToolStatus
 from sentinel.tools.base import RegisteredTool
 
@@ -74,6 +75,14 @@ def _safe_files(repo_path: str) -> list[Path]:
     return [path for path in root.rglob("*") if path.is_file() and ".git" not in path.parts]
 
 
+def _resolve_inside(repo_path: str, file_path: str) -> Path:
+    root = Path(repo_path).resolve()
+    target = (root / file_path).resolve()
+    if target != root and root not in target.parents:
+        raise SandboxViolationError(f"Path escapes repo_path: {file_path}")
+    return target
+
+
 def list_files(inp: RepoListFilesInput, state) -> RepoListFilesOutput:
     root = Path(inp.repo_path)
     files = [str(path.relative_to(root)) for path in _safe_files(inp.repo_path)]
@@ -82,7 +91,7 @@ def list_files(inp: RepoListFilesInput, state) -> RepoListFilesOutput:
 
 
 def read_file(inp: RepoReadFileInput, state) -> RepoReadFileOutput:
-    target = Path(inp.repo_path) / inp.file_path
+    target = _resolve_inside(inp.repo_path, inp.file_path)
     raw = target.read_bytes()
     truncated = len(raw) > inp.max_bytes
     content = raw[: inp.max_bytes].decode("utf-8", errors="replace")
@@ -119,7 +128,7 @@ def find_tests(inp: RepoPathInput, state) -> RepoListFilesOutput:
 
 
 def write_file(inp: RepoWriteFileInput, state) -> RepoGenericOutput:
-    target = Path(inp.repo_path) / inp.file_path
+    target = _resolve_inside(inp.repo_path, inp.file_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(inp.content, encoding="utf-8")
     return RepoGenericOutput(status=ToolStatus.OK, message=f"Wrote {inp.file_path}")

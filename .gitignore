@@ -1,6 +1,9 @@
 SOLIDITY_SENTINEL_CODEX_CONTEXT.md
+ARCHITECTURE_AUDIT_REVIEW.md
+.env
 .venv/
 runs/
+data/rag/
 __pycache__/
 .pytest_cache/
 *.egg-info/
