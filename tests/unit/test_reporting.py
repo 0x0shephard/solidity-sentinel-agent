@@ -1,5 +1,5 @@
 from sentinel.reporting import build_report_document, create_findings_from_state, render_markdown_report
-from sentinel.schemas.common import ToolStatus
+from sentinel.schemas.common import ArtifactRef, ToolStatus
 from sentinel.schemas.research import ResearchSubgraphResult, VulnerabilityHypothesis
 from sentinel.state import initial_audit_state
 
@@ -100,3 +100,19 @@ def test_markdown_report_renders_evidence_line_numbers():
 
     assert "`src/Vault.sol:23::withdraw`" in markdown
     assert "token.transfer(msg.sender, amount);" in markdown
+
+
+def test_markdown_report_renders_artifacts():
+    state = initial_audit_state("run-1", "./repo", "Find bugs", "runs/run-1")
+    state["artifacts"] = [
+        ArtifactRef(
+            kind="foundry_validation_test",
+            path="runs/run-1/artifacts/validation-tests/SentinelTest.t.sol",
+            description="Generated Foundry validation test",
+        )
+    ]
+
+    markdown = render_markdown_report(build_report_document(state))
+
+    assert "## Artifacts" in markdown
+    assert "SentinelTest.t.sol" in markdown

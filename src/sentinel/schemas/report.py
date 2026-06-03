@@ -37,6 +37,6 @@ class ReportDocument(BaseModel):
     objective: str
     repo_path: str
     findings: list[Finding] = Field(default_factory=list)
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
     tool_call_count: int = Field(ge=0)
     subgraphs_spawned: int = Field(ge=0)
-

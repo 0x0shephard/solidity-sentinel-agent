@@ -43,6 +43,35 @@ def test_dynamic_create_and_patch_poc_test(tmp_path):
     assert Path(patched.data["path"]).exists()
 
 
+def test_dynamic_generate_validation_artifact_in_run_dir(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_dir = tmp_path / "runs" / "run-1"
+    state = initial_audit_state("run-1", str(repo), "Find bugs", str(run_dir))
+    state["hypotheses"] = [
+        VulnerabilityHypothesis(
+            id="hyp-1",
+            title="Unchecked transfer",
+            vulnerability_class="unchecked_transfer",
+            affected_files=["src/UnsafeTokenVault.sol"],
+            affected_functions=["withdraw"],
+            evidence_summary="Ignored ERC20 transfer return value",
+            confidence=0.7,
+        )
+    ]
+    executor = ToolExecutor(build_default_registry())
+
+    generated = executor.execute("dynamic.generate_validation_artifacts", {"repo_path": str(repo)}, state)
+
+    artifact_path = Path(generated.data["path"])
+    content = artifact_path.read_text(encoding="utf-8")
+    assert generated.status == ToolStatus.OK
+    assert artifact_path.exists()
+    assert "SentinelFalseReturnToken" in content
+    assert "target.withdraw(1 ether);" in content
+    assert state["artifacts"][0].kind == "foundry_validation_test"
+
+
 def test_dynamic_parse_and_classify_test_output():
     state = initial_audit_state("run-1", ".", "Find bugs", "runs/run-1")
     executor = ToolExecutor(build_default_registry())
@@ -89,4 +118,3 @@ def test_memory_artifact_and_plan_tools():
     assert artifact.status == ToolStatus.OK
     assert artifact.data["artifact_count"] == 1
     assert plan.status == ToolStatus.OK
-

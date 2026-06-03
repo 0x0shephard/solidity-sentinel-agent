@@ -65,6 +65,7 @@ def build_report_document(state: AuditState) -> ReportDocument:
         objective=state["objective"],
         repo_path=state["repo_path"],
         findings=state.get("findings", []),
+        artifacts=state.get("artifacts", []),
         tool_call_count=state.get("tool_call_count", 0),
         subgraphs_spawned=len(state.get("subgraph_results", [])),
     )
@@ -81,6 +82,12 @@ def render_markdown_report(report: ReportDocument) -> str:
         f"Research subgraphs: {report.subgraphs_spawned}",
         "",
     ]
+    if report.artifacts:
+        lines.extend(["## Artifacts", ""])
+        for artifact in report.artifacts:
+            description = f": {artifact.description}" if artifact.description else ""
+            lines.append(f"- `{artifact.path}` ({artifact.kind}){description}")
+        lines.append("")
     if not report.findings:
         lines.append("No findings were generated.")
         return "\n".join(lines) + "\n"

@@ -44,6 +44,7 @@ def test_parent_graph_compiles_and_finishes(tmp_path):
     assert (run_dir / "state.json").exists()
     assert (run_dir / "report.json").exists()
     assert (run_dir / "report.md").exists()
+    assert list((run_dir / "artifacts" / "validation-tests").glob("*.t.sol"))
     assert (run_dir / "tool_ledger.jsonl").exists()
     assert (run_dir / "logs.jsonl").exists()
     assert (run_dir / "trace.jsonl").exists()
@@ -65,3 +66,4 @@ def test_run_audit_parent_graph_returns_state(tmp_path, monkeypatch):
     report = json.loads(Path("runs/fixed-run/report.json").read_text(encoding="utf-8"))
     assert report["run_id"] == "fixed-run"
     assert report["tool_call_count"] >= 20
+    assert report["artifacts"]
