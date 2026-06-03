@@ -32,12 +32,13 @@ class RAGState(TypedDict, total=False):
     grade: RetrievalQualityGrade
     critiques: list
     used_repair: bool
+    targeted_rag: dict
     notes: list[str]
     subagent_tool_ledger: list
     bundle: RAGContextBundle
 
 
-def initial_rag_state(subgraph_run_id: str, parent_run_id: str, hypothesis: VulnerabilityHypothesis) -> RAGState:
+def initial_rag_state(subgraph_run_id: str, parent_run_id: str, hypothesis: VulnerabilityHypothesis, targeted_rag: dict | None = None) -> RAGState:
     return {
         "subgraph_run_id": subgraph_run_id,
         "parent_run_id": parent_run_id,
@@ -47,6 +48,7 @@ def initial_rag_state(subgraph_run_id: str, parent_run_id: str, hypothesis: Vuln
         "matches": [],
         "critiques": [],
         "used_repair": False,
+        "targeted_rag": targeted_rag or {},
         "notes": [],
         "subagent_tool_ledger": [],
     }
@@ -64,6 +66,7 @@ def _tool_state(state: RAGState) -> dict:
         "tool_ledger": [],
         "last_outputs": {},
         "historical_findings": [],
+        "targeted_rag": state.get("targeted_rag", {}),
     }
 
 
@@ -184,4 +187,3 @@ def run_rag_subgraph(state: RAGState) -> RAGContextBundle:
         return result["bundle"]
     except Exception as exc:
         return empty_bundle(state["hypothesis"], f"RAG subgraph unavailable: {type(exc).__name__}: {exc}")
-

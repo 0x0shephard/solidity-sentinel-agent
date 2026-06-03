@@ -8,8 +8,8 @@ from sentinel.config import Settings
 from sentinel.schemas.rag import HistoricalFinding, HistoricalFindingQuery
 
 
-def rag_paths(settings: Settings) -> dict[str, Path]:
-    root = settings.rag_dir
+def rag_paths(settings: Settings, root: Path | None = None) -> dict[str, Path]:
+    root = root or settings.rag_dir
     return {
         "root": root,
         "raw": root / "solodit_raw_cache.jsonl",
@@ -19,8 +19,8 @@ def rag_paths(settings: Settings) -> dict[str, Path]:
     }
 
 
-def write_findings(settings: Settings, raw_findings: list[dict], findings: list[HistoricalFinding]) -> None:
-    paths = rag_paths(settings)
+def write_findings(settings: Settings, raw_findings: list[dict], findings: list[HistoricalFinding], root: Path | None = None) -> None:
+    paths = rag_paths(settings, root)
     paths["root"].mkdir(parents=True, exist_ok=True)
     with paths["raw"].open("w", encoding="utf-8") as handle:
         for finding in raw_findings:
@@ -30,8 +30,8 @@ def write_findings(settings: Settings, raw_findings: list[dict], findings: list[
             handle.write(json.dumps(finding.model_dump(mode="json")) + "\n")
 
 
-def load_findings(settings: Settings) -> list[HistoricalFinding]:
-    path = rag_paths(settings)["normalized"]
+def load_findings(settings: Settings, root: Path | None = None) -> list[HistoricalFinding]:
+    path = rag_paths(settings, root)["normalized"]
     if not path.exists():
         return []
     findings = []
@@ -44,11 +44,12 @@ def load_findings(settings: Settings) -> list[HistoricalFinding]:
 class HistoricalFindingStore:
     """Persistent Chroma-backed store, with JSON fallback when Chroma is not installed."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, root: Path | None = None) -> None:
         self.settings = settings
+        self.root = root
 
     def build(self, findings: list[HistoricalFinding]) -> str:
-        paths = rag_paths(self.settings)
+        paths = rag_paths(self.settings, self.root)
         paths["chroma"].mkdir(parents=True, exist_ok=True)
         try:
             from langchain_chroma import Chroma
@@ -56,24 +57,27 @@ class HistoricalFindingStore:
         except Exception:
             (paths["chroma"] / "UNAVAILABLE").write_text("Install langchain-chroma and chromadb to build the vector index.\n", encoding="utf-8")
             return str(paths["chroma"])
-        embeddings = HuggingFaceEmbeddings(model_name=self.settings.rag_embed_model)
-        texts = [finding.search_text for finding in findings]
-        metadatas = [
-            {
-                "id": finding.id,
-                "title": finding.title,
-                "impact": finding.impact or "",
-                "vulnerability_class": finding.vulnerability_class,
-                "tags": ",".join(finding.tags),
-            }
-            for finding in findings
-        ]
-        ids = [finding.id for finding in findings]
-        Chroma.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas, ids=ids, persist_directory=str(paths["chroma"]))
+        try:
+            embeddings = HuggingFaceEmbeddings(model_name=self.settings.rag_embed_model)
+            texts = [finding.search_text for finding in findings]
+            metadatas = [
+                {
+                    "id": finding.id,
+                    "title": finding.title,
+                    "impact": finding.impact or "",
+                    "vulnerability_class": finding.vulnerability_class,
+                    "tags": ",".join(finding.tags),
+                }
+                for finding in findings
+            ]
+            ids = [finding.id for finding in findings]
+            Chroma.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas, ids=ids, persist_directory=str(paths["chroma"]))
+        except Exception as exc:
+            (paths["chroma"] / "UNAVAILABLE").write_text(f"Vector index build unavailable: {type(exc).__name__}: {exc}\n", encoding="utf-8")
         return str(paths["chroma"])
 
     def search(self, query: HistoricalFindingQuery, candidate_k: int = 25) -> list[tuple[HistoricalFinding, float]]:
-        findings_by_id = {finding.id: finding for finding in load_findings(self.settings)}
+        findings_by_id = {finding.id: finding for finding in load_findings(self.settings, self.root)}
         if not findings_by_id:
             return []
         try:
@@ -81,7 +85,7 @@ class HistoricalFindingStore:
             from langchain_huggingface import HuggingFaceEmbeddings
 
             embeddings = HuggingFaceEmbeddings(model_name=self.settings.rag_embed_model, model_kwargs={"local_files_only": True})
-            db = Chroma(persist_directory=str(rag_paths(self.settings)["chroma"]), embedding_function=embeddings)
+            db = Chroma(persist_directory=str(rag_paths(self.settings, self.root)["chroma"]), embedding_function=embeddings)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="Relevance scores must be between 0 and 1.*")
                 raw = db.similarity_search_with_relevance_scores(query.query, k=candidate_k)

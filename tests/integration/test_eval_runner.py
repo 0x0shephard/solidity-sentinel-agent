@@ -21,7 +21,7 @@ def test_eval_runner_scores_all_fixtures(tmp_path, monkeypatch):
         else:
             assert score.expected_class_found
             assert score.expected_function_found
-        assert score.evidence_present
+            assert score.evidence_present
         assert score.composition_chain_present
         assert score.score >= 80
 

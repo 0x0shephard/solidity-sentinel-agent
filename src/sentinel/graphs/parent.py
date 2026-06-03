@@ -145,6 +145,16 @@ def _resolve_output_references(state: AuditState, tool_input: dict, references: 
     return resolved
 
 
+def _model_or_mapping_json(value) -> dict:
+    if not value:
+        return {}
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
 def plan_with_llm(state: AuditState) -> AuditState:
     registry = build_default_registry()
     planner = get_planner(mock=False)
@@ -180,6 +190,7 @@ def initialize_run(state: AuditState) -> AuditState:
         PlanStep(id="inspect_repo", description="Inspect repository files and Solidity contracts"),
         PlanStep(id="detect_framework", description="Detect Solidity framework and compiler pragmas"),
         PlanStep(id="run_static_analysis", description="Extract static facts and run safe analyzers"),
+        PlanStep(id="build_targeted_rag_context", description="Build repo profile and targeted Solodit context"),
         PlanStep(id="rank_hypotheses", description="Create early vulnerability hypotheses"),
         PlanStep(id="finish", description="Persist state artifacts"),
     ]
@@ -270,6 +281,24 @@ def run_static_analysis(state: AuditState) -> AuditState:
     return state
 
 
+def build_targeted_rag_context(state: AuditState) -> AuditState:
+    repo_path = state["repo_path"]
+    profile = _run_tool(
+        state,
+        "research.build_repo_profile",
+        {"repo_path": repo_path, "static_facts": state.get("static_facts", {})},
+    )
+    state["repo_rag_profile"] = getattr(profile, "profile", None)
+    targeted = _run_tool(
+        state,
+        "research.targeted_solodit_context",
+        {"repo_path": repo_path, "static_facts": state.get("static_facts", {})},
+    )
+    state["targeted_rag"] = getattr(targeted, "state", None)
+    state["current_focus"] = "rank_hypotheses"
+    return state
+
+
 def rank_hypotheses(state: AuditState) -> AuditState:
     _run_tool(
         state,
@@ -284,6 +313,7 @@ def rank_hypotheses(state: AuditState) -> AuditState:
                 *state.get("static_facts", {}).get("slither_findings", []),
                 *state.get("static_facts", {}).get("access_control", []),
                 *state.get("static_facts", {}).get("detections", []),
+                _model_or_mapping_json(state.get("repo_rag_profile")),
             ],
         },
     )
@@ -308,6 +338,7 @@ def rag_retrieve_context(state: AuditState) -> AuditState:
                 subgraph_run_id=f"{state['run_id']}-rag-{hypothesis.id}",
                 parent_run_id=state["run_id"],
                 hypothesis=hypothesis,
+                targeted_rag=_model_or_mapping_json(state.get("targeted_rag")),
             )
         )
         state["rag_context_bundles"][hypothesis.id] = bundle
@@ -397,6 +428,7 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_node("inspect_repo", inspect_repo)
     graph.add_node("detect_framework", detect_framework)
     graph.add_node("run_static_analysis", run_static_analysis)
+    graph.add_node("build_targeted_rag_context", build_targeted_rag_context)
     graph.add_node("rank_hypotheses", rank_hypotheses)
     graph.add_node("rag_retrieve_context", rag_retrieve_context)
     graph.add_node("research_subgraph", research_subgraph)
@@ -409,7 +441,8 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_edge("plan_with_llm", "inspect_repo")
     graph.add_edge("inspect_repo", "detect_framework")
     graph.add_edge("detect_framework", "run_static_analysis")
-    graph.add_edge("run_static_analysis", "rank_hypotheses")
+    graph.add_edge("run_static_analysis", "build_targeted_rag_context")
+    graph.add_edge("build_targeted_rag_context", "rank_hypotheses")
     graph.add_edge("rank_hypotheses", "rag_retrieve_context")
     graph.add_edge("rag_retrieve_context", "research_subgraph")
     graph.add_edge("research_subgraph", "summarize_context")

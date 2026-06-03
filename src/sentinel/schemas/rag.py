@@ -72,6 +72,39 @@ class HistoricalFindingSearchOutput(BaseModel):
     message: str | None = None
 
 
+class RepoRAGSearchIntent(BaseModel):
+    intent_id: str
+    query: str
+    purpose: str
+    vulnerability_class: str | None = None
+    tags: list[str] = Field(default_factory=list)
+
+
+class RepoRAGProfile(BaseModel):
+    repo_id: str
+    protocol_domain: str = "unknown"
+    contract_names: list[str] = Field(default_factory=list)
+    function_names: list[str] = Field(default_factory=list)
+    role_terms: list[str] = Field(default_factory=list)
+    asset_terms: list[str] = Field(default_factory=list)
+    upgrade_terms: list[str] = Field(default_factory=list)
+    lifecycle_terms: list[str] = Field(default_factory=list)
+    invariant_candidates: list[str] = Field(default_factory=list)
+    search_intents: list[RepoRAGSearchIntent] = Field(default_factory=list)
+
+
+class TargetedRAGState(BaseModel):
+    status: ToolStatus
+    repo_id: str
+    profile_path: str | None = None
+    normalized_path: str | None = None
+    chroma_path: str | None = None
+    finding_count: int = 0
+    fetched_count: int = 0
+    selected_from_global_count: int = 0
+    message: str | None = None
+
+
 class RAGQuery(BaseModel):
     hypothesis_id: str
     query: str

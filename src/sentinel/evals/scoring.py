@@ -43,7 +43,8 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
     minimum_expected = int(expected["minimum_expected_findings"]) if "minimum_expected_findings" in expected else len(expected_items)
     expected_class_found = len(matched_items) >= minimum_expected
     expected_function_found = expected_class_found
-    evidence_present = all(finding.evidence for finding in confirmed_findings) if confirmed_findings else not expected.get("allow_no_findings", False)
+    allow_no_findings = bool(expected.get("allow_no_findings", False))
+    evidence_present = all(finding.evidence for finding in confirmed_findings) if confirmed_findings else allow_no_findings
     expected_file_found = expected_class_found
     composition_chain_present = all(
         tool_name in state.get("last_outputs", {})
@@ -61,12 +62,17 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
     score += 15 if state.get("subgraph_results") else 0
     score += 10 if generated_json_report else 0
     score += 5 if generated_markdown_report else 0
-    hypothesis_recall = len(matched_hypotheses) / max(1, len(expected_items))
-    finding_recall = len(matched_items) / max(1, len(expected_items))
+    false_positive_count = (
+        len(confirmed_findings)
+        if allow_no_findings
+        else sum(1 for finding in confirmed_findings if finding.vulnerability_class not in {item["vulnerability_class"] for item in expected_items})
+    )
+    hypothesis_recall = 1.0 if allow_no_findings and false_positive_count == 0 else len(matched_hypotheses) / max(1, len(expected_items))
+    finding_recall = 1.0 if allow_no_findings and false_positive_count == 0 else len(matched_items) / max(1, len(expected_items))
     evidence_coverage = (
         sum(1 for finding in confirmed_findings if finding.evidence) / len(confirmed_findings)
         if confirmed_findings
-        else (1.0 if expected.get("allow_no_findings", False) else 0.0)
+        else (1.0 if allow_no_findings else 0.0)
     )
     rag_context_coverage = (
         sum(1 for finding in confirmed_findings if getattr(finding, "historical_matches", [])) / len(confirmed_findings)
@@ -74,13 +80,6 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         else 0.0
     )
     unsupported_claim_rate = 1.0 - evidence_coverage if confirmed_findings else 0.0
-    expected_classes = {item["vulnerability_class"] for item in expected_items}
-    false_positive_count = (
-        len(confirmed_findings)
-        if expected.get("allow_no_findings", False)
-        else sum(1 for finding in confirmed_findings if finding.vulnerability_class not in expected_classes)
-    )
-
     score += min(20, int(20 * finding_recall))
     score += 15 if expected_function_found and expected_file_found and evidence_present else 0
     score += 10 if composition_chain_present else 0

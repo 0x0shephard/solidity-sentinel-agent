@@ -216,6 +216,16 @@ def create_result(state: ResearchState) -> ResearchState:
     exploit_preconditions = refinement.exploit_preconditions or (["Attacker can reach the affected function"] if functions else [])
     limitations = refinement.limitations or deterministic_limitations
     confidence = min(0.95, max(0.0, hypothesis.confidence + 0.1 + refinement.confidence_delta))
+    if hypothesis.status == "rejected":
+        finding_status = "rejected"
+    elif hypothesis.status == "needs_manual_review" and not state.get("llm_refinement"):
+        finding_status = "needs_manual_review"
+    elif state.get("evidence_records") and confidence >= 0.85:
+        finding_status = "confirmed"
+    elif state.get("evidence_records"):
+        finding_status = "likely"
+    else:
+        finding_status = "needs_manual_review"
     result = ResearchSubgraphResult(
         status=ToolStatus.OK,
         subgraph_run_id=state["subgraph_run_id"],
@@ -232,7 +242,7 @@ def create_result(state: ResearchState) -> ResearchState:
         notes=state.get("notes", []),
         historical_findings=state.get("historical_findings", []),
         subagent_tool_ledger=[record.model_dump(mode="json") if hasattr(record, "model_dump") else record for record in state.get("subagent_tool_ledger", [])],
-        finding_status="confirmed" if state.get("evidence_records") and confidence >= 0.85 else ("likely" if state.get("evidence_records") else "needs_manual_review"),
+        finding_status=finding_status,
         reasoning_summary=likely_impact,
         historical_context_used=bool(state.get("historical_findings")),
         rag_context_bundle=state.get("rag_context_bundle"),

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 from sentinel.schemas.common import ArtifactRef, CompletedStep, PlanStep, ToolCallRecord
-from sentinel.schemas.rag import RAGContextBundle
+from sentinel.schemas.rag import RAGContextBundle, RepoRAGProfile, TargetedRAGState
 from sentinel.schemas.report import Finding
 from sentinel.schemas.research import ResearchRefinement, ResearchSubgraphResult, VulnerabilityHypothesis
 
@@ -39,6 +39,8 @@ class AuditState(TypedDict, total=False):
     warnings: list[str]
     historical_findings: list[dict]
     rag_context_bundles: dict[str, RAGContextBundle]
+    repo_rag_profile: RepoRAGProfile | None
+    targeted_rag: TargetedRAGState | None
     last_outputs: dict[str, dict]
     use_llm_refiner: bool
 
@@ -89,6 +91,8 @@ def initial_audit_state(run_id: str, repo: str, objective: str, run_dir: str) ->
         "warnings": [],
         "historical_findings": [],
         "rag_context_bundles": {},
+        "repo_rag_profile": None,
+        "targeted_rag": None,
         "last_outputs": {},
         "use_llm_refiner": False,
     }

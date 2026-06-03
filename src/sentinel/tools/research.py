@@ -7,6 +7,7 @@ from sentinel.rag.checklist import build_solodit_checklists_from_cache, write_ge
 from sentinel.rag.ranking import rank_matches
 from sentinel.rag.store import HistoricalFindingStore
 from sentinel.rag.sync import sync_solodit
+from sentinel.rag.targeted import build_repo_rag_profile, build_targeted_rag, repo_profile_root
 from sentinel.schemas.common import SideEffect, ToolStatus
 from sentinel.schemas.rag import (
     HistoricalFindingMatch,
@@ -16,10 +17,12 @@ from sentinel.schemas.rag import (
     RAGContextBundle,
     RAGQuery,
     RagSyncOutput,
+    RepoRAGProfile,
     RetrievalQualityGrade,
+    TargetedRAGState,
 )
 from sentinel.schemas.research import VulnerabilityHypothesis
-from sentinel.schemas.static import StaticDetection
+from sentinel.schemas.static import SourceEvidence, StaticDetection
 from sentinel.tools.base import RegisteredTool
 
 
@@ -50,6 +53,26 @@ class ResearchGenericOutput(BaseModel):
     status: ToolStatus
     message: str | None = None
     data: dict = Field(default_factory=dict)
+
+
+class RepoRAGProfileInput(BaseModel):
+    repo_path: str
+    static_facts: dict = Field(default_factory=dict)
+
+
+class RepoRAGProfileOutput(BaseModel):
+    status: ToolStatus
+    profile: RepoRAGProfile
+
+
+class TargetedRAGInput(BaseModel):
+    repo_path: str
+    static_facts: dict = Field(default_factory=dict)
+
+
+class TargetedRAGOutput(BaseModel):
+    status: ToolStatus
+    state: TargetedRAGState
 
 
 class RAGQueriesInput(BaseModel):
@@ -255,6 +278,79 @@ def _dedupe_hypotheses(hypotheses: list[VulnerabilityHypothesis]) -> list[Vulner
     return deduped[:10]
 
 
+def _evidence_from_fact(fact: dict, reason: str) -> SourceEvidence | None:
+    line = fact.get("line") or fact.get("line_start") or fact.get("start_line")
+    file_path = fact.get("file_path")
+    text = fact.get("text") or fact.get("signature") or fact.get("source_text")
+    if not file_path or not line or not text:
+        return None
+    try:
+        line_number = int(line)
+    except (TypeError, ValueError):
+        return None
+    return SourceEvidence(
+        file_path=str(file_path),
+        line_start=line_number,
+        line_end=int(fact.get("line_end") or line_number),
+        contract_name=fact.get("contract") or fact.get("contract_name"),
+        function_name=fact.get("function") or fact.get("function_name"),
+        source_text=str(text),
+        reason=reason,
+    )
+
+
+def _profile_invariant_hypotheses(static_facts: list[dict]) -> list[VulnerabilityHypothesis]:
+    profile = next((fact for fact in static_facts if isinstance(fact, dict) and fact.get("search_intents") and fact.get("invariant_candidates")), None)
+    if not profile:
+        return []
+    fact_texts = [fact for fact in static_facts if isinstance(fact, dict) and fact.get("text")]
+    candidates: list[VulnerabilityHypothesis] = []
+    invariant_terms = {
+        term.lower()
+        for candidate in profile.get("invariant_candidates", [])
+        for term in str(candidate).split()
+        if len(term) > 4
+    }
+    for intent in profile.get("search_intents", []):
+        query = str(intent.get("query", ""))
+        purpose = str(intent.get("purpose", ""))
+        terms = {term.lower() for term in query.split() if len(term) > 4}.union(invariant_terms)
+        evidence = []
+        for fact in fact_texts:
+            text = str(fact.get("text", "")).lower()
+            if any(term in text for term in terms):
+                item = _evidence_from_fact(fact, f"Source term overlaps repo-profile intent: {intent.get('intent_id')}")
+                if item:
+                    evidence.append(item)
+            if len(evidence) >= 4:
+                break
+        if not evidence:
+            continue
+        vulnerability_class = str(intent.get("vulnerability_class") or "business_logic")
+        affected_files = list(dict.fromkeys(item.file_path for item in evidence))
+        affected_functions = list(dict.fromkeys(item.function_name for item in evidence if item.function_name))
+        candidates.append(
+            VulnerabilityHypothesis(
+                id="hyp-profile",
+                title=f"Profile-guided {vulnerability_class.replace('_', ' ')} review: {purpose}",
+                vulnerability_class=vulnerability_class,
+                affected_files=affected_files,
+                affected_functions=affected_functions,
+                evidence_summary="; ".join(f"{item.file_path}:{item.line_start} {item.reason}" for item in evidence[:3]),
+                confidence=0.48,
+                affected_contract=evidence[0].contract_name,
+                affected_function=affected_functions[0] if affected_functions else evidence[0].function_name,
+                evidence_lines=evidence,
+                root_cause_terms=list(dict.fromkeys([*intent.get("tags", []), *query.lower().split()[:8]])),
+                recommended_validation=[f"Write an invariant or regression test for: {purpose}"],
+                source_detection_ids=[f"repo-profile:{intent.get('intent_id')}"],
+                suggested_rag_queries=[query],
+                status="needs_manual_review",
+            )
+        )
+    return candidates[:5]
+
+
 def _detect_slither_finding(functions: list[dict], slither_findings: list[dict]) -> VulnerabilityHypothesis | None:
     for finding in slither_findings:
         check = str(finding.get("check", "unknown"))
@@ -392,6 +488,8 @@ def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
         if hypothesis:
             hypotheses.append(hypothesis)
 
+    hypotheses.extend(_profile_invariant_hypotheses(inp.static_facts))
+
     hypotheses = _dedupe_hypotheses(hypotheses)
     if hypotheses:
         return RankHypothesesOutput(status=ToolStatus.OK, hypotheses=hypotheses)
@@ -440,9 +538,36 @@ def build_solodit_checklist(inp: ResearchGenericInput, state) -> ResearchGeneric
     )
 
 
+def build_repo_profile(inp: RepoRAGProfileInput, state) -> RepoRAGProfileOutput:
+    profile = build_repo_rag_profile(inp.repo_path, inp.static_facts)
+    state["repo_rag_profile"] = profile
+    state.setdefault("last_outputs", {})["research.build_repo_profile"] = {"profile": profile.model_dump(mode="json")}
+    return RepoRAGProfileOutput(status=ToolStatus.OK, profile=profile)
+
+
+def targeted_solodit_context(inp: TargetedRAGInput, state) -> TargetedRAGOutput:
+    result = build_targeted_rag(inp.repo_path, inp.static_facts)
+    state["targeted_rag"] = result
+    state.setdefault("last_outputs", {})["research.targeted_solodit_context"] = {"state": result.model_dump(mode="json")}
+    if result.message:
+        state.setdefault("warnings", []).append(result.message)
+    return TargetedRAGOutput(status=result.status, state=result)
+
+
 def retrieve_historical_findings(inp: HistoricalFindingQuery, state) -> HistoricalFindingSearchOutput:
     settings = get_settings()
-    candidates = HistoricalFindingStore(settings).search(inp)
+    candidates = []
+    targeted = state.get("targeted_rag") or {}
+    repo_id = targeted.get("repo_id") if isinstance(targeted, dict) else getattr(targeted, "repo_id", None)
+    targeted_status = targeted.get("status") if isinstance(targeted, dict) else getattr(targeted, "status", None)
+    if repo_id and str(targeted_status).lower().endswith("ok"):
+        targeted_root = repo_profile_root(settings, str(repo_id))
+        candidates.extend(HistoricalFindingStore(settings, root=targeted_root).search(inp, candidate_k=30))
+    seen_ids = {finding.id for finding, _ in candidates}
+    for finding, score in HistoricalFindingStore(settings).search(inp):
+        if finding.id not in seen_ids:
+            candidates.append((finding, score))
+            seen_ids.add(finding.id)
     matches = rank_matches(inp, candidates)
     if matches:
         state.setdefault("historical_findings", []).extend(matches)
@@ -647,6 +772,8 @@ def register(registry) -> None:
         RegisteredTool(namespace="research", name="retrieve_similar_cases", description="Retrieve similar vulnerability cases.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=retrieve_similar_cases, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="solodit_sync", description="Synchronize Solodit historical findings into the local RAG cache.", input_model=ResearchGenericInput, output_model=RagSyncOutput, fn=solodit_sync, side_effects=[SideEffect.EXTERNAL_NETWORK]),
         RegisteredTool(namespace="research", name="build_solodit_checklist", description="Build Solodit-informed detection checklists from the local RAG cache.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=build_solodit_checklist, side_effects=[SideEffect.WRITE_FILES]),
+        RegisteredTool(namespace="research", name="build_repo_profile", description="Extract a repo RAG profile with protocol domain, invariants, and Solodit search intents.", input_model=RepoRAGProfileInput, output_model=RepoRAGProfileOutput, fn=build_repo_profile, side_effects=[SideEffect.NONE]),
+        RegisteredTool(namespace="research", name="targeted_solodit_context", description="Build a repo-specific Solodit RAG cache from targeted search intents plus global cache fallback.", input_model=TargetedRAGInput, output_model=TargetedRAGOutput, fn=targeted_solodit_context, side_effects=[SideEffect.EXTERNAL_NETWORK, SideEffect.WRITE_FILES]),
         RegisteredTool(namespace="research", name="retrieve_historical_findings", description="Retrieve and hybrid-rank Solodit historical findings.", input_model=HistoricalFindingQuery, output_model=HistoricalFindingSearchOutput, fn=retrieve_historical_findings, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="research", name="expand_rag_queries", description="Expand one hypothesis into multiple RAG query intents.", input_model=RAGQueriesInput, output_model=RAGQueriesOutput, fn=expand_rag_queries, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="retrieve_multi_query", description="Retrieve historical matches for multiple RAG queries.", input_model=MultiQueryRetrievalInput, output_model=MultiQueryRetrievalOutput, fn=retrieve_multi_query, side_effects=[SideEffect.READ_FILES]),
