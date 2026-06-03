@@ -9,8 +9,11 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from sentinel.reliability.subprocess import run_command
+from sentinel.rag.checklist import checklist_by_id, write_generated_checklists
 from sentinel.schemas.common import SideEffect, ToolStatus
 from sentinel.schemas.research import SlitherFinding
+from sentinel.schemas.static import FunctionRange, SourceEvidence, StaticDetection, StaticDetectionsOutput
+from sentinel.solidity.ranges import build_function_ranges, containing_function
 from sentinel.tools.base import RegisteredTool
 from sentinel.tools.repo import RepoPathInput
 
@@ -40,6 +43,16 @@ class ParseSlitherOutput(BaseModel):
     findings: list[SlitherFinding] = Field(default_factory=list)
     finding_count: int = Field(ge=0)
     message: str | None = None
+
+
+class FunctionRangesOutput(BaseModel):
+    status: ToolStatus
+    ranges: list[FunctionRange] = Field(default_factory=list)
+
+
+class ChecklistBuildOutput(BaseModel):
+    status: ToolStatus
+    data: dict = Field(default_factory=dict)
 
 
 def _normalize_slither_path(filename: str | None) -> str | None:
@@ -78,6 +91,71 @@ def _extract_slither_locations(elements: list[dict]) -> tuple[list[str], list[st
 
 def _solidity_files(repo_path: str) -> list[Path]:
     return [path for path in Path(repo_path).rglob("*.sol") if path.is_file() and "out" not in path.parts and "cache" not in path.parts]
+
+
+def _source_line(repo_path: str, relative_path: str, line_no: int) -> str:
+    path = Path(repo_path) / relative_path
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no < 1 or line_no > len(lines):
+        return ""
+    return lines[line_no - 1].strip()
+
+
+def _evidence(repo_path: str, ranges: list[FunctionRange], file_path: str, line_no: int, reason: str) -> SourceEvidence:
+    fn = containing_function(ranges, file_path, line_no)
+    return SourceEvidence(
+        file_path=file_path,
+        line_start=line_no,
+        line_end=line_no,
+        contract_name=fn.contract_name if fn else None,
+        function_name=fn.function_name if fn else None,
+        source_text=_source_line(repo_path, file_path, line_no),
+        reason=reason,
+    )
+
+
+def _affected_functions(evidence: list[SourceEvidence]) -> list[str]:
+    seen: list[str] = []
+    for item in evidence:
+        if item.function_name and item.function_name not in seen:
+            seen.append(item.function_name)
+    return seen
+
+
+def _detection(
+    detector_id: str,
+    vulnerability_class: str,
+    title: str,
+    confidence: float,
+    evidence: list[SourceEvidence],
+    root_cause_terms: list[str],
+    recommendation_hint: str,
+    checklist_refs: list[str],
+) -> StaticDetection:
+    return StaticDetection(
+        detector_id=detector_id,
+        vulnerability_class=vulnerability_class,
+        title=title,
+        confidence=confidence,
+        evidence=evidence,
+        affected_functions=_affected_functions(evidence),
+        root_cause_terms=root_cause_terms,
+        recommendation_hint=recommendation_hint,
+        checklist_refs=checklist_refs,
+    )
+
+
+def _line_has_any(line: str, terms: tuple[str, ...]) -> bool:
+    lower = line.lower()
+    return any(term.lower() in lower for term in terms)
+
+
+def _iter_source_lines(repo_path: str):
+    for path in _solidity_files(repo_path):
+        rel = str(path.relative_to(repo_path))
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for line_no, line in enumerate(lines, start=1):
+            yield rel, line_no, line
 
 
 def _function_context_by_line(lines: list[str]) -> dict[int, str]:
@@ -202,6 +280,262 @@ def find_oracle_patterns(inp: RepoPathInput, state) -> StaticFactsOutput:
     return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
 
 
+def map_function_ranges(inp: RepoPathInput, state) -> FunctionRangesOutput:
+    return FunctionRangesOutput(status=ToolStatus.OK, ranges=build_function_ranges(inp.repo_path))
+
+
+def build_solodit_checklist(inp: RepoPathInput, state) -> ChecklistBuildOutput:
+    path = write_generated_checklists()
+    return ChecklistBuildOutput(status=ToolStatus.OK, data={"path": str(path)})
+
+
+def detect_tx_origin_auth(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    ranges = build_function_ranges(inp.repo_path)
+    evidence = []
+    for rel, line_no, line in _iter_source_lines(inp.repo_path):
+        if "tx.origin" not in line:
+            continue
+        if not _line_has_any(line, ("require", "if", "owner", "keeper", "role", "auth", "delay")):
+            continue
+        evidence.append(_evidence(inp.repo_path, ranges, rel, line_no, "tx.origin participates in an authorization or bypass condition."))
+    detections = []
+    if evidence:
+        detections.append(
+            _detection(
+                "static.detect_tx_origin_auth",
+                "tx_origin_authorization",
+                "tx.origin is used in authorization logic",
+                0.86,
+                evidence,
+                ["tx.origin", "authorization bypass", "caller identity"],
+                "Replace tx.origin checks with explicit msg.sender authorization and remove origin-based bypass branches.",
+                ["solodit-access-tx-origin"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def detect_unguarded_initializer(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    ranges = build_function_ranges(inp.repo_path)
+    privileged_terms = ("owner", "keeper", "treasury", "admin", "asset", "oracle", "initialized")
+    guard_terms = ("initializer", "onlyinitializing", "reinitializer", "require(!initialized", "require(initialized == false", "if (!initialized")
+    detections = []
+    for fn in ranges:
+        if fn.function_name.lower() != "initialize":
+            continue
+        lines = (Path(inp.repo_path) / fn.file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        body = "\n".join(lines[fn.start_line - 1 : fn.end_line])
+        signature = fn.signature.lower()
+        if "external" not in signature and "public" not in signature:
+            continue
+        if any(term in body.replace(" ", "").lower() or term in signature for term in guard_terms):
+            continue
+        write_lines = []
+        for offset, line in enumerate(lines[fn.start_line - 1 : fn.end_line], start=fn.start_line):
+            compact = line.replace(" ", "").lower()
+            if "=" in line and any(f"{term}=" in compact or f"{term}_" in compact for term in privileged_terms):
+                write_lines.append(_evidence(inp.repo_path, ranges, fn.file_path, offset, "Initializer writes privileged configuration without a one-time guard."))
+        if write_lines:
+            detections.append(
+                _detection(
+                    "static.detect_unguarded_initializer",
+                    "unguarded_initializer",
+                    "External initializer lacks a one-time guard",
+                    0.84,
+                    write_lines[:6],
+                    ["initializer", "privileged state", "one-time guard"],
+                    "Add an initializer/reinitializer modifier or require(!initialized) before privileged writes.",
+                    ["solodit-initializer-unguarded"],
+                )
+            )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def detect_oracle_staleness_logic(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    ranges = build_function_ranges(inp.repo_path)
+    detections = []
+    evidence = []
+    for rel, line_no, line in _iter_source_lines(inp.repo_path):
+        lower = line.lower()
+        if "require" in lower and "||" in line and any(term in lower for term in ["oracle", "price", "updatedat", "timestamp", "latest"]):
+            evidence.append(_evidence(inp.repo_path, ranges, rel, line_no, "Oracle value/freshness validation is OR-combined, allowing one branch to pass without the other."))
+    if evidence:
+        detections.append(
+            _detection(
+                "static.detect_oracle_staleness_logic",
+                "oracle_staleness_logic",
+                "Oracle validation may accept stale or incomplete data",
+                0.81,
+                evidence,
+                ["oracle", "stale price", "unsafe OR", "freshness"],
+                "Require both positive/valid price data and fresh timestamps with AND-combined checks.",
+                ["solodit-oracle-staleness", "solodit-unsafe-or-guard"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def detect_unchecked_erc20_returns(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    ranges = build_function_ranges(inp.repo_path)
+    evidence = []
+    for rel, line_no, line in _iter_source_lines(inp.repo_path):
+        compact = line.replace(" ", "")
+        lower = line.lower()
+        if "safeTransfer".lower() in lower or "safeapprove" in lower:
+            continue
+        direct_call = any(term in compact for term in [".transfer(", ".transferFrom(", ".approve("])
+        if direct_call and compact.startswith("to.transfer("):
+            continue
+        low_level_token_call = "call(" in line and any(term in line for term in ["IERC20", "transfer.selector", "transferFrom.selector", "approve(", "approve.selector"])
+        ignores_return = (
+            direct_call
+            and not compact.startswith("require(")
+            and "require(" not in compact
+            and "=" not in compact.split("//", 1)[0].split(".transfer", 1)[0]
+        )
+        low_level_checks_only_status = low_level_token_call and "abi.decode" not in line and "returndata" not in lower
+        if ignores_return or low_level_checks_only_status:
+            evidence.append(_evidence(inp.repo_path, ranges, rel, line_no, "ERC20 operation return data is ignored or only low-level call status is checked."))
+    detections = []
+    if evidence:
+        detections.append(
+            _detection(
+                "static.detect_unchecked_erc20_returns",
+                "unchecked_erc20_return",
+                "ERC20 return value may be unchecked",
+                0.78,
+                evidence[:10],
+                ["unchecked ERC20 return", "low-level token call", "SafeERC20"],
+                "Use SafeERC20 or decode and require the returned boolean when return data is present.",
+                ["solodit-token-return"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def detect_dangerous_delegatecall(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    ranges = build_function_ranges(inp.repo_path)
+    evidence = []
+    for rel, line_no, line in _iter_source_lines(inp.repo_path):
+        if ".delegatecall(" not in line and ".delegatecall{" not in line:
+            continue
+        reason = "delegatecall executes target code in caller storage context."
+        if any(term in line.lower() for term in ["target", "payload", "data", "calls[", "migration", "strategy"]):
+            reason = "delegatecall target or payload appears externally supplied or insufficiently constrained."
+        evidence.append(_evidence(inp.repo_path, ranges, rel, line_no, reason))
+    detections = []
+    if evidence:
+        detections.append(
+            _detection(
+                "static.detect_dangerous_delegatecall",
+                "dangerous_delegatecall",
+                "Delegatecall target or payload may be dangerous",
+                0.83,
+                evidence,
+                ["delegatecall", "storage corruption", "user-controlled target"],
+                "Restrict delegatecall targets to trusted immutable implementations and validate payload scope.",
+                ["solodit-delegatecall-control"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def detect_unsafe_or_guards(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    ranges = build_function_ranges(inp.repo_path)
+    evidence = []
+    sensitive_terms = ("owner", "keeper", "role", "fee", "limit", "max", "min", "oracle", "updatedat", "timestamp", "paused", "trusted")
+    for rel, line_no, line in _iter_source_lines(inp.repo_path):
+        lower = line.lower()
+        if "require" not in lower or "||" not in line:
+            continue
+        if not any(term in lower for term in sensitive_terms):
+            continue
+        evidence.append(_evidence(inp.repo_path, ranges, rel, line_no, "Security-sensitive require uses OR, so one weak branch may bypass other intended constraints."))
+    detections = []
+    if evidence:
+        detections.append(
+            _detection(
+                "static.detect_unsafe_or_guards",
+                "unsafe_or_guard",
+                "Security guard uses unsafe OR logic",
+                0.74,
+                evidence,
+                ["unsafe OR", "guard bypass", "constraint bypass"],
+                "Split independent constraints into separate requires or use AND where all conditions must hold.",
+                ["solodit-unsafe-or-guard"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def detect_external_call_before_accounting(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    ranges = build_function_ranges(inp.repo_path)
+    evidence = []
+    external_terms = (".call(", ".call{", ".transfer(", ".send(", "beforeWithdraw", "onFlashLoan", ".withdraw(", ".deposit(")
+    accounting_terms = ("_burn(", "_mint(", "balanceOf[", "totalSupply", "totalManagedDebt", ".debt", "rewardDebt", "allowance[", "lastDepositAt")
+    for fn in ranges:
+        lines = (Path(inp.repo_path) / fn.file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        fn_lines = list(enumerate(lines[fn.start_line - 1 : fn.end_line], start=fn.start_line))
+        call_line = next(((line_no, line) for line_no, line in fn_lines if any(term in line for term in external_terms)), None)
+        if not call_line:
+            continue
+        later_accounting = next(((line_no, line) for line_no, line in fn_lines if line_no > call_line[0] and any(term in line for term in accounting_terms)), None)
+        if not later_accounting:
+            continue
+        evidence.extend(
+            [
+                _evidence(inp.repo_path, ranges, fn.file_path, call_line[0], "External control flow occurs before related accounting is finalized."),
+                _evidence(inp.repo_path, ranges, fn.file_path, later_accounting[0], "Accounting update occurs after the external call."),
+            ]
+        )
+    detections = []
+    if evidence:
+        detections.append(
+            _detection(
+                "static.detect_external_call_before_accounting",
+                "external_call_before_accounting",
+                "External call occurs before accounting is finalized",
+                0.79,
+                evidence[:12],
+                ["external call before state update", "reentrancy", "accounting order"],
+                "Move accounting before external control flow or add a reentrancy guard plus invariant-preserving ordering.",
+                ["solodit-external-before-accounting"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def detect_strategy_accounting_trust(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    ranges = build_function_ranges(inp.repo_path)
+    evidence = []
+    for fn in ranges:
+        lines = (Path(inp.repo_path) / fn.file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        body = "\n".join(lines[fn.start_line - 1 : fn.end_line]).lower()
+        if "strategy" not in body:
+            continue
+        if not any(term in body for term in ["estimatedtotalassets", ".withdraw(", ".call(", "trusted", "totalmanageddebt", ".debt"]):
+            continue
+        for offset, line in enumerate(lines[fn.start_line - 1 : fn.end_line], start=fn.start_line):
+            lower = line.lower()
+            if any(term in lower for term in ["estimatedtotalassets", ".withdraw(", ".call(", "trusted", "totalmanageddebt", ".debt"]):
+                evidence.append(_evidence(inp.repo_path, ranges, fn.file_path, offset, "Strategy-controlled value or call result affects accounting/trust decisions."))
+    detections = []
+    if evidence:
+        detections.append(
+            _detection(
+                "static.detect_strategy_accounting_trust",
+                "strategy_accounting_trust",
+                "Strategy accounting trusts external strategy state",
+                0.72,
+                evidence[:12],
+                ["strategy trust", "debt accounting", "external report", "reconciliation"],
+                "Reconcile strategy-reported values with token balance deltas and avoid trusted branches that mask failed calls.",
+                ["solodit-strategy-accounting-trust"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
 def run_slither(inp: RepoPathInput, state) -> RunSlitherOutput:
     command = ["slither", inp.repo_path, "--json", ""]
     if shutil.which("slither") is None:
@@ -264,6 +598,7 @@ def register(registry) -> None:
         RegisteredTool(namespace="static", name="extract_contracts", description="Extract Solidity contract declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_contracts, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_inheritance", description="Extract Solidity inheritance declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_inheritance, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_functions", description="Extract Solidity function declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_functions, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="map_function_ranges", description="Map Solidity functions to source ranges.", input_model=RepoPathInput, output_model=FunctionRangesOutput, fn=map_function_ranges, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_modifiers", description="Extract Solidity modifier declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_modifiers, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="find_access_control_terms", description="Find access-control related source terms.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=find_access_control_terms, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_external_calls", description="Extract low-level/external call sites.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_external_calls, side_effects=[SideEffect.READ_FILES]),
@@ -271,6 +606,15 @@ def register(registry) -> None:
         RegisteredTool(namespace="static", name="extract_token_transfers", description="Extract token transfer patterns.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_token_transfers, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_storage_writes", description="Extract likely storage write lines.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_storage_writes, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="find_oracle_patterns", description="Find oracle and price-read patterns.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=find_oracle_patterns, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="build_solodit_checklist", description="Build Solodit-informed detector checklists from local RAG cache.", input_model=RepoPathInput, output_model=ChecklistBuildOutput, fn=build_solodit_checklist, side_effects=[SideEffect.WRITE_FILES]),
+        RegisteredTool(namespace="static", name="detect_tx_origin_auth", description="Detect tx.origin authorization and bypass patterns.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_tx_origin_auth, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_unguarded_initializer", description="Detect public/external initializers without one-time guards.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_unguarded_initializer, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_oracle_staleness_logic", description="Detect stale or incomplete oracle validation logic.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_oracle_staleness_logic, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_unchecked_erc20_returns", description="Detect unchecked ERC20 transfer/approve return handling.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_unchecked_erc20_returns, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_dangerous_delegatecall", description="Detect dangerous delegatecall target and payload patterns.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_dangerous_delegatecall, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_unsafe_or_guards", description="Detect security-sensitive OR-combined guards.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_unsafe_or_guards, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_external_call_before_accounting", description="Detect external calls before related accounting updates.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_external_call_before_accounting, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_strategy_accounting_trust", description="Detect strategy accounting that trusts external strategy state.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_strategy_accounting_trust, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="run_slither", description="Run Slither and write JSON artifact.", input_model=RepoPathInput, output_model=RunSlitherOutput, fn=run_slither, side_effects=[SideEffect.EXECUTE_LOCAL], chaining_hints=["Use raw_json_path as static.parse_slither.raw_json_path."]),
         RegisteredTool(namespace="static", name="parse_slither", description="Parse Slither JSON artifact into typed findings.", input_model=ParseSlitherInput, output_model=ParseSlitherOutput, fn=parse_slither, side_effects=[SideEffect.READ_FILES]),
     ]:

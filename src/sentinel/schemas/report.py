@@ -30,6 +30,8 @@ class Finding(BaseModel):
     reproduction_steps: list[str] = Field(default_factory=list)
     recommendation: str | None = None
     limitations: list[str] = Field(default_factory=list)
+    historical_matches: list[dict] = Field(default_factory=list)
+    status: str = "likely"
 
 
 class ReportDocument(BaseModel):
@@ -37,6 +39,8 @@ class ReportDocument(BaseModel):
     objective: str
     repo_path: str
     findings: list[Finding] = Field(default_factory=list)
+    needs_manual_review: list[Finding] = Field(default_factory=list)
+    rejected_hypotheses: list[Finding] = Field(default_factory=list)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     tool_call_count: int = Field(ge=0)
     subgraphs_spawned: int = Field(ge=0)

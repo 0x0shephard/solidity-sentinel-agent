@@ -43,12 +43,12 @@ def test_huggingface_research_refiner_requires_token():
 
 def test_huggingface_planner_allows_default_router_base_url():
     planner = HuggingFacePlanner(
-        model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        model="Qwen/Qwen2.5-Coder-32B-Instruct",
         token="test-token",
         base_url="https://router.huggingface.co/v1",
     )
 
-    assert planner.llm.model_id == "Qwen/Qwen2.5-Coder-7B-Instruct"
+    assert planner.llm.model_id == "Qwen/Qwen2.5-Coder-32B-Instruct"
 
 
 def test_tool_plan_schema():

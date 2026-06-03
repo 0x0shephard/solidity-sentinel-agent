@@ -7,7 +7,9 @@ import uuid
 from langgraph.graph import END, START, StateGraph
 
 from sentinel.artifacts import ensure_run_dir, write_json, write_text
+from sentinel.config import get_settings
 from sentinel.graphs.research import DEFAULT_RESEARCH_TOOLS, run_research_subgraph
+from sentinel.graphs.rag_subgraph import initial_rag_state, run_rag_subgraph
 from sentinel.llm.provider import get_planner
 from sentinel.observability.logging import log_event
 from sentinel.observability.tracing import trace_span
@@ -39,6 +41,20 @@ def _run_tool(state: AuditState, tool_name: str, raw_input: dict):
 
 
 def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: VulnerabilityHypothesis) -> list[dict]:
+    if hypothesis.evidence_lines:
+        return [
+            {
+                "kind": "source_evidence",
+                "file_path": item.file_path,
+                "line": item.line_start,
+                "line_start": item.line_start,
+                "line_end": item.line_end,
+                "function": item.function_name,
+                "text": item.source_text,
+                "message": item.reason,
+            }
+            for item in hypothesis.evidence_lines
+        ][:8]
     affected_files = set(hypothesis.affected_files)
     affected_functions = set(hypothesis.affected_functions)
     grouped_snippets: dict[str, list[dict]] = {}
@@ -94,7 +110,7 @@ def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: Vulnerabili
 
 
 def _tool_prompt(state: AuditState) -> str:
-    remaining_budget = max(0, 40 - state.get("tool_call_count", 0))
+    remaining_budget = max(0, get_settings().max_tool_calls - state.get("tool_call_count", 0))
     rag_context = state.get("last_outputs", {}).get("research.retrieve_historical_findings", {})
     return (
         f"Objective: {state['objective']}\n"
@@ -211,10 +227,23 @@ def run_static_analysis(state: AuditState) -> AuditState:
     repo_path = state["repo_path"]
     _run_tool(state, "static.extract_contracts", {"repo_path": repo_path})
     _run_tool(state, "static.extract_functions", {"repo_path": repo_path})
+    _run_tool(state, "static.map_function_ranges", {"repo_path": repo_path})
     _run_tool(state, "static.find_access_control_terms", {"repo_path": repo_path})
     _run_tool(state, "static.extract_external_calls", {"repo_path": repo_path})
     _run_tool(state, "static.extract_token_transfers", {"repo_path": repo_path})
     _run_tool(state, "static.extract_storage_writes", {"repo_path": repo_path})
+    detector_names = [
+        "static.detect_tx_origin_auth",
+        "static.detect_unguarded_initializer",
+        "static.detect_oracle_staleness_logic",
+        "static.detect_unchecked_erc20_returns",
+        "static.detect_dangerous_delegatecall",
+        "static.detect_unsafe_or_guards",
+        "static.detect_external_call_before_accounting",
+        "static.detect_strategy_accounting_trust",
+    ]
+    for detector_name in detector_names:
+        _run_tool(state, detector_name, {"repo_path": repo_path})
     slither_output = _run_tool(state, "static.run_slither", {"repo_path": repo_path})
     if getattr(slither_output, "raw_json_path", None):
         _run_tool(state, "static.parse_slither", {"raw_json_path": slither_output.raw_json_path})
@@ -225,11 +254,17 @@ def run_static_analysis(state: AuditState) -> AuditState:
     state["static_facts"] = {
         "contracts": state["last_outputs"].get("static.extract_contracts", {}).get("facts", []),
         "functions": state["last_outputs"].get("static.extract_functions", {}).get("facts", []),
+        "function_ranges": state["last_outputs"].get("static.map_function_ranges", {}).get("ranges", []),
         "access_control": state["last_outputs"].get("static.find_access_control_terms", {}).get("facts", []),
         "external_calls": state["last_outputs"].get("static.extract_external_calls", {}).get("facts", []),
         "token_transfers": state["last_outputs"].get("static.extract_token_transfers", {}).get("facts", []),
         "storage_writes": state["last_outputs"].get("static.extract_storage_writes", {}).get("facts", []),
         "slither_findings": state["last_outputs"].get("static.parse_slither", {}).get("findings", []),
+        "detections": [
+            detection
+            for detector_name in detector_names
+            for detection in state["last_outputs"].get(detector_name, {}).get("detections", [])
+        ],
     }
     state["current_focus"] = "rank_hypotheses"
     return state
@@ -248,6 +283,7 @@ def rank_hypotheses(state: AuditState) -> AuditState:
                 *state.get("static_facts", {}).get("storage_writes", []),
                 *state.get("static_facts", {}).get("slither_findings", []),
                 *state.get("static_facts", {}).get("access_control", []),
+                *state.get("static_facts", {}).get("detections", []),
             ],
         },
     )
@@ -265,16 +301,18 @@ def rag_retrieve_context(state: AuditState) -> AuditState:
     hypotheses = state.get("hypotheses", [])
     if not hypotheses:
         return state
-    hypothesis = hypotheses[0]
-    query = " ".join([state["objective"], hypothesis.title, hypothesis.evidence_summary, " ".join(hypothesis.affected_functions)])
-    try:
-        _run_tool(
-            state,
-            "research.retrieve_historical_findings",
-            {"query": query, "vulnerability_class": hypothesis.vulnerability_class, "top_k": 5},
+    state.setdefault("rag_context_bundles", {})
+    for hypothesis in hypotheses[:5]:
+        bundle = run_rag_subgraph(
+            initial_rag_state(
+                subgraph_run_id=f"{state['run_id']}-rag-{hypothesis.id}",
+                parent_run_id=state["run_id"],
+                hypothesis=hypothesis,
+            )
         )
-    except Exception as exc:
-        state.setdefault("warnings", []).append(f"RAG retrieval unavailable: {type(exc).__name__}: {exc}")
+        state["rag_context_bundles"][hypothesis.id] = bundle
+        hypothesis.historical_matches = [critique.model_dump(mode="json") for critique in bundle.safe_matches]
+        _record_step(state, "rag.subgraph", f"RAG bundle for {hypothesis.id}: {bundle.quality_grade.grade}, safe={len(bundle.safe_matches)}")
     state["current_focus"] = "research_subgraph"
     return state
 
@@ -286,21 +324,23 @@ def research_subgraph(state: AuditState) -> AuditState:
         state["current_focus"] = "summarize_context"
         return state
 
-    hypothesis = hypotheses[0]
-    selected_snippets = _evidence_snippets_for_hypothesis(state, hypothesis)
-    subgraph_state = initial_research_state(
-        subgraph_run_id=f"{state['run_id']}-research-1",
-        parent_run_id=state["run_id"],
-        objective=state["objective"],
-        hypothesis=hypothesis,
-        selected_snippets=selected_snippets,
-        allowed_tool_names=DEFAULT_RESEARCH_TOOLS,
-        use_llm_refiner=state.get("use_llm_refiner", False),
-    )
-    result = run_research_subgraph(subgraph_state)
-    state.setdefault("subgraph_results", []).append(result)
-    state["last_outputs"]["research.subgraph"] = result.model_dump(mode="json")
-    _record_step(state, "research.subgraph", f"Research subgraph returned {result.status}")
+    for index, hypothesis in enumerate(hypotheses[:5], start=1):
+        selected_snippets = _evidence_snippets_for_hypothesis(state, hypothesis)
+        subgraph_state = initial_research_state(
+            subgraph_run_id=f"{state['run_id']}-research-{index}",
+            parent_run_id=state["run_id"],
+            objective=state["objective"],
+            hypothesis=hypothesis,
+            selected_snippets=selected_snippets,
+            allowed_tool_names=DEFAULT_RESEARCH_TOOLS,
+            use_llm_refiner=state.get("use_llm_refiner", False),
+        )
+        subgraph_state["rag_context_bundle"] = state.get("rag_context_bundles", {}).get(hypothesis.id)
+        result = run_research_subgraph(subgraph_state)
+        state.setdefault("subgraph_results", []).append(result)
+        state["last_outputs"][f"research.subgraph.{hypothesis.id}"] = result.model_dump(mode="json")
+        state["last_outputs"]["research.subgraph"] = result.model_dump(mode="json")
+        _record_step(state, "research.subgraph", f"Research subgraph returned {result.status} for {hypothesis.id}")
     state["current_focus"] = "summarize_context"
     return state
 

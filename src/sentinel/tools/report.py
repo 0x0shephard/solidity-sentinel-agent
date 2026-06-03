@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from sentinel.reporting import build_report_document, create_findings_from_state, render_markdown_report
+from sentinel.reporting import SEVERITY_BY_CLASS, build_report_document, create_findings_from_state, render_markdown_report
 from sentinel.schemas.common import SideEffect, ToolStatus
 from sentinel.schemas.report import Evidence, Finding
 from sentinel.tools.base import RegisteredTool
@@ -37,6 +37,22 @@ def generate_json(inp: ReportGenericInput, state) -> ReportGenericOutput:
 def add_evidence(inp: ReportGenericInput, state) -> ReportGenericOutput:
     if not state.get("findings"):
         state["findings"] = create_findings_from_state(state)
+    if not state.get("findings") and state.get("hypotheses"):
+        hypothesis = state["hypotheses"][0]
+        state["findings"] = [
+            Finding(
+                id=hypothesis.id.replace("hyp", "finding"),
+                title=hypothesis.title,
+                severity=SEVERITY_BY_CLASS.get(hypothesis.vulnerability_class, "info"),
+                confidence=hypothesis.confidence,
+                vulnerability_class=hypothesis.vulnerability_class,
+                summary=hypothesis.evidence_summary,
+                affected_files=hypothesis.affected_files,
+                affected_functions=hypothesis.affected_functions,
+                recommendation="Collect file/function evidence and add targeted regression tests.",
+                limitations=["Draft finding created by report.add_evidence before final evidence gating."],
+            )
+        ]
     if not state.get("findings"):
         return ReportGenericOutput(status=ToolStatus.ERROR, message="No finding available to attach evidence.")
     evidence = Evidence(

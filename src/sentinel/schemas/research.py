@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from sentinel.schemas.common import ToolStatus
+from sentinel.schemas.rag import RAGContextBundle
+from sentinel.schemas.static import SourceEvidence
 
 
 class SlitherFinding(BaseModel):
@@ -23,6 +27,16 @@ class VulnerabilityHypothesis(BaseModel):
     affected_functions: list[str] = Field(default_factory=list)
     evidence_summary: str
     confidence: float = Field(ge=0.0, le=1.0)
+    affected_contract: str | None = None
+    affected_function: str | None = None
+    evidence_lines: list[SourceEvidence] = Field(default_factory=list)
+    root_cause_terms: list[str] = Field(default_factory=list)
+    recommended_validation: list[str] = Field(default_factory=list)
+    historical_matches: list[dict] = Field(default_factory=list)
+    source_detection_ids: list[str] = Field(default_factory=list)
+    exploit_precondition_terms: list[str] = Field(default_factory=list)
+    suggested_rag_queries: list[str] = Field(default_factory=list)
+    status: Literal["confirmed", "likely", "needs_manual_review", "rejected"] = "likely"
 
 
 class ResearchSubgraphResult(BaseModel):
@@ -41,6 +55,10 @@ class ResearchSubgraphResult(BaseModel):
     notes: list[str] = Field(default_factory=list)
     historical_findings: list[dict] = Field(default_factory=list)
     subagent_tool_ledger: list[dict] = Field(default_factory=list)
+    finding_status: Literal["confirmed", "likely", "needs_manual_review", "rejected"] = "likely"
+    reasoning_summary: str | None = None
+    historical_context_used: bool = False
+    rag_context_bundle: RAGContextBundle | None = None
 
 
 class ResearchRefinement(BaseModel):

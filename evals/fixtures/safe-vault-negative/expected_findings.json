@@ -1,0 +1,22 @@
+{
+  "expected_findings": [
+    {
+      "vulnerability_class": "tx_origin_authorization",
+      "affected_file_contains": "SafeVault.sol",
+      "affected_function": "onlyOwner"
+    },
+    {
+      "vulnerability_class": "unguarded_initializer",
+      "affected_file_contains": "SafeVault.sol",
+      "affected_function": "initialize"
+    },
+    {
+      "vulnerability_class": "oracle_staleness_logic",
+      "affected_file_contains": "SafeVault.sol",
+      "affected_function": "depositWithOracle"
+    }
+  ],
+  "minimum_expected_findings": 0,
+  "allow_no_findings": true
+}
+

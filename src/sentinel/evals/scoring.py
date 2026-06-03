@@ -10,18 +10,41 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
     generated_json_report = (run_dir / "report.json").exists()
     generated_markdown_report = (run_dir / "report.md").exists()
     findings = state.get("findings", [])
+    hypotheses = state.get("hypotheses", [])
+    confirmed_findings = [finding for finding in findings if getattr(finding, "status", "likely") in {"confirmed", "likely"}]
 
-    expected_class = expected["vulnerability_class"]
-    expected_function = expected["affected_function"]
-    expected_file_contains = expected["affected_file_contains"]
+    expected_items = expected.get("expected_findings") or [expected]
 
-    expected_class_found = any(finding.vulnerability_class == expected_class for finding in findings)
-    expected_function_found = any(expected_function in finding.affected_functions for finding in findings)
-    evidence_present = any(finding.evidence for finding in findings)
-    expected_file_found = any(
-        any(expected_file_contains in file_path for file_path in finding.affected_files)
-        for finding in findings
-    )
+    def _matches_expected(item: dict) -> bool:
+        expected_class = item["vulnerability_class"]
+        expected_function = item["affected_function"]
+        expected_file_contains = item["affected_file_contains"]
+        return any(
+            finding.vulnerability_class == expected_class
+            and expected_function in finding.affected_functions
+            and any(expected_file_contains in file_path for file_path in finding.affected_files)
+            and bool(finding.evidence)
+            for finding in confirmed_findings
+        )
+
+    def _hypothesis_matches_expected(item: dict) -> bool:
+        expected_class = item["vulnerability_class"]
+        expected_function = item["affected_function"]
+        expected_file_contains = item["affected_file_contains"]
+        return any(
+            hypothesis.vulnerability_class == expected_class
+            and expected_function in hypothesis.affected_functions
+            and any(expected_file_contains in file_path for file_path in hypothesis.affected_files)
+            for hypothesis in hypotheses
+        )
+
+    matched_items = [item for item in expected_items if _matches_expected(item)]
+    matched_hypotheses = [item for item in expected_items if _hypothesis_matches_expected(item)]
+    minimum_expected = int(expected["minimum_expected_findings"]) if "minimum_expected_findings" in expected else len(expected_items)
+    expected_class_found = len(matched_items) >= minimum_expected
+    expected_function_found = expected_class_found
+    evidence_present = all(finding.evidence for finding in confirmed_findings) if confirmed_findings else not expected.get("allow_no_findings", False)
+    expected_file_found = expected_class_found
     composition_chain_present = all(
         tool_name in state.get("last_outputs", {})
         for tool_name in [
@@ -38,17 +61,38 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
     score += 15 if state.get("subgraph_results") else 0
     score += 10 if generated_json_report else 0
     score += 5 if generated_markdown_report else 0
-    score += 20 if expected_class_found else 0
+    hypothesis_recall = len(matched_hypotheses) / max(1, len(expected_items))
+    finding_recall = len(matched_items) / max(1, len(expected_items))
+    evidence_coverage = (
+        sum(1 for finding in confirmed_findings if finding.evidence) / len(confirmed_findings)
+        if confirmed_findings
+        else (1.0 if expected.get("allow_no_findings", False) else 0.0)
+    )
+    rag_context_coverage = (
+        sum(1 for finding in confirmed_findings if getattr(finding, "historical_matches", [])) / len(confirmed_findings)
+        if confirmed_findings
+        else 0.0
+    )
+    unsupported_claim_rate = 1.0 - evidence_coverage if confirmed_findings else 0.0
+    expected_classes = {item["vulnerability_class"] for item in expected_items}
+    false_positive_count = (
+        len(confirmed_findings)
+        if expected.get("allow_no_findings", False)
+        else sum(1 for finding in confirmed_findings if finding.vulnerability_class not in expected_classes)
+    )
+
+    score += min(20, int(20 * finding_recall))
     score += 15 if expected_function_found and expected_file_found and evidence_present else 0
     score += 10 if composition_chain_present else 0
 
     notes = []
     if not expected_class_found:
-        notes.append(f"Expected class not found: {expected_class}")
-    if not expected_function_found:
-        notes.append(f"Expected function not found: {expected_function}")
-    if not expected_file_found:
-        notes.append(f"Expected file evidence not found: {expected_file_contains}")
+        missing = [item["vulnerability_class"] for item in expected_items if item not in matched_items]
+        notes.append(f"Expected recall not met: matched {len(matched_items)}/{len(expected_items)}; missing {missing}")
+    if confirmed_findings and not evidence_present:
+        notes.append("At least one generated finding is missing local evidence.")
+    if expected.get("allow_no_findings", False) and false_positive_count:
+        notes.append(f"False positives in negative fixture: {false_positive_count}")
 
     return EvalScore(
         fixture=fixture,
@@ -62,7 +106,12 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         expected_function_found=expected_function_found,
         evidence_present=evidence_present,
         composition_chain_present=composition_chain_present,
+        hypothesis_recall=hypothesis_recall,
+        finding_recall=finding_recall,
+        evidence_coverage=evidence_coverage,
+        rag_context_coverage=rag_context_coverage,
+        unsupported_claim_rate=unsupported_claim_rate,
+        false_positive_count=false_positive_count,
         score=float(score),
         notes=notes,
     )
-

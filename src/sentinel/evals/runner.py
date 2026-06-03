@@ -9,7 +9,7 @@ from sentinel.evals.scoring import score_run
 from sentinel.graphs.parent import run_audit
 
 
-FIXTURES = ["missing-access-control", "unchecked-transfer", "reentrancy-toy"]
+FIXTURES = ["missing-access-control", "unchecked-transfer", "reentrancy-toy", "astra-vault", "safe-vault-negative"]
 
 
 def fixture_dir(name: str) -> Path:
@@ -19,7 +19,11 @@ def fixture_dir(name: str) -> Path:
 def run_fixture(name: str, mock_llm: bool = True):
     root = fixture_dir(name)
     expected = json.loads((root / "expected_findings.json").read_text(encoding="utf-8"))
-    state = run_audit(str(root / "repo"), f"Find {expected['vulnerability_class']} bugs", run_id=f"eval-{name}", mock_llm=mock_llm)
+    if expected.get("expected_findings"):
+        objective = "Find bugs"
+    else:
+        objective = f"Find {expected['vulnerability_class']} bugs"
+    state = run_audit(str(root / "repo"), objective, run_id=f"eval-{name}", mock_llm=mock_llm)
     return score_run(name, state, expected)
 
 

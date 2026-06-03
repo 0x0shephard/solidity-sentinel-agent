@@ -1,4 +1,5 @@
 from sentinel.schemas.common import ToolStatus
+from sentinel.schemas.static import SourceEvidence, StaticDetection
 from sentinel.tools.research import RankHypothesesInput, rank_hypotheses
 
 
@@ -77,3 +78,66 @@ def test_rank_hypotheses_ignores_checked_token_transfer():
 
     assert output.status == ToolStatus.OK
     assert output.hypotheses[0].vulnerability_class == "manual_review"
+
+
+def test_rank_hypotheses_returns_multiple_static_detection_hypotheses():
+    detections = [
+        StaticDetection(
+            detector_id="static.detect_tx_origin_auth",
+            vulnerability_class="tx_origin_authorization",
+            title="tx.origin auth",
+            confidence=0.86,
+            evidence=[
+                SourceEvidence(
+                    file_path="src/Vault.sol",
+                    line_start=10,
+                    line_end=10,
+                    contract_name="Vault",
+                    function_name="onlyOwner",
+                    source_text="require(tx.origin == owner);",
+                    reason="tx.origin in auth",
+                )
+            ],
+            affected_functions=["onlyOwner"],
+            root_cause_terms=["tx.origin"],
+            recommendation_hint="Remove tx.origin",
+            checklist_refs=["solodit-access-tx-origin"],
+        ),
+        StaticDetection(
+            detector_id="static.detect_dangerous_delegatecall",
+            vulnerability_class="dangerous_delegatecall",
+            title="dangerous delegatecall",
+            confidence=0.83,
+            evidence=[
+                SourceEvidence(
+                    file_path="src/Vault.sol",
+                    line_start=20,
+                    line_end=20,
+                    contract_name="Vault",
+                    function_name="batch",
+                    source_text="target.delegatecall(data);",
+                    reason="delegatecall target is caller supplied",
+                )
+            ],
+            affected_functions=["batch"],
+            root_cause_terms=["delegatecall"],
+            recommendation_hint="Restrict delegatecall",
+            checklist_refs=["solodit-delegatecall-control"],
+        ),
+    ]
+
+    output = rank_hypotheses(
+        RankHypothesesInput(
+            objective="Find bugs",
+            static_facts=[detection.model_dump(mode="json") for detection in detections],
+        ),
+        {},
+    )
+
+    assert output.status == ToolStatus.OK
+    assert [hyp.id for hyp in output.hypotheses] == ["hyp-1", "hyp-2"]
+    assert {hyp.vulnerability_class for hyp in output.hypotheses} == {
+        "tx_origin_authorization",
+        "dangerous_delegatecall",
+    }
+    assert all(hyp.evidence_lines for hyp in output.hypotheses)

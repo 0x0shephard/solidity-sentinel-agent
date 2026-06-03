@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -69,3 +70,39 @@ class HistoricalFindingSearchOutput(BaseModel):
     status: ToolStatus
     matches: list[HistoricalFindingMatch] = Field(default_factory=list)
     message: str | None = None
+
+
+class RAGQuery(BaseModel):
+    hypothesis_id: str
+    query: str
+    intent: str
+    vulnerability_class: str | None = None
+    root_cause_terms: list[str] = Field(default_factory=list)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class RetrievalQualityGrade(BaseModel):
+    grade: Literal["good", "weak", "bad"]
+    score: float = Field(ge=0.0, le=1.0)
+    reason: str
+    repair_hint: str | None = None
+
+
+class HistoricalMatchCritique(BaseModel):
+    match: HistoricalFindingMatch
+    shared_root_cause: bool = False
+    shared_exploit_preconditions: bool = False
+    important_differences: list[str] = Field(default_factory=list)
+    safe_to_cite: bool = False
+    reason: str
+
+
+class RAGContextBundle(BaseModel):
+    hypothesis_id: str
+    queries: list[RAGQuery] = Field(default_factory=list)
+    raw_match_count: int = 0
+    quality_grade: RetrievalQualityGrade
+    safe_matches: list[HistoricalMatchCritique] = Field(default_factory=list)
+    rejected_matches: list[HistoricalMatchCritique] = Field(default_factory=list)
+    used_repair: bool = False
+    notes: list[str] = Field(default_factory=list)

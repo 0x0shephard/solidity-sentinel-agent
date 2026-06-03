@@ -1,6 +1,7 @@
 from sentinel.reporting import build_report_document, create_findings_from_state, render_markdown_report
 from sentinel.schemas.common import ArtifactRef, ToolStatus
 from sentinel.schemas.research import ResearchSubgraphResult, VulnerabilityHypothesis
+from sentinel.schemas.static import SourceEvidence
 from sentinel.state import initial_audit_state
 
 
@@ -116,3 +117,55 @@ def test_markdown_report_renders_artifacts():
 
     assert "## Artifacts" in markdown
     assert "SentinelTest.t.sol" in markdown
+
+
+def test_report_requires_local_evidence_and_separates_historical_context():
+    state = initial_audit_state("run-1", "./repo", "Find bugs", "runs/run-1")
+    state["hypotheses"] = [
+        VulnerabilityHypothesis(
+            id="hyp-1",
+            title="Dangerous delegatecall",
+            vulnerability_class="dangerous_delegatecall",
+            affected_files=["src/Vault.sol"],
+            affected_functions=["batch"],
+            evidence_summary="delegatecall target controlled",
+            confidence=0.8,
+            evidence_lines=[
+                SourceEvidence(
+                    file_path="src/Vault.sol",
+                    line_start=42,
+                    line_end=42,
+                    contract_name="Vault",
+                    function_name="batch",
+                    source_text="target.delegatecall(payload);",
+                    reason="delegatecall target is caller supplied",
+                )
+            ],
+            historical_matches=[
+                {
+                    "finding": {
+                        "id": "hist-1",
+                        "title": "Delegatecall to user-controlled target",
+                        "source_link": "https://example.test/report",
+                    },
+                    "final_score": 0.91,
+                    "relevance_reason": "same root cause",
+                }
+            ],
+        ),
+        VulnerabilityHypothesis(
+            id="hyp-2",
+            title="RAG only",
+            vulnerability_class="manual_review",
+            evidence_summary="historical only",
+            confidence=0.5,
+        ),
+    ]
+
+    state["findings"] = create_findings_from_state(state)
+    markdown = render_markdown_report(build_report_document(state))
+
+    assert len(state["findings"]) == 1
+    assert "Historical Similar Findings" in markdown
+    assert "not proof of a bug" in markdown
+    assert "Delegatecall to user-controlled target" in markdown

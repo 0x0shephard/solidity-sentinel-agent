@@ -1,0 +1,36 @@
+{
+  "expected_findings": [
+    {
+      "vulnerability_class": "tx_origin_authorization",
+      "affected_file_contains": "AstraVault.sol",
+      "affected_function": "onlyOwner"
+    },
+    {
+      "vulnerability_class": "unguarded_initializer",
+      "affected_file_contains": "AstraVault.sol",
+      "affected_function": "initialize"
+    },
+    {
+      "vulnerability_class": "oracle_staleness_logic",
+      "affected_file_contains": "AstraVault.sol",
+      "affected_function": "depositWithOracle"
+    },
+    {
+      "vulnerability_class": "unchecked_erc20_return",
+      "affected_file_contains": "AstraVault.sol",
+      "affected_function": "_pull"
+    },
+    {
+      "vulnerability_class": "dangerous_delegatecall",
+      "affected_file_contains": "AstraVault.sol",
+      "affected_function": "autoRebalance"
+    },
+    {
+      "vulnerability_class": "external_call_before_accounting",
+      "affected_file_contains": "AstraVault.sol",
+      "affected_function": "withdraw"
+    }
+  ],
+  "minimum_expected_findings": 5
+}
+

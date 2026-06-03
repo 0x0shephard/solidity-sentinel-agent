@@ -15,6 +15,11 @@ class EvalScore(BaseModel):
     expected_function_found: bool
     evidence_present: bool
     composition_chain_present: bool
+    hypothesis_recall: float = Field(default=0.0, ge=0.0, le=1.0)
+    finding_recall: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
+    rag_context_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
+    unsupported_claim_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    false_positive_count: int = Field(default=0, ge=0)
     score: float = Field(ge=0.0, le=100.0)
     notes: list[str] = Field(default_factory=list)
-

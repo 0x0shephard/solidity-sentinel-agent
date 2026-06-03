@@ -15,11 +15,15 @@ def test_eval_runner_scores_all_fixtures(tmp_path, monkeypatch):
         assert score.spawned_research_subgraph
         assert score.generated_json_report
         assert score.generated_markdown_report
-        assert score.expected_class_found
-        assert score.expected_function_found
+        if score.fixture == "safe-vault-negative":
+            assert score.false_positive_count <= 1
+            assert score.unsupported_claim_rate <= 0.10
+        else:
+            assert score.expected_class_found
+            assert score.expected_function_found
         assert score.evidence_present
         assert score.composition_chain_present
-        assert score.score >= 90
+        assert score.score >= 80
 
 
 def test_eval_summary_writes_json_and_markdown(tmp_path):

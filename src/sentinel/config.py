@@ -19,11 +19,11 @@ class Settings(BaseModel):
 
     runs_dir: Path = Path("runs")
     llm_provider: LLMProviderName = "huggingface"
-    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
+    model: str = "Qwen/Qwen2.5-Coder-32B-Instruct"
     ollama_base_url: str = "http://localhost:11434"
     hf_token: str | None = None
     hf_base_url: str = "https://router.huggingface.co/v1"
-    max_tool_calls: int = Field(default=40, ge=1)
+    max_tool_calls: int = Field(default=80, ge=1)
     context_summary_interval: int = Field(default=6, ge=1)
     solodit_api_url: str = "https://solodit.cyfrin.io/api/v1/solodit"
     solodit_api_key: str | None = None
@@ -48,11 +48,11 @@ def get_settings() -> Settings:
     return Settings(
         runs_dir=Path(os.getenv("SENTINEL_RUNS_DIR", "runs")),
         llm_provider=os.getenv("SENTINEL_LLM_PROVIDER", "huggingface"),  # type: ignore[arg-type]
-        model=os.getenv("SENTINEL_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct"),
+        model=os.getenv("SENTINEL_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct"),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         hf_token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN"),
         hf_base_url=os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1"),
-        max_tool_calls=int(os.getenv("SENTINEL_MAX_TOOL_CALLS", "40")),
+        max_tool_calls=int(os.getenv("SENTINEL_MAX_TOOL_CALLS", "80")),
         context_summary_interval=int(os.getenv("SENTINEL_CONTEXT_SUMMARY_INTERVAL", "6")),
         solodit_api_url=os.getenv("SOLODIT_API_URL", "https://solodit.cyfrin.io/api/v1/solodit"),
         solodit_api_key=os.getenv("SOLODIT_API_KEY") or None,

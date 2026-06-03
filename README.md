@@ -31,15 +31,16 @@ ollama --version
 
 ## Default LLM Runtime
 
-The documented real-LLM default is Hugging Face:
+The documented real-LLM default is hosted Hugging Face inference:
 
 ```env
 SENTINEL_LLM_PROVIDER=huggingface
-SENTINEL_MODEL=Qwen/Qwen2.5-Coder-7B-Instruct
+SENTINEL_MODEL=Qwen/Qwen2.5-Coder-32B-Instruct
+HF_BASE_URL=https://router.huggingface.co/v1
 HF_TOKEN=...
 ```
 
-Ollama remains supported for local runs:
+Ollama remains supported through a remote or local Ollama-compatible REST endpoint:
 
 ```env
 SENTINEL_LLM_PROVIDER=ollama

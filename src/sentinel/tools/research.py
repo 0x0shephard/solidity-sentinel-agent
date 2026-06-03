@@ -3,12 +3,23 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from sentinel.config import get_settings
+from sentinel.rag.checklist import build_solodit_checklists_from_cache, write_generated_checklists
 from sentinel.rag.ranking import rank_matches
 from sentinel.rag.store import HistoricalFindingStore
 from sentinel.rag.sync import sync_solodit
 from sentinel.schemas.common import SideEffect, ToolStatus
-from sentinel.schemas.rag import HistoricalFindingQuery, HistoricalFindingSearchOutput, RagSyncOutput
+from sentinel.schemas.rag import (
+    HistoricalFindingMatch,
+    HistoricalFindingQuery,
+    HistoricalFindingSearchOutput,
+    HistoricalMatchCritique,
+    RAGContextBundle,
+    RAGQuery,
+    RagSyncOutput,
+    RetrievalQualityGrade,
+)
 from sentinel.schemas.research import VulnerabilityHypothesis
+from sentinel.schemas.static import StaticDetection
 from sentinel.tools.base import RegisteredTool
 
 
@@ -39,6 +50,68 @@ class ResearchGenericOutput(BaseModel):
     status: ToolStatus
     message: str | None = None
     data: dict = Field(default_factory=dict)
+
+
+class RAGQueriesInput(BaseModel):
+    hypothesis: VulnerabilityHypothesis
+    objective: str = ""
+
+
+class RAGQueriesOutput(BaseModel):
+    status: ToolStatus
+    queries: list[RAGQuery] = Field(default_factory=list)
+
+
+class MultiQueryRetrievalInput(BaseModel):
+    queries: list[RAGQuery]
+
+
+class MultiQueryRetrievalOutput(BaseModel):
+    status: ToolStatus
+    matches_by_query: dict[str, list[HistoricalFindingMatch]] = Field(default_factory=dict)
+
+
+class MergeRAGResultsInput(BaseModel):
+    matches_by_query: dict[str, list[HistoricalFindingMatch]] = Field(default_factory=dict)
+
+
+class MergeRAGResultsOutput(BaseModel):
+    status: ToolStatus
+    matches: list[HistoricalFindingMatch] = Field(default_factory=list)
+
+
+class RetrievalGradeInput(BaseModel):
+    hypothesis: VulnerabilityHypothesis
+    matches: list[HistoricalFindingMatch] = Field(default_factory=list)
+
+
+class RetrievalGradeOutput(BaseModel):
+    status: ToolStatus
+    grade: RetrievalQualityGrade
+
+
+class RepairRAGQueryInput(BaseModel):
+    hypothesis: VulnerabilityHypothesis
+    grade: RetrievalQualityGrade
+
+
+class CritiqueHistoricalMatchesInput(BaseModel):
+    hypothesis: VulnerabilityHypothesis
+    matches: list[HistoricalFindingMatch] = Field(default_factory=list)
+
+
+class CritiqueHistoricalMatchesOutput(BaseModel):
+    status: ToolStatus
+    critiques: list[HistoricalMatchCritique] = Field(default_factory=list)
+
+
+class BuildRAGContextBundleInput(BaseModel):
+    hypothesis: VulnerabilityHypothesis
+    queries: list[RAGQuery] = Field(default_factory=list)
+    matches: list[HistoricalFindingMatch] = Field(default_factory=list)
+    grade: RetrievalQualityGrade | None = None
+    critiques: list[HistoricalMatchCritique] = Field(default_factory=list)
+    used_repair: bool = False
 
 
 SENSITIVE_FUNCTION_TERMS = ("emergency", "withdraw", "sweep", "drain", "claim", "redeem", "pay", "send")
@@ -118,6 +191,68 @@ def _class_from_slither_check(check: str) -> str | None:
         if normalized.startswith(prefix):
             return vulnerability_class
     return None
+
+
+def _validation_for_class(vulnerability_class: str, function_name: str | None = None) -> list[str]:
+    target = function_name or "the affected function"
+    if vulnerability_class in {"reentrancy", "external_call_before_accounting"}:
+        return [f"Add a callback/reentrancy regression test around {target} and assert accounting remains invariant."]
+    if vulnerability_class == "unchecked_erc20_return":
+        return [f"Use a mock ERC20 that returns false and assert {target} handles the failure."]
+    if vulnerability_class in {"missing_access_control", "tx_origin_authorization"}:
+        return [f"Call {target} through unauthorized direct and intermediary callers."]
+    if vulnerability_class == "unguarded_initializer":
+        return [f"Call {target} twice and from a non-admin account after deployment."]
+    if vulnerability_class == "oracle_staleness_logic":
+        return [f"Mock stale and zero oracle responses and assert {target} rejects each case independently."]
+    if vulnerability_class == "dangerous_delegatecall":
+        return [f"Attempt to execute a malicious delegatecall payload through {target}."]
+    return [f"Add a targeted regression test for {target}."]
+
+
+def _hypothesis_from_detection(index: int, detection: StaticDetection) -> VulnerabilityHypothesis:
+    affected_files = []
+    for item in detection.evidence:
+        if item.file_path not in affected_files:
+            affected_files.append(item.file_path)
+    affected_functions = detection.affected_functions or [
+        item.function_name for item in detection.evidence if item.function_name
+    ]
+    affected_functions = list(dict.fromkeys(affected_functions))
+    first_evidence = detection.evidence[0] if detection.evidence else None
+    evidence_summary = "; ".join(
+        f"{item.file_path}:{item.line_start} {item.reason}" for item in detection.evidence[:4]
+    )
+    return VulnerabilityHypothesis(
+        id=f"hyp-{index}",
+        title=detection.title,
+        vulnerability_class=detection.vulnerability_class,
+        affected_files=affected_files,
+        affected_functions=affected_functions,
+        evidence_summary=evidence_summary or detection.title,
+        confidence=detection.confidence,
+        affected_contract=first_evidence.contract_name if first_evidence else None,
+        affected_function=affected_functions[0] if affected_functions else None,
+        evidence_lines=detection.evidence,
+        root_cause_terms=detection.root_cause_terms,
+        recommended_validation=_validation_for_class(detection.vulnerability_class, affected_functions[0] if affected_functions else None),
+        source_detection_ids=[detection.detector_id],
+    )
+
+
+def _dedupe_hypotheses(hypotheses: list[VulnerabilityHypothesis]) -> list[VulnerabilityHypothesis]:
+    deduped: list[VulnerabilityHypothesis] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in sorted(hypotheses, key=lambda hyp: hyp.confidence, reverse=True):
+        file_key = item.affected_files[0] if item.affected_files else ""
+        function_key = item.affected_functions[0] if item.affected_functions else item.affected_function or ""
+        key = (item.vulnerability_class, file_key, function_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        item.id = f"hyp-{len(deduped) + 1}"
+        deduped.append(item)
+    return deduped[:10]
 
 
 def _detect_slither_finding(functions: list[dict], slither_findings: list[dict]) -> VulnerabilityHypothesis | None:
@@ -226,6 +361,16 @@ def _detect_missing_access_control(
 
 
 def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
+    static_detections = [
+        StaticDetection.model_validate(fact)
+        for fact in inp.static_facts
+        if isinstance(fact, dict) and fact.get("detector_id") and fact.get("evidence")
+    ]
+    hypotheses: list[VulnerabilityHypothesis] = [
+        _hypothesis_from_detection(index, detection)
+        for index, detection in enumerate(static_detections, start=1)
+    ]
+
     functions = _facts_with_key(inp.static_facts, "function")
     external_calls = _facts_containing(inp.static_facts, (".transfer(", ".call(", ".call{", ".send(", ".delegatecall(", ".delegatecall{"))
     token_transfers = _facts_containing(inp.static_facts, (".transfer(", ".transferFrom("))
@@ -245,7 +390,11 @@ def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
     ]:
         hypothesis = detector()
         if hypothesis:
-            return RankHypothesesOutput(status=ToolStatus.OK, hypotheses=[hypothesis])
+            hypotheses.append(hypothesis)
+
+    hypotheses = _dedupe_hypotheses(hypotheses)
+    if hypotheses:
+        return RankHypothesesOutput(status=ToolStatus.OK, hypotheses=hypotheses)
 
     hypothesis = VulnerabilityHypothesis(
         id="hyp-1",
@@ -278,6 +427,19 @@ def solodit_sync(inp: ResearchGenericInput, state) -> RagSyncOutput:
     return RagSyncOutput(status=result.status, state=result)
 
 
+def build_solodit_checklist(inp: ResearchGenericInput, state) -> ResearchGenericOutput:
+    path = write_generated_checklists()
+    items = build_solodit_checklists_from_cache()
+    return ResearchGenericOutput(
+        status=ToolStatus.OK,
+        data={
+            "path": str(path),
+            "checklist_count": len(items),
+            "classes": sorted({item.vulnerability_class for item in items}),
+        },
+    )
+
+
 def retrieve_historical_findings(inp: HistoricalFindingQuery, state) -> HistoricalFindingSearchOutput:
     settings = get_settings()
     candidates = HistoricalFindingStore(settings).search(inp)
@@ -285,6 +447,163 @@ def retrieve_historical_findings(inp: HistoricalFindingQuery, state) -> Historic
     if matches:
         state.setdefault("historical_findings", []).extend(matches)
     return HistoricalFindingSearchOutput(status=ToolStatus.OK, matches=matches)
+
+
+def expand_rag_queries(inp: RAGQueriesInput, state) -> RAGQueriesOutput:
+    hyp = inp.hypothesis
+    snippets = " ".join(item.source_text for item in hyp.evidence_lines[:3])
+    affected = " ".join([hyp.affected_contract or "", hyp.affected_function or "", " ".join(hyp.affected_functions)])
+    roots = " ".join(hyp.root_cause_terms)
+    preconditions = " ".join(hyp.exploit_precondition_terms)
+    seeds = [
+        ("root_cause", f"{hyp.vulnerability_class} {roots} {hyp.title}"),
+        ("exploit_preconditions", f"{hyp.vulnerability_class} {preconditions or roots} exploit preconditions"),
+        ("code_indicators", f"{hyp.vulnerability_class} {snippets[:500]}"),
+        ("affected_surface", f"{hyp.vulnerability_class} {affected} Solidity audit finding"),
+    ]
+    if hyp.suggested_rag_queries:
+        seeds.extend((f"suggested_{idx}", query) for idx, query in enumerate(hyp.suggested_rag_queries[:2], start=1))
+    queries = []
+    seen = set()
+    for intent, query in seeds:
+        cleaned = " ".join(query.split())
+        if not cleaned or cleaned.lower() in seen:
+            continue
+        seen.add(cleaned.lower())
+        queries.append(
+            RAGQuery(
+                hypothesis_id=hyp.id,
+                query=cleaned,
+                intent=intent,
+                vulnerability_class=hyp.vulnerability_class,
+                root_cause_terms=hyp.root_cause_terms,
+                top_k=5,
+            )
+        )
+    return RAGQueriesOutput(status=ToolStatus.OK, queries=queries[:5])
+
+
+def retrieve_multi_query(inp: MultiQueryRetrievalInput, state) -> MultiQueryRetrievalOutput:
+    matches_by_query: dict[str, list[HistoricalFindingMatch]] = {}
+    for query in inp.queries:
+        output = retrieve_historical_findings(
+            HistoricalFindingQuery(
+                query=query.query,
+                vulnerability_class=query.vulnerability_class,
+                tags=query.root_cause_terms,
+                top_k=query.top_k,
+            ),
+            state,
+        )
+        matches_by_query[query.intent] = output.matches
+    return MultiQueryRetrievalOutput(status=ToolStatus.OK, matches_by_query=matches_by_query)
+
+
+def merge_rag_results(inp: MergeRAGResultsInput, state) -> MergeRAGResultsOutput:
+    best: dict[str, HistoricalFindingMatch] = {}
+    for matches in inp.matches_by_query.values():
+        for match in matches:
+            key = match.finding.id or match.finding.title
+            existing = best.get(key)
+            if existing is None or match.final_score > existing.final_score:
+                best[key] = match
+    merged = sorted(best.values(), key=lambda item: item.final_score, reverse=True)[:10]
+    return MergeRAGResultsOutput(status=ToolStatus.OK, matches=merged)
+
+
+def _root_overlap(hypothesis: VulnerabilityHypothesis, match: HistoricalFindingMatch) -> set[str]:
+    hyp_terms = {term.lower() for term in hypothesis.root_cause_terms + [hypothesis.vulnerability_class] if term}
+    finding_terms = {term.lower() for term in match.finding.root_cause_terms + [match.finding.vulnerability_class] if term}
+    matched_terms = {term.lower() for term in match.matched_terms if term}
+    return hyp_terms.intersection(finding_terms.union(matched_terms))
+
+
+def grade_retrieval_quality(inp: RetrievalGradeInput, state) -> RetrievalGradeOutput:
+    if not inp.matches:
+        grade = RetrievalQualityGrade(grade="bad", score=0.0, reason="No historical matches returned.", repair_hint="Use root-cause and source-code terms.")
+        return RetrievalGradeOutput(status=ToolStatus.OK, grade=grade)
+    strong = [match for match in inp.matches if match.final_score >= 0.30 and _root_overlap(inp.hypothesis, match)]
+    weak = [match for match in inp.matches if match.final_score >= 0.18]
+    if len(strong) >= 2:
+        score = min(1.0, sum(match.final_score for match in strong[:3]) / 3)
+        grade = RetrievalQualityGrade(grade="good", score=score, reason=f"{len(strong)} matches share root-cause terms.")
+    elif weak:
+        score = max(match.final_score for match in weak)
+        grade = RetrievalQualityGrade(grade="weak", score=score, reason="Matches exist but root-cause overlap is thin.", repair_hint="Add exact vulnerability class and evidence source terms.")
+    else:
+        grade = RetrievalQualityGrade(grade="bad", score=0.05, reason="Only low-scoring lexical matches returned.", repair_hint="Use concrete source evidence and exploit precondition terms.")
+    return RetrievalGradeOutput(status=ToolStatus.OK, grade=grade)
+
+
+def repair_rag_query(inp: RepairRAGQueryInput, state) -> RAGQueriesOutput:
+    hyp = inp.hypothesis
+    snippets = " ".join(item.source_text for item in hyp.evidence_lines[:2])
+    query = " ".join(
+        [
+            hyp.vulnerability_class,
+            " ".join(hyp.root_cause_terms),
+            " ".join(hyp.exploit_precondition_terms),
+            snippets[:400],
+            inp.grade.repair_hint or "",
+        ]
+    )
+    return RAGQueriesOutput(
+        status=ToolStatus.OK,
+        queries=[
+            RAGQuery(
+                hypothesis_id=hyp.id,
+                query=" ".join(query.split()),
+                intent="repair",
+                vulnerability_class=hyp.vulnerability_class,
+                root_cause_terms=hyp.root_cause_terms,
+                top_k=8,
+            )
+        ],
+    )
+
+
+def critique_historical_matches(inp: CritiqueHistoricalMatchesInput, state) -> CritiqueHistoricalMatchesOutput:
+    critiques = []
+    preconditions = {term.lower() for term in inp.hypothesis.exploit_precondition_terms if term}
+    for match in inp.matches:
+        overlap = _root_overlap(inp.hypothesis, match)
+        haystack = f"{match.finding.title} {match.finding.summary or ''} {match.finding.search_text[:2000]}".lower()
+        shared_preconditions = bool(preconditions and any(term in haystack for term in preconditions))
+        same_class = match.finding.vulnerability_class == inp.hypothesis.vulnerability_class
+        safe = bool(overlap or shared_preconditions or (same_class and match.final_score >= 0.30))
+        differences = []
+        if not same_class:
+            differences.append(f"class differs: {match.finding.vulnerability_class}")
+        if not overlap:
+            differences.append("no explicit root-cause term overlap")
+        critiques.append(
+            HistoricalMatchCritique(
+                match=match,
+                shared_root_cause=bool(overlap),
+                shared_exploit_preconditions=shared_preconditions,
+                important_differences=differences,
+                safe_to_cite=safe,
+                reason="Safe to cite as historical context." if safe else "Rejected: similar wording without shared root cause or exploit preconditions.",
+            )
+        )
+    return CritiqueHistoricalMatchesOutput(status=ToolStatus.OK, critiques=critiques)
+
+
+def build_rag_context_bundle(inp: BuildRAGContextBundleInput, state) -> ResearchGenericOutput:
+    grade = inp.grade or RetrievalQualityGrade(grade="bad", score=0.0, reason="No retrieval grade provided.")
+    safe = [critique for critique in inp.critiques if critique.safe_to_cite][:3]
+    rejected = [critique for critique in inp.critiques if not critique.safe_to_cite]
+    bundle = RAGContextBundle(
+        hypothesis_id=inp.hypothesis.id,
+        queries=inp.queries,
+        raw_match_count=len(inp.matches),
+        quality_grade=grade,
+        safe_matches=safe,
+        rejected_matches=rejected,
+        used_repair=inp.used_repair,
+        notes=[grade.reason],
+    )
+    return ResearchGenericOutput(status=ToolStatus.OK, data={"bundle": bundle.model_dump(mode="json")})
 
 
 def compare_to_known_bug(inp: HistoricalFindingQuery, state) -> HistoricalFindingSearchOutput:
@@ -327,7 +646,15 @@ def register(registry) -> None:
         RegisteredTool(namespace="research", name="search_local_vuln_db", description="Search local vulnerability class memory.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=search_local_vuln_db, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="retrieve_similar_cases", description="Retrieve similar vulnerability cases.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=retrieve_similar_cases, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="solodit_sync", description="Synchronize Solodit historical findings into the local RAG cache.", input_model=ResearchGenericInput, output_model=RagSyncOutput, fn=solodit_sync, side_effects=[SideEffect.EXTERNAL_NETWORK]),
+        RegisteredTool(namespace="research", name="build_solodit_checklist", description="Build Solodit-informed detection checklists from the local RAG cache.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=build_solodit_checklist, side_effects=[SideEffect.WRITE_FILES]),
         RegisteredTool(namespace="research", name="retrieve_historical_findings", description="Retrieve and hybrid-rank Solodit historical findings.", input_model=HistoricalFindingQuery, output_model=HistoricalFindingSearchOutput, fn=retrieve_historical_findings, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="research", name="expand_rag_queries", description="Expand one hypothesis into multiple RAG query intents.", input_model=RAGQueriesInput, output_model=RAGQueriesOutput, fn=expand_rag_queries, side_effects=[SideEffect.NONE]),
+        RegisteredTool(namespace="research", name="retrieve_multi_query", description="Retrieve historical matches for multiple RAG queries.", input_model=MultiQueryRetrievalInput, output_model=MultiQueryRetrievalOutput, fn=retrieve_multi_query, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="research", name="merge_rag_results", description="Deduplicate and rerank multi-query RAG results.", input_model=MergeRAGResultsInput, output_model=MergeRAGResultsOutput, fn=merge_rag_results, side_effects=[SideEffect.NONE]),
+        RegisteredTool(namespace="research", name="grade_retrieval_quality", description="Grade historical retrieval quality as good, weak, or bad.", input_model=RetrievalGradeInput, output_model=RetrievalGradeOutput, fn=grade_retrieval_quality, side_effects=[SideEffect.NONE]),
+        RegisteredTool(namespace="research", name="repair_rag_query", description="Repair weak historical retrieval with a more specific query.", input_model=RepairRAGQueryInput, output_model=RAGQueriesOutput, fn=repair_rag_query, side_effects=[SideEffect.NONE]),
+        RegisteredTool(namespace="research", name="critique_historical_matches", description="Critique historical matches and mark which are safe to cite.", input_model=CritiqueHistoricalMatchesInput, output_model=CritiqueHistoricalMatchesOutput, fn=critique_historical_matches, side_effects=[SideEffect.NONE]),
+        RegisteredTool(namespace="research", name="build_rag_context_bundle", description="Build a final Self-RAG context bundle for a hypothesis.", input_model=BuildRAGContextBundleInput, output_model=ResearchGenericOutput, fn=build_rag_context_bundle, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="compare_to_known_bug", description="Compare local hypothesis text to known historical findings.", input_model=HistoricalFindingQuery, output_model=HistoricalFindingSearchOutput, fn=compare_to_known_bug, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="research", name="challenge_finding", description="Challenge whether historical matches are supported by local target evidence.", input_model=HistoricalFindingQuery, output_model=ResearchGenericOutput, fn=challenge_finding, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="map_to_vulnerability_class", description="Map evidence to vulnerability class.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=map_to_vulnerability_class, side_effects=[SideEffect.NONE]),

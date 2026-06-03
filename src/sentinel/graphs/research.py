@@ -28,6 +28,20 @@ def _impact_for_class(vulnerability_class: str, functions: list[str]) -> str:
         return f"Ignoring an ERC20 transfer return value in{function_text} can make accounting continue after a token transfer failed."
     if vulnerability_class == "missing_access_control":
         return f"An unauthorized caller may be able to execute sensitive behavior in{function_text}."
+    if vulnerability_class == "tx_origin_authorization":
+        return f"Origin-based authorization in{function_text} can allow an intermediary contract to satisfy access checks through a victim origin."
+    if vulnerability_class == "unguarded_initializer":
+        return f"An unguarded initializer in{function_text} can allow unauthorized setup or repeated privileged state changes."
+    if vulnerability_class == "oracle_staleness_logic":
+        return f"Oracle validation in{function_text} may accept stale or incomplete price data."
+    if vulnerability_class == "dangerous_delegatecall":
+        return f"Delegatecall in{function_text} can execute external code in this contract's storage context."
+    if vulnerability_class == "unsafe_or_guard":
+        return f"An OR-combined guard in{function_text} can allow one weak branch to bypass intended constraints."
+    if vulnerability_class == "external_call_before_accounting":
+        return f"External control flow before finalized accounting in{function_text} can expose stale balances or inconsistent state."
+    if vulnerability_class == "strategy_accounting_trust":
+        return f"Strategy-controlled calls or reports in{function_text} can influence debt/accounting without sufficient reconciliation."
     return "The evidence supports a manual security review before reporting exploitability."
 
 
@@ -39,6 +53,20 @@ def _tests_for_class(vulnerability_class: str, functions: list[str]) -> list[str
         return [f"Add a mock ERC20 that returns false and assert {target} reverts or handles the failure."]
     if vulnerability_class == "missing_access_control":
         return [f"Add a non-authorized caller regression test for {target}."]
+    if vulnerability_class == "tx_origin_authorization":
+        return [f"Call {target} through an intermediary contract where tx.origin is privileged but msg.sender is not."]
+    if vulnerability_class == "unguarded_initializer":
+        return [f"Call {target} twice and from an unauthorized caller after initial setup."]
+    if vulnerability_class == "oracle_staleness_logic":
+        return [f"Mock zero and stale oracle responses and assert {target} rejects each independently."]
+    if vulnerability_class == "dangerous_delegatecall":
+        return [f"Pass a malicious delegatecall payload to {target} and assert storage cannot be corrupted."]
+    if vulnerability_class == "unsafe_or_guard":
+        return [f"Exercise each OR branch in {target} independently and assert weak branches do not bypass intended constraints."]
+    if vulnerability_class == "external_call_before_accounting":
+        return [f"Add a callback/reentrancy-style regression test around {target} before accounting is finalized."]
+    if vulnerability_class == "strategy_accounting_trust":
+        return [f"Use a malicious strategy mock around {target} that misreports or under-returns assets."]
     return [f"Add a targeted regression test for {target}."]
 
 
@@ -123,6 +151,11 @@ def analyze_hypothesis(state: ResearchState) -> ResearchState:
 
 
 def retrieve_historical_context(state: ResearchState) -> ResearchState:
+    if state.get("rag_context_bundle"):
+        bundle = state["rag_context_bundle"]
+        state["historical_findings"] = [critique.model_dump(mode="json") for critique in bundle.safe_matches]
+        state.setdefault("notes", []).append(f"Received RAG context bundle graded {bundle.quality_grade.grade}.")
+        return state
     hypothesis = state["hypothesis"]
     query = " ".join(
         [
@@ -199,6 +232,10 @@ def create_result(state: ResearchState) -> ResearchState:
         notes=state.get("notes", []),
         historical_findings=state.get("historical_findings", []),
         subagent_tool_ledger=[record.model_dump(mode="json") if hasattr(record, "model_dump") else record for record in state.get("subagent_tool_ledger", [])],
+        finding_status="confirmed" if state.get("evidence_records") and confidence >= 0.85 else ("likely" if state.get("evidence_records") else "needs_manual_review"),
+        reasoning_summary=likely_impact,
+        historical_context_used=bool(state.get("historical_findings")),
+        rag_context_bundle=state.get("rag_context_bundle"),
     )
     state["result"] = result
     return state

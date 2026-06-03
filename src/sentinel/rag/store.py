@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import warnings
 
 from sentinel.config import Settings
 from sentinel.schemas.rag import HistoricalFinding, HistoricalFindingQuery
@@ -79,9 +80,11 @@ class HistoricalFindingStore:
             from langchain_chroma import Chroma
             from langchain_huggingface import HuggingFaceEmbeddings
 
-            embeddings = HuggingFaceEmbeddings(model_name=self.settings.rag_embed_model)
+            embeddings = HuggingFaceEmbeddings(model_name=self.settings.rag_embed_model, model_kwargs={"local_files_only": True})
             db = Chroma(persist_directory=str(rag_paths(self.settings)["chroma"]), embedding_function=embeddings)
-            raw = db.similarity_search_with_relevance_scores(query.query, k=candidate_k)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Relevance scores must be between 0 and 1.*")
+                raw = db.similarity_search_with_relevance_scores(query.query, k=candidate_k)
             candidates = []
             for doc, score in raw:
                 finding_id = str(doc.metadata.get("id"))
