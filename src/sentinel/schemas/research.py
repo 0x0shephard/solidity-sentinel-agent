@@ -31,6 +31,7 @@ class ResearchSubgraphResult(BaseModel):
     hypothesis_id: str
     refined_title: str
     vulnerability_class: str
+    evidence: list[dict] = Field(default_factory=list)
     exploit_preconditions: list[str] = Field(default_factory=list)
     likely_impact: str
     evidence_to_collect: list[str] = Field(default_factory=list)

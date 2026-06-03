@@ -48,6 +48,7 @@ class ResearchState(TypedDict, total=False):
     selected_snippets: list[dict]
     allowed_tool_names: list[str]
     notes: list[str]
+    evidence_records: list[dict]
     result: ResearchSubgraphResult
 
 

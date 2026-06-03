@@ -19,14 +19,27 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
         "unchecked_transfer": "medium",
     }
     severity = severity_by_class.get(hypothesis.vulnerability_class, "info")
-    evidence = [
-        Evidence(
-            kind="research_subgraph" if research else "static_analysis",
-            file_path=hypothesis.affected_files[0] if hypothesis.affected_files else None,
-            function=hypothesis.affected_functions[0] if hypothesis.affected_functions else None,
-            message=research.likely_impact if research else hypothesis.evidence_summary,
-        )
-    ]
+    if research and research.evidence:
+        evidence = [
+            Evidence(
+                kind=item.get("kind", "research_subgraph"),
+                file_path=item.get("file_path") or (hypothesis.affected_files[0] if hypothesis.affected_files else None),
+                line_start=item.get("line_start"),
+                line_end=item.get("line_end"),
+                function=item.get("function") or (hypothesis.affected_functions[0] if hypothesis.affected_functions else None),
+                message=item.get("message", research.likely_impact),
+            )
+            for item in research.evidence
+        ]
+    else:
+        evidence = [
+            Evidence(
+                kind="research_subgraph" if research else "static_analysis",
+                file_path=hypothesis.affected_files[0] if hypothesis.affected_files else None,
+                function=hypothesis.affected_functions[0] if hypothesis.affected_functions else None,
+                message=research.likely_impact if research else hypothesis.evidence_summary,
+            )
+        ]
     findings.append(
         Finding(
             id=hypothesis.id.replace("hyp", "finding"),
@@ -90,6 +103,8 @@ def render_markdown_report(report: ReportDocument) -> str:
         )
         for item in finding.evidence:
             location = item.file_path or "unknown file"
+            if item.line_start:
+                location += f":{item.line_start}"
             if item.function:
                 location += f"::{item.function}"
             lines.append(f"- `{location}`: {item.message}")

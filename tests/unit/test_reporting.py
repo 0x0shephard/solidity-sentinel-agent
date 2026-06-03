@@ -24,6 +24,16 @@ def test_create_findings_from_state_uses_research_result():
             hypothesis_id="hyp-1",
             refined_title="Missing access control",
             vulnerability_class="missing_access_control",
+            evidence=[
+                {
+                    "kind": "external_calls",
+                    "file_path": "src/Vault.sol",
+                    "line_start": 16,
+                    "line_end": 16,
+                    "function": "emergencyWithdraw",
+                    "message": "to.transfer(address(this).balance);",
+                }
+            ],
             likely_impact="Unauthorized withdrawal",
             confidence=0.8,
             recommended_tests=["Non-owner call should revert"],
@@ -35,6 +45,8 @@ def test_create_findings_from_state_uses_research_result():
     assert findings[0].severity == "high"
     assert findings[0].confidence == 0.8
     assert findings[0].affected_functions == ["emergencyWithdraw"]
+    assert findings[0].evidence[0].line_start == 16
+    assert findings[0].evidence[0].message == "to.transfer(address(this).balance);"
 
 
 def test_markdown_report_renders_findings():
@@ -47,3 +59,44 @@ def test_markdown_report_renders_findings():
     assert "# Solidity Sentinel Report" in markdown
     assert "No findings were generated." in markdown
 
+
+def test_markdown_report_renders_evidence_line_numbers():
+    state = initial_audit_state("run-1", "./repo", "Find bugs", "runs/run-1")
+    state["hypotheses"] = [
+        VulnerabilityHypothesis(
+            id="hyp-1",
+            title="Unchecked token transfer",
+            vulnerability_class="unchecked_transfer",
+            affected_files=["src/Vault.sol"],
+            affected_functions=["withdraw"],
+            evidence_summary="token.transfer ignored",
+            confidence=0.7,
+        )
+    ]
+    state["subgraph_results"] = [
+        ResearchSubgraphResult(
+            status=ToolStatus.OK,
+            subgraph_run_id="sub-1",
+            hypothesis_id="hyp-1",
+            refined_title="Unchecked token transfer",
+            vulnerability_class="unchecked_transfer",
+            evidence=[
+                {
+                    "kind": "token_transfers",
+                    "file_path": "src/Vault.sol",
+                    "line_start": 23,
+                    "line_end": 23,
+                    "function": "withdraw",
+                    "message": "token.transfer(msg.sender, amount);",
+                }
+            ],
+            likely_impact="Ignoring an ERC20 transfer return value can break accounting.",
+            confidence=0.8,
+        )
+    ]
+    state["findings"] = create_findings_from_state(state)
+
+    markdown = render_markdown_report(build_report_document(state))
+
+    assert "`src/Vault.sol:23::withdraw`" in markdown
+    assert "token.transfer(msg.sender, amount);" in markdown

@@ -97,3 +97,28 @@ def test_parse_slither_json(tmp_path):
     assert output.findings[0].check == "reentrancy-eth"
     assert output.findings[0].source_files == ["src/Vault.sol"]
     assert output.findings[0].functions == ["withdraw"]
+
+
+def test_extract_storage_writes_ignores_mapping_type_arrow(tmp_path):
+    repo = tmp_path / "repo"
+    src = repo / "src"
+    src.mkdir(parents=True)
+    (src / "Vault.sol").write_text(
+        """
+pragma solidity ^0.8.20;
+
+contract Vault {
+    mapping(address => uint256) public balances;
+
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+    state = initial_audit_state("run-1", str(repo), "Find bugs", "runs/run-1")
+    output = ToolExecutor(build_default_registry()).execute("static.extract_storage_writes", {"repo_path": str(repo)}, state)
+
+    assert output.status == ToolStatus.OK
+    assert [fact["text"] for fact in output.facts] == ["balances[msg.sender] += msg.value;"]

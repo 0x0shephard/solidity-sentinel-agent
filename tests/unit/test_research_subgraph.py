@@ -23,7 +23,7 @@ def test_research_graph_compiles_and_returns_result():
         parent_run_id="parent-1",
         objective="Find access control bugs",
         hypothesis=_hypothesis(),
-        selected_snippets=[{"file_path": "src/Vault.sol", "function": "emergencyWithdraw"}],
+        selected_snippets=[{"kind": "external_calls", "file_path": "src/Vault.sol", "line": 16, "function": "emergencyWithdraw", "text": "to.transfer(address(this).balance);"}],
         allowed_tool_names=["research.summarize_known_pattern"],
     )
 
@@ -31,6 +31,8 @@ def test_research_graph_compiles_and_returns_result():
 
     assert result_state["result"].status == ToolStatus.OK
     assert result_state["result"].hypothesis_id == "hyp-1"
+    assert result_state["result"].evidence[0]["line_start"] == 16
+    assert "unauthorized caller" in result_state["result"].likely_impact
     assert "Research subgraph received scoped state only." in result_state["result"].notes
 
 
@@ -64,4 +66,3 @@ def test_research_state_does_not_include_parent_audit_fields():
     forbidden_parent_fields = {"repo_path", "tool_ledger", "static_facts", "build_facts", "artifacts", "errors"}
 
     assert forbidden_parent_fields.isdisjoint(state.keys())
-

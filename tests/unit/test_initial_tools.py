@@ -26,5 +26,4 @@ def test_static_extract_functions(tmp_path):
 
     output = executor.execute("static.extract_functions", {"repo_path": str(tmp_path)}, state)
 
-    assert output.facts == [{"file_path": "src/Vault.sol", "function": "deposit"}]
-
+    assert output.facts == [{"file_path": "src/Vault.sol", "line": 2, "function": "deposit"}]

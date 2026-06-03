@@ -80,6 +80,29 @@ def _solidity_files(repo_path: str) -> list[Path]:
     return [path for path in Path(repo_path).rglob("*.sol") if path.is_file() and "out" not in path.parts and "cache" not in path.parts]
 
 
+def _function_context_by_line(lines: list[str]) -> dict[int, str]:
+    context: dict[int, str] = {}
+    current_function: str | None = None
+    brace_depth = 0
+    declaration = re.compile(r"\bfunction\s+(\w+)|\bconstructor\s*\(")
+    for line_no, line in enumerate(lines, start=1):
+        if current_function is None:
+            match = declaration.search(line)
+            if match:
+                current_function = match.group(1) or "constructor"
+                brace_depth = line.count("{") - line.count("}")
+                context[line_no] = current_function
+                if brace_depth <= 0:
+                    current_function = None
+                continue
+        if current_function is not None:
+            context[line_no] = current_function
+            brace_depth += line.count("{") - line.count("}")
+            if brace_depth <= 0:
+                current_function = None
+    return context
+
+
 def extract_contracts(inp: RepoPathInput, state) -> StaticFactsOutput:
     facts = []
     for path in _solidity_files(inp.repo_path):
@@ -91,8 +114,10 @@ def extract_contracts(inp: RepoPathInput, state) -> StaticFactsOutput:
 def extract_functions(inp: RepoPathInput, state) -> StaticFactsOutput:
     facts = []
     for path in _solidity_files(inp.repo_path):
-        for match in re.finditer(r"\bfunction\s+(\w+)", path.read_text(encoding="utf-8", errors="replace")):
-            facts.append({"file_path": str(path.relative_to(inp.repo_path)), "function": match.group(1)})
+        for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+            match = re.search(r"\bfunction\s+(\w+)", line)
+            if match:
+                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "function": match.group(1)})
     return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
 
 
@@ -126,9 +151,11 @@ def extract_modifiers(inp: RepoPathInput, state) -> StaticFactsOutput:
 def extract_external_calls(inp: RepoPathInput, state) -> StaticFactsOutput:
     facts = []
     for path in _solidity_files(inp.repo_path):
-        for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        function_context = _function_context_by_line(lines)
+        for line_no, line in enumerate(lines, start=1):
             if any(term in line for term in [".call(", ".call{", ".delegatecall(", ".delegatecall{", ".transfer(", ".send("]):
-                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "text": line.strip()})
+                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "function": function_context.get(line_no), "text": line.strip()})
     return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
 
 
@@ -144,20 +171,25 @@ def extract_delegatecalls(inp: RepoPathInput, state) -> StaticFactsOutput:
 def extract_token_transfers(inp: RepoPathInput, state) -> StaticFactsOutput:
     facts = []
     for path in _solidity_files(inp.repo_path):
-        for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        function_context = _function_context_by_line(lines)
+        for line_no, line in enumerate(lines, start=1):
             if ".transfer(" in line or ".transferFrom(" in line:
-                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "text": line.strip()})
+                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "function": function_context.get(line_no), "text": line.strip()})
     return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
 
 
 def extract_storage_writes(inp: RepoPathInput, state) -> StaticFactsOutput:
     facts = []
-    assignment = re.compile(r"(?<![=!<>])=(?!=)|\+=|-=")
+    assignment = re.compile(r"(?<![=!<>])=(?![=>])|\+=|-=")
+    local_declaration = re.compile(r"^(u?int\d*|address|bool|string|bytes\d*|\w+\s+memory|\w+\s+calldata)\s+\w+\s*=")
     for path in _solidity_files(inp.repo_path):
-        for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        function_context = _function_context_by_line(lines)
+        for line_no, line in enumerate(lines, start=1):
             stripped = line.strip()
-            if assignment.search(stripped) and not stripped.startswith(("require", "assert", "if ", "for ")):
-                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "text": stripped})
+            if assignment.search(stripped) and function_context.get(line_no) and not stripped.startswith(("require", "assert", "if ", "for ")) and not local_declaration.search(stripped):
+                facts.append({"file_path": str(path.relative_to(inp.repo_path)), "line": line_no, "function": function_context.get(line_no), "text": stripped})
     return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
 
 

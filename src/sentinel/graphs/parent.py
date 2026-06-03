@@ -37,6 +37,61 @@ def _run_tool(state: AuditState, tool_name: str, raw_input: dict):
     return output
 
 
+def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: VulnerabilityHypothesis) -> list[dict]:
+    affected_files = set(hypothesis.affected_files)
+    affected_functions = set(hypothesis.affected_functions)
+    grouped_snippets: dict[str, list[dict]] = {}
+    for fact_group, facts in state.get("static_facts", {}).items():
+        for fact in facts:
+            fact_files = set()
+            if fact.get("file_path"):
+                fact_files.add(fact["file_path"])
+            fact_files.update(fact.get("source_files") or [])
+            if affected_files and fact_files and not affected_files.intersection(fact_files):
+                continue
+            fact_functions = set()
+            if fact.get("function"):
+                fact_functions.add(fact["function"])
+            fact_functions.update(fact.get("functions") or [])
+            if affected_functions and fact_functions and not affected_functions.intersection(fact_functions):
+                continue
+            snippet = {"kind": fact_group, **fact}
+            grouped_snippets.setdefault(fact_group, []).append(snippet)
+    if hypothesis.vulnerability_class == "reentrancy":
+        snippets = [
+            *grouped_snippets.get("slither_findings", []),
+            *grouped_snippets.get("external_calls", []),
+            *grouped_snippets.get("storage_writes", []),
+            *grouped_snippets.get("functions", []),
+        ]
+    elif hypothesis.vulnerability_class == "unchecked_transfer":
+        snippets = [
+            *grouped_snippets.get("slither_findings", []),
+            *grouped_snippets.get("token_transfers", []),
+            *grouped_snippets.get("functions", []),
+            *grouped_snippets.get("storage_writes", []),
+        ]
+    elif hypothesis.vulnerability_class == "missing_access_control":
+        snippets = [
+            *grouped_snippets.get("slither_findings", []),
+            *grouped_snippets.get("external_calls", []),
+            *grouped_snippets.get("access_control", []),
+            *grouped_snippets.get("functions", []),
+        ]
+    else:
+        snippets = [snippet for group in grouped_snippets.values() for snippet in group]
+    if not snippets:
+        snippets.append(
+            {
+                "kind": "hypothesis",
+                "file_path": hypothesis.affected_files[0] if hypothesis.affected_files else None,
+                "function": hypothesis.affected_functions[0] if hypothesis.affected_functions else None,
+                "text": hypothesis.evidence_summary,
+            }
+        )
+    return snippets[:8]
+
+
 def _tool_prompt(state: AuditState) -> str:
     return (
         f"Objective: {state['objective']}\n"
@@ -179,10 +234,7 @@ def research_subgraph(state: AuditState) -> AuditState:
         return state
 
     hypothesis = hypotheses[0]
-    selected_snippets = [
-        *state.get("static_facts", {}).get("functions", [])[:3],
-        *state.get("static_facts", {}).get("external_calls", [])[:3],
-    ]
+    selected_snippets = _evidence_snippets_for_hypothesis(state, hypothesis)
     subgraph_state = initial_research_state(
         subgraph_run_id=f"{state['run_id']}-research-1",
         parent_run_id=state["run_id"],
