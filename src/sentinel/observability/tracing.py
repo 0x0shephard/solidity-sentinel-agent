@@ -2,23 +2,78 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from functools import lru_cache
+import contextlib
+import io
 import uuid
 
 from sentinel.config import get_settings
 
 
+@lru_cache(maxsize=8)
+def _langsmith_trace_writable(api_key: str, project_name: str) -> bool:
+    """Return whether this key can write traces to the configured project.
+
+    Constructing a LangSmith client is not enough: invalid workspace/project
+    permissions often fail only when posting runs. This preflight keeps a bad
+    key from producing noisy async multipart-ingest failures during every tool
+    span.
+    """
+
+    try:
+        from langsmith import Client
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            client = Client(api_key=api_key)
+            try:
+                client.read_project(project_name=project_name)
+            except Exception:
+                client.create_project(project_name=project_name, upsert=True)
+            run_id = uuid.uuid4()
+            client.create_run(
+                id=run_id,
+                name="sentinel.langsmith_preflight",
+                run_type="chain",
+                inputs={"purpose": "trace_write_preflight"},
+                project_name=project_name,
+            )
+            client.update_run(run_id, outputs={"ok": True}, end_time=datetime.now(UTC))
+        return True
+    except Exception:
+        return False
+
+
 @contextmanager
 def trace_span(name: str, run_dir: str | None = None, **attrs):
     settings = get_settings()
-    if settings.langsmith_tracing and settings.langsmith_api_key:
+    if (
+        settings.langsmith_tracing
+        and settings.langsmith_api_key
+        and _langsmith_trace_writable(settings.langsmith_api_key, settings.langsmith_project)
+    ):
         try:
-            from langsmith.run_helpers import trace
+            from langsmith import Client
 
-            with trace(name, run_type="chain", inputs=attrs, project_name=settings.langsmith_project) as run:
-                try:
-                    yield run
-                except Exception:
-                    raise
+            client = Client(api_key=settings.langsmith_api_key)
+            run_id = uuid.uuid4()
+            client.create_run(
+                id=run_id,
+                name=name,
+                run_type="chain",
+                inputs=attrs,
+                project_name=settings.langsmith_project,
+            )
+            try:
+                yield {"id": str(run_id), "name": name, "langsmith": True}
+                client.update_run(run_id, outputs={"status": "ok"}, end_time=datetime.now(UTC))
+            except Exception as exc:
+                client.update_run(
+                    run_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                    outputs={"status": "error"},
+                    end_time=datetime.now(UTC),
+                )
+                raise
             return
         except Exception:
             pass

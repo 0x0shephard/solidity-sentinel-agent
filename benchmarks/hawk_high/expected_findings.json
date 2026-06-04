@@ -1,0 +1,36 @@
+{
+  "benchmark_id": "hawk-high",
+  "description": "Protocol-level benchmark hooks for the Hawk High Foundry repo. These are expected hypothesis classes, not confirmed bug claims.",
+  "expected_hypotheses": [
+    {
+      "vulnerability_class": "business_logic",
+      "invariant_type": "configured_but_not_enforced",
+      "description": "Configuration or threshold variables should be enforced in production control flow."
+    },
+    {
+      "vulnerability_class": "accounting_invariant",
+      "invariant_type": "percentage_distribution_math",
+      "description": "Distribution or payout math should conserve funds across dynamic recipients."
+    },
+    {
+      "vulnerability_class": "upgradeability",
+      "invariant_type": "upgrade_authorization_without_upgrade",
+      "description": "Upgrade authorization and execution lifecycle should be reachable, authorized, and testable."
+    },
+    {
+      "vulnerability_class": "storage_layout",
+      "invariant_type": "storage_layout_mismatch",
+      "description": "Related upgradeable versions should preserve compatible storage layout."
+    },
+    {
+      "vulnerability_class": "denial_of_service",
+      "invariant_type": "unbounded_loop_dos",
+      "description": "Public lifecycle or payout flows should not depend on unbounded dynamic array iteration."
+    }
+  ],
+  "required_metrics": {
+    "hypothesis_recall": 0.8,
+    "production_evidence_coverage": 1.0,
+    "unsupported_claim_rate": 0.1
+  }
+}

@@ -37,7 +37,14 @@ def write_eval_summary(scores: list) -> Path:
     write_json(out_dir / "eval_summary.json", [score.model_dump(mode="json") for score in scores])
     lines = ["# Eval Summary", ""]
     for score in scores:
-        lines.append(f"- {score.fixture}: {score.score:.0f}/100, tools={score.tool_call_count}, subgraph={score.spawned_research_subgraph}")
+        lines.append(
+            f"- {score.fixture}: {score.score:.0f}/100, tools={score.tool_call_count}, "
+            f"subgraph={score.spawned_research_subgraph}, "
+            f"hypothesis_recall={score.hypothesis_recall:.2f}, "
+            f"finding_recall={score.finding_recall:.2f}, "
+            f"production_evidence={score.production_evidence_coverage:.2f}, "
+            f"invariant_candidates={score.invariant_candidate_count}"
+        )
         for note in score.notes:
             lines.append(f"  - {note}")
     write_text(out_dir / "eval_summary.md", "\n".join(lines) + "\n")

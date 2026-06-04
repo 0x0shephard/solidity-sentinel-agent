@@ -7,10 +7,11 @@ import uuid
 from langgraph.graph import END, START, StateGraph
 
 from sentinel.artifacts import ensure_run_dir, write_json, write_text
+from sentinel.analysis.invariants import build_protocol_model as build_protocol_model_from_facts, mine_invariant_candidates
 from sentinel.config import get_settings
 from sentinel.graphs.research import DEFAULT_RESEARCH_TOOLS, run_research_subgraph
 from sentinel.graphs.rag_subgraph import initial_rag_state, run_rag_subgraph
-from sentinel.llm.provider import get_planner
+from sentinel.llm.provider import get_ollama_fallback_planner, get_planner
 from sentinel.observability.logging import log_event
 from sentinel.observability.tracing import trace_span
 from sentinel.rag.sync import sync_solodit
@@ -157,8 +158,32 @@ def _model_or_mapping_json(value) -> dict:
 
 def plan_with_llm(state: AuditState) -> AuditState:
     registry = build_default_registry()
-    planner = get_planner(mock=False)
-    plan = planner.plan(_tool_prompt(state), [tool.public_dict() for tool in registry.list()])
+    tool_catalog = [tool.public_dict() for tool in registry.list()]
+    planner_source = "primary"
+    try:
+        planner = get_planner(mock=False)
+        plan = planner.plan(_tool_prompt(state), tool_catalog)
+    except Exception as exc:
+        primary_error = f"{type(exc).__name__}: {exc}"
+        state.setdefault("warnings", []).append(f"Primary LLM planner unavailable; trying Ollama fallback: {primary_error}")
+        try:
+            planner = get_ollama_fallback_planner()
+            planner_source = "ollama_fallback"
+            plan = planner.plan(_tool_prompt(state), tool_catalog)
+            state.setdefault("warnings", []).append("Ollama fallback planner succeeded after primary LLM failure.")
+        except Exception as fallback_exc:
+            state.setdefault("warnings", []).append(
+                f"Ollama fallback planner unavailable; continuing with deterministic graph path: {type(fallback_exc).__name__}: {fallback_exc}"
+            )
+            state["last_outputs"]["llm.plan_with_llm"] = {
+                "executed": [],
+                "fallback": "deterministic_graph",
+                "primary_error": primary_error[:500],
+                "fallback_error_type": type(fallback_exc).__name__,
+                "fallback_message": str(fallback_exc)[:500],
+            }
+            state["current_focus"] = "inspect_repo"
+            return state
     valid_names = {tool.full_name for tool in registry.list()}
     executed = []
     executor = ToolExecutor(registry)
@@ -177,7 +202,7 @@ def plan_with_llm(state: AuditState) -> AuditState:
         output = executor.execute(decision.tool_name, tool_input, state)
         _record_step(state, decision.tool_name, f"{decision.tool_name} selected by LLM: {decision.rationale}")
         executed.append({"tool_name": decision.tool_name, "status": getattr(output, "status", "ok")})
-    state["last_outputs"]["llm.plan_with_llm"] = {"executed": executed}
+    state["last_outputs"]["llm.plan_with_llm"] = {"executed": executed, "planner_source": planner_source}
     state["current_focus"] = "inspect_repo"
     return state
 
@@ -190,6 +215,8 @@ def initialize_run(state: AuditState) -> AuditState:
         PlanStep(id="inspect_repo", description="Inspect repository files and Solidity contracts"),
         PlanStep(id="detect_framework", description="Detect Solidity framework and compiler pragmas"),
         PlanStep(id="run_static_analysis", description="Extract static facts and run safe analyzers"),
+        PlanStep(id="build_protocol_model", description="Summarize protocol roles, assets, lifecycle, accounting, and upgrade surfaces"),
+        PlanStep(id="mine_invariant_candidates", description="Mine protocol invariant candidates from production source evidence"),
         PlanStep(id="build_targeted_rag_context", description="Build repo profile and targeted Solodit context"),
         PlanStep(id="rank_hypotheses", description="Create early vulnerability hypotheses"),
         PlanStep(id="finish", description="Persist state artifacts"),
@@ -226,9 +253,14 @@ def detect_framework(state: AuditState) -> AuditState:
     _run_tool(state, "build.detect_solc", {"repo_path": repo_path})
     _run_tool(state, "build.check_foundry_available", {"repo_path": repo_path})
     _run_tool(state, "build.check_slither_available", {"repo_path": repo_path})
+    framework = state["last_outputs"].get("build.detect_framework", {}).get("framework")
+    foundry_status = state["last_outputs"].get("build.check_foundry_available", {}).get("status")
+    if framework in {"foundry", "mixed"} and str(foundry_status).lower().endswith("ok"):
+        _run_tool(state, "build.foundry_build", {"repo_path": repo_path})
     state["build_facts"] = {
         "framework": state["last_outputs"].get("build.detect_framework", {}),
         "solc": state["last_outputs"].get("build.detect_solc", {}),
+        "foundry_build": state["last_outputs"].get("build.foundry_build", {}),
     }
     state["current_focus"] = "run_static_analysis"
     return state
@@ -281,6 +313,27 @@ def run_static_analysis(state: AuditState) -> AuditState:
     return state
 
 
+def build_protocol_model(state: AuditState) -> AuditState:
+    model = build_protocol_model_from_facts(state.get("static_facts", {}))
+    state["protocol_model"] = model
+    state["last_outputs"]["analysis.build_protocol_model"] = {"status": "ok", "protocol_model": model.model_dump(mode="json")}
+    _record_step(state, "analysis.build_protocol_model", f"Protocol model terms: roles={len(model.roles)}, accounting={len(model.accounting_terms)}")
+    state["current_focus"] = "mine_invariant_candidates"
+    return state
+
+
+def mine_invariants(state: AuditState) -> AuditState:
+    candidates = mine_invariant_candidates(state["repo_path"], state.get("static_facts", {}))
+    state["invariant_candidates"] = candidates
+    state["last_outputs"]["analysis.mine_invariant_candidates"] = {
+        "status": "ok",
+        "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
+    }
+    _record_step(state, "analysis.mine_invariant_candidates", f"Mined {len(candidates)} protocol invariant candidates")
+    state["current_focus"] = "build_targeted_rag_context"
+    return state
+
+
 def build_targeted_rag_context(state: AuditState) -> AuditState:
     repo_path = state["repo_path"]
     profile = _run_tool(
@@ -313,6 +366,10 @@ def rank_hypotheses(state: AuditState) -> AuditState:
                 *state.get("static_facts", {}).get("slither_findings", []),
                 *state.get("static_facts", {}).get("access_control", []),
                 *state.get("static_facts", {}).get("detections", []),
+                *[
+                    {"invariant_candidate": candidate.model_dump(mode="json")}
+                    for candidate in state.get("invariant_candidates", [])
+                ],
                 _model_or_mapping_json(state.get("repo_rag_profile")),
             ],
         },
@@ -395,7 +452,16 @@ def finish(state: AuditState) -> AuditState:
     repo_path = state["repo_path"]
     _run_tool(state, "repo.list_files", {"repo_path": repo_path, "max_files": 50})
     _run_tool(state, "static.extract_functions", {"repo_path": repo_path})
-    _run_tool(state, "dynamic.generate_validation_artifacts", {"repo_path": repo_path})
+    hypotheses = state.get("hypotheses", [])
+    if hypotheses:
+        for hypothesis in hypotheses[:5]:
+            _run_tool(
+                state,
+                "dynamic.generate_validation_artifacts",
+                {"repo_path": repo_path, "hypothesis": hypothesis.model_dump(mode="json")},
+            )
+    else:
+        _run_tool(state, "dynamic.generate_validation_artifacts", {"repo_path": repo_path})
     _run_tool(state, "dynamic.compile_validation_artifacts", {"repo_path": repo_path})
     _run_tool(state, "dynamic.run_validation_artifacts", {"repo_path": repo_path})
     state["findings"] = create_findings_from_state(state)
@@ -429,6 +495,8 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_node("inspect_repo", inspect_repo)
     graph.add_node("detect_framework", detect_framework)
     graph.add_node("run_static_analysis", run_static_analysis)
+    graph.add_node("build_protocol_model", build_protocol_model)
+    graph.add_node("mine_invariant_candidates", mine_invariants)
     graph.add_node("build_targeted_rag_context", build_targeted_rag_context)
     graph.add_node("rank_hypotheses", rank_hypotheses)
     graph.add_node("rag_retrieve_context", rag_retrieve_context)
@@ -442,7 +510,9 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_edge("plan_with_llm", "inspect_repo")
     graph.add_edge("inspect_repo", "detect_framework")
     graph.add_edge("detect_framework", "run_static_analysis")
-    graph.add_edge("run_static_analysis", "build_targeted_rag_context")
+    graph.add_edge("run_static_analysis", "build_protocol_model")
+    graph.add_edge("build_protocol_model", "mine_invariant_candidates")
+    graph.add_edge("mine_invariant_candidates", "build_targeted_rag_context")
     graph.add_edge("build_targeted_rag_context", "rank_hypotheses")
     graph.add_edge("rank_hypotheses", "rag_retrieve_context")
     graph.add_edge("rag_retrieve_context", "research_subgraph")

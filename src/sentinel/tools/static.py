@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from sentinel.evidence import classify_source_path
 from sentinel.reliability.subprocess import run_command
 from sentinel.rag.checklist import checklist_by_id, write_generated_checklists
 from sentinel.schemas.common import SideEffect, ToolStatus
@@ -60,6 +61,9 @@ def _normalize_slither_path(filename: str | None) -> str | None:
         return None
     path = Path(filename)
     parts = path.parts
+    for marker in ["src", "contracts", "test", "tests", "script", "scripts", "lib", "libs", "node_modules"]:
+        if marker in parts:
+            return str(Path(*parts[parts.index(marker) :]))
     if "src" in parts:
         return str(Path(*parts[parts.index("src") :]))
     if "contracts" in parts:
@@ -90,7 +94,16 @@ def _extract_slither_locations(elements: list[dict]) -> tuple[list[str], list[st
 
 
 def _solidity_files(repo_path: str) -> list[Path]:
-    return [path for path in Path(repo_path).rglob("*.sol") if path.is_file() and "out" not in path.parts and "cache" not in path.parts]
+    files = []
+    for path in Path(repo_path).rglob("*.sol"):
+        if not path.is_file() or "out" in path.parts or "cache" in path.parts:
+            continue
+        relative_path = str(path.relative_to(Path(repo_path))).replace("\\", "/")
+        source_type = classify_source_path(relative_path)
+        if source_type in {"test", "script", "library", "dependency", "docs"}:
+            continue
+        files.append(path)
+    return files
 
 
 def _source_line(repo_path: str, relative_path: str, line_no: int) -> str:

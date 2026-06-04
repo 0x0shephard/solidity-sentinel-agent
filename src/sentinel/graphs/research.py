@@ -196,8 +196,14 @@ def refine_with_llm(state: ResearchState) -> ResearchState:
     try:
         refinement = llm_provider.get_research_refiner(mock=False).refine(_refinement_prompt(state))
     except Exception as exc:
-        state.setdefault("notes", []).append(f"LLM research refinement unavailable: {type(exc).__name__}: {exc}")
-        return state
+        primary_error = f"{type(exc).__name__}: {exc}"
+        state.setdefault("notes", []).append(f"Primary LLM research refinement unavailable; trying Ollama fallback: {primary_error}")
+        try:
+            refinement = llm_provider.get_ollama_fallback_refiner().refine(_refinement_prompt(state))
+            state.setdefault("notes", []).append("Ollama fallback research refinement applied.")
+        except Exception as fallback_exc:
+            state.setdefault("notes", []).append(f"LLM research refinement unavailable: {type(fallback_exc).__name__}: {fallback_exc}")
+            return state
     state["llm_refinement"] = refinement
     state.setdefault("notes", []).append("LLM research refinement applied.")
     return state

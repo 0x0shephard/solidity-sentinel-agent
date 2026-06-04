@@ -4,8 +4,8 @@ from sentinel.config import Settings
 from sentinel.errors import ConfigurationError, NonRetryableExternalError
 from sentinel.llm.base import ToolDecision, ToolPlan
 from sentinel.llm.huggingface import HuggingFacePlanner
-from sentinel.llm.ollama import extract_json_object
-from sentinel.llm.provider import get_planner, get_research_refiner
+from sentinel.llm.ollama import OllamaPlanner, extract_json_object
+from sentinel.llm.provider import get_ollama_fallback_planner, get_planner, get_research_refiner
 
 
 def test_extract_json_object_handles_fenced_json():
@@ -49,6 +49,45 @@ def test_huggingface_planner_allows_default_router_base_url():
     )
 
     assert planner.llm.model_id == "Qwen/Qwen2.5-Coder-32B-Instruct"
+
+
+def test_ollama_planner_passes_api_key_as_bearer_header(monkeypatch):
+    captured = {}
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("sentinel.llm.ollama.ChatOllama", FakeChatOllama)
+
+    planner = OllamaPlanner(model="qwen2.5-coder:7b", base_url="https://ollama.example.test", api_key="ollama-key")
+
+    assert planner.llm is not None
+    assert captured["model"] == "qwen2.5-coder:7b"
+    assert captured["base_url"] == "https://ollama.example.test"
+    assert captured["client_kwargs"]["headers"]["Authorization"] == "Bearer ollama-key"
+
+
+def test_ollama_fallback_provider_uses_configured_api_key(monkeypatch):
+    captured = {}
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("sentinel.llm.ollama.ChatOllama", FakeChatOllama)
+    settings = Settings(
+        llm_provider="huggingface",
+        ollama_base_url="https://ollama.example.test",
+        ollama_api_key="ollama-key",
+        ollama_fallback_model="qwen2.5-coder:32b",
+    )
+
+    planner = get_ollama_fallback_planner(settings)
+
+    assert planner.llm is not None
+    assert captured["model"] == "qwen2.5-coder:32b"
+    assert captured["client_kwargs"]["headers"]["Authorization"] == "Bearer ollama-key"
 
 
 def test_tool_plan_schema():

@@ -10,6 +10,8 @@ def test_settings_read_huggingface_defaults(monkeypatch):
     assert settings.llm_provider == "huggingface"
     assert settings.model == "Qwen/Qwen2.5-Coder-32B-Instruct"
     assert settings.ollama_base_url == "http://localhost:11434"
+    assert settings.ollama_api_key is None
+    assert settings.ollama_fallback_model == "qwen2.5-coder:7b"
     assert settings.rag_embed_model == "sentence-transformers/all-MiniLM-L6-v2"
 
 
@@ -33,3 +35,15 @@ def test_langsmith_tracing_requires_env_flag_and_key(monkeypatch):
 
     assert settings.langsmith_tracing is True
     assert settings.langsmith_api_key == "test-key"
+
+
+def test_settings_support_ollama_api_key(monkeypatch):
+    monkeypatch.setenv("OLLAMA_BASE_URL", "https://ollama.example.test")
+    monkeypatch.setenv("OLLAMA_API_KEY", "ollama-test-key")
+    monkeypatch.setenv("SENTINEL_OLLAMA_FALLBACK_MODEL", "qwen2.5-coder:32b")
+
+    settings = get_settings()
+
+    assert settings.ollama_base_url == "https://ollama.example.test"
+    assert settings.ollama_api_key == "ollama-test-key"
+    assert settings.ollama_fallback_model == "qwen2.5-coder:32b"

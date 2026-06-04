@@ -234,6 +234,47 @@ def _validation_test_content(hypothesis: VulnerabilityHypothesis) -> str:
     return _generic_validation_test(hypothesis)
 
 
+def _validation_plan_content(hypothesis: VulnerabilityHypothesis) -> str:
+    target_file, target_contract, target_function = _target_details(hypothesis)
+    root_terms = ", ".join(hypothesis.root_cause_terms) or hypothesis.vulnerability_class
+    evidence_lines = [
+        f"- {item.file_path}:{item.line_start}::{item.function_name or 'unknown'} {item.reason}: {item.source_text}"
+        for item in hypothesis.evidence_lines[:6]
+    ] or ["- No local source evidence was attached to this hypothesis."]
+    recommended = hypothesis.recommended_validation or [f"Create a targeted regression test for {target_function}."]
+    template_notes = {
+        "accounting_invariant": "Assert accounting conservation before and after the action: total balances, rewards, fees, or payout sums should reconcile.",
+        "business_logic": "Assert the intended business rule against an attacker-controlled or boundary-value scenario.",
+        "upgradeability": "Assert upgrade authorization, implementation transitions, and initializer/reinitializer constraints.",
+        "storage_layout": "Compare storage layouts across versions and assert state variables retain slot/order compatibility.",
+        "denial_of_service": "Exercise the largest realistic dynamic collection and assert gas/runtime remains bounded.",
+        "external_call_before_accounting": "Use a callback receiver and assert state is updated before observable external interaction.",
+    }
+    lines = [
+        f"# Validation Plan: {hypothesis.title}",
+        "",
+        f"- Hypothesis ID: {hypothesis.id}",
+        f"- Class: {hypothesis.vulnerability_class}",
+        f"- Target: {target_file}::{target_contract}.{target_function}",
+        f"- Root terms: {root_terms}",
+        "",
+        "## Local Evidence",
+        *evidence_lines,
+        "",
+        "## Validation Objective",
+        template_notes.get(hypothesis.vulnerability_class, "Build a project-specific proof-of-concept or regression test from the cited local evidence."),
+        "",
+        "## Suggested Checks",
+        *[f"- {step}" for step in recommended],
+        "",
+        "## Expected Outcome",
+        "- Confirmed only if a production-source path violates the stated invariant or authorization/accounting rule.",
+        "- Otherwise keep the hypothesis in manual review or reject it with the observed counterevidence.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def _validation_artifact_paths(inp: ValidationCompileInput, state) -> list[Path]:
     raw_paths = inp.artifact_paths or [
         artifact.path
@@ -395,6 +436,9 @@ def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
     test_path = artifact_dir / test_name
     content = _validation_test_content(hypothesis)
     test_path.write_text(content, encoding="utf-8")
+    plan_path = artifact_dir / f"{test_path.stem}.plan.md"
+    plan_content = _validation_plan_content(hypothesis)
+    plan_path.write_text(plan_content, encoding="utf-8")
 
     ref = ArtifactRef(
         kind="foundry_validation_test",
@@ -402,12 +446,21 @@ def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
         description=f"Generated Foundry validation test for {hypothesis.vulnerability_class}; copy into the audited repo's test/ directory before running.",
     )
     state.setdefault("artifacts", []).append(ref)
+    state.setdefault("artifacts", []).append(
+        ArtifactRef(
+            kind="validation_plan",
+            path=str(plan_path),
+            description=f"Hypothesis-specific validation plan for {hypothesis.vulnerability_class}.",
+        )
+    )
     data = {
         "path": str(test_path),
+        "plan_path": str(plan_path),
         "test_name": test_name,
         "hypothesis_id": hypothesis.id,
         "vulnerability_class": hypothesis.vulnerability_class,
         "content": content,
+        "plan": plan_content,
     }
     return DynamicGenericOutput(status=ToolStatus.OK, data=data)
 

@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 from sentinel.artifacts import append_jsonl
 from sentinel.config import get_settings
+from sentinel.evidence import classify_source_path
 from sentinel.rag.canonical import build_canonical_query_text
 from sentinel.rag.checklist import build_solodit_checklists_from_cache, write_generated_checklists
 from sentinel.rag.ranking import rank_matches
@@ -11,6 +12,7 @@ from sentinel.rag.store import HistoricalFindingStore
 from sentinel.rag.sync import sync_solodit
 from sentinel.rag.targeted import build_repo_rag_profile, build_targeted_rag, repo_profile_root
 from sentinel.schemas.common import SideEffect, ToolStatus
+from sentinel.schemas.invariants import InvariantCandidate
 from sentinel.schemas.rag import (
     HistoricalFindingMatch,
     HistoricalFindingQuery,
@@ -162,6 +164,14 @@ def _facts_with_key(facts: list[dict], key: str) -> list[dict]:
 
 def _facts_containing(facts: list[dict], terms: tuple[str, ...]) -> list[dict]:
     return [fact for fact in facts if any(term in fact.get("text", "") for term in terms)]
+
+
+def _is_target_source_path(path: str | None) -> bool:
+    return classify_source_path(path) in {"production", "unknown"}
+
+
+def _has_target_source(paths: list[str]) -> bool:
+    return any(_is_target_source_path(path) for path in paths)
 
 
 def _sensitive_function_for_file(functions: list[dict], file_path: str) -> dict | None:
@@ -353,6 +363,62 @@ def _profile_invariant_hypotheses(static_facts: list[dict]) -> list[Vulnerabilit
     return candidates[:5]
 
 
+def _class_from_invariant_type(invariant_type: str) -> str:
+    mapping = {
+        "configured_but_not_enforced": "business_logic",
+        "checked_but_never_updated": "business_logic",
+        "percentage_distribution_math": "accounting_invariant",
+        "upgrade_authorization_without_upgrade": "upgradeability",
+        "storage_layout_mismatch": "storage_layout",
+        "unbounded_loop_dos": "denial_of_service",
+        "external_state_accounting_trust": "accounting_invariant",
+    }
+    return mapping.get(invariant_type, "business_logic")
+
+
+def _hypotheses_from_invariant_candidates(static_facts: list[dict]) -> list[VulnerabilityHypothesis]:
+    hypotheses: list[VulnerabilityHypothesis] = []
+    raw_candidates = [
+        fact.get("invariant_candidate")
+        for fact in static_facts
+        if isinstance(fact, dict) and fact.get("invariant_candidate")
+    ]
+    for index, raw in enumerate(raw_candidates, start=1):
+        candidate = InvariantCandidate.model_validate(raw)
+        evidence = candidate.production_evidence
+        if not evidence:
+            continue
+        affected_files = list(dict.fromkeys(item.file_path for item in evidence))
+        affected_functions = list(dict.fromkeys([*candidate.affected_functions, *(item.function_name for item in evidence if item.function_name)]))
+        vulnerability_class = _class_from_invariant_type(candidate.invariant_type)
+        hypotheses.append(
+            VulnerabilityHypothesis(
+                id=f"hyp-invariant-{index}",
+                title=f"Protocol invariant candidate: {candidate.invariant_type.replace('_', ' ')}",
+                vulnerability_class=vulnerability_class,
+                affected_files=affected_files,
+                affected_functions=affected_functions,
+                evidence_summary=candidate.description,
+                confidence=candidate.confidence,
+                affected_contract=candidate.affected_contracts[0] if candidate.affected_contracts else evidence[0].contract_name,
+                affected_function=affected_functions[0] if affected_functions else evidence[0].function_name,
+                evidence_lines=evidence,
+                root_cause_terms=list(dict.fromkeys([candidate.invariant_type, *candidate.missing_guard_terms, *candidate.suspicious_terms])),
+                recommended_validation=[
+                    f"Use validation template `{candidate.recommended_validation_template}` to prove or refute this invariant candidate.",
+                    candidate.description,
+                ],
+                source_detection_ids=[candidate.id],
+                exploit_precondition_terms=candidate.suspicious_terms,
+                suggested_rag_queries=[
+                    f"{vulnerability_class} {candidate.invariant_type} {' '.join(candidate.suspicious_terms)}"
+                ],
+                status="needs_manual_review",
+            )
+        )
+    return hypotheses
+
+
 def _detect_slither_finding(functions: list[dict], slither_findings: list[dict]) -> VulnerabilityHypothesis | None:
     for finding in slither_findings:
         check = str(finding.get("check", "unknown"))
@@ -462,21 +528,29 @@ def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
     static_detections = [
         StaticDetection.model_validate(fact)
         for fact in inp.static_facts
-        if isinstance(fact, dict) and fact.get("detector_id") and fact.get("evidence")
+        if isinstance(fact, dict)
+        and fact.get("detector_id")
+        and fact.get("evidence")
+        and any(_is_target_source_path(item.get("file_path")) for item in fact.get("evidence", []))
     ]
     hypotheses: list[VulnerabilityHypothesis] = [
         _hypothesis_from_detection(index, detection)
         for index, detection in enumerate(static_detections, start=1)
     ]
 
-    functions = _facts_with_key(inp.static_facts, "function")
-    external_calls = _facts_containing(inp.static_facts, (".transfer(", ".call(", ".call{", ".send(", ".delegatecall(", ".delegatecall{"))
-    token_transfers = _facts_containing(inp.static_facts, (".transfer(", ".transferFrom("))
-    storage_writes = [fact for fact in inp.static_facts if "line" in fact and ("=" in fact.get("text", "") or "+=" in fact.get("text", "") or "-=" in fact.get("text", ""))]
-    slither_findings = _facts_with_key(inp.static_facts, "check")
+    target_facts = [fact for fact in inp.static_facts if not fact.get("file_path") or _is_target_source_path(fact.get("file_path"))]
+    functions = _facts_with_key(target_facts, "function")
+    external_calls = _facts_containing(target_facts, (".transfer(", ".call(", ".call{", ".send(", ".delegatecall(", ".delegatecall{"))
+    token_transfers = _facts_containing(target_facts, (".transfer(", ".transferFrom("))
+    storage_writes = [fact for fact in target_facts if "line" in fact and ("=" in fact.get("text", "") or "+=" in fact.get("text", "") or "-=" in fact.get("text", ""))]
+    slither_findings = [
+        fact
+        for fact in _facts_with_key(inp.static_facts, "check")
+        if _has_target_source([str(path) for path in fact.get("source_files", [])])
+    ]
     access_facts = [
         fact
-        for fact in inp.static_facts
+        for fact in target_facts
         if any(term in fact.get("text", "") for term in ["owner", "onlyOwner", "hasRole", "AccessControl", "msg.sender"])
     ]
 
@@ -490,6 +564,7 @@ def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
         if hypothesis:
             hypotheses.append(hypothesis)
 
+    hypotheses.extend(_hypotheses_from_invariant_candidates(inp.static_facts))
     hypotheses.extend(_profile_invariant_hypotheses(inp.static_facts))
 
     hypotheses = _dedupe_hypotheses(hypotheses)

@@ -21,6 +21,8 @@ class Settings(BaseModel):
     llm_provider: LLMProviderName = "huggingface"
     model: str = "Qwen/Qwen2.5-Coder-32B-Instruct"
     ollama_base_url: str = "http://localhost:11434"
+    ollama_api_key: str | None = None
+    ollama_fallback_model: str = "qwen2.5-coder:7b"
     hf_token: str | None = None
     hf_base_url: str = "https://router.huggingface.co/v1"
     max_tool_calls: int = Field(default=80, ge=1)
@@ -51,6 +53,8 @@ def get_settings() -> Settings:
         llm_provider=os.getenv("SENTINEL_LLM_PROVIDER", "huggingface"),  # type: ignore[arg-type]
         model=os.getenv("SENTINEL_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct"),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        ollama_api_key=os.getenv("OLLAMA_API_KEY") or None,
+        ollama_fallback_model=os.getenv("SENTINEL_OLLAMA_FALLBACK_MODEL", "qwen2.5-coder:7b"),
         hf_token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN"),
         hf_base_url=os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1"),
         max_tool_calls=int(os.getenv("SENTINEL_MAX_TOOL_CALLS", "80")),

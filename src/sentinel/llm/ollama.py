@@ -23,9 +23,21 @@ def extract_json_object(text: str) -> str:
     return cleaned[start : end + 1]
 
 
+def _ollama_client_kwargs(api_key: str | None) -> dict:
+    if not api_key:
+        return {}
+    return {"headers": {"Authorization": f"Bearer {api_key}"}}
+
+
 class OllamaPlanner(BasePlanner):
-    def __init__(self, model: str, base_url: str, llm: ChatOllama | None = None) -> None:
-        self.llm = llm or ChatOllama(model=model, base_url=base_url, temperature=0.0, format="json")
+    def __init__(self, model: str, base_url: str, api_key: str | None = None, llm: ChatOllama | None = None) -> None:
+        self.llm = llm or ChatOllama(
+            model=model,
+            base_url=base_url,
+            temperature=0.0,
+            format="json",
+            client_kwargs=_ollama_client_kwargs(api_key),
+        )
 
     def plan(self, prompt: str, tools: list[dict]) -> ToolPlan:
         tool_catalog = json.dumps(tools, indent=2, default=str)[:120_000]
@@ -47,8 +59,14 @@ class OllamaPlanner(BasePlanner):
 
 
 class OllamaResearchRefiner(BaseResearchRefiner):
-    def __init__(self, model: str, base_url: str, llm: ChatOllama | None = None) -> None:
-        self.llm = llm or ChatOllama(model=model, base_url=base_url, temperature=0.0, format="json")
+    def __init__(self, model: str, base_url: str, api_key: str | None = None, llm: ChatOllama | None = None) -> None:
+        self.llm = llm or ChatOllama(
+            model=model,
+            base_url=base_url,
+            temperature=0.0,
+            format="json",
+            client_kwargs=_ollama_client_kwargs(api_key),
+        )
 
     def refine(self, prompt: str) -> ResearchRefinement:
         response = self.llm.invoke(

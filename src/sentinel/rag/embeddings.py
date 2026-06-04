@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Protocol
 
 from sentinel.schemas.rag import EmbeddingModelInfo
@@ -31,9 +32,7 @@ class SentenceTransformerEmbeddingClient:
 
     def _load(self):
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
-
-            self._model = SentenceTransformer(self.model_name, local_files_only=self.local_files_only)
+            self._model = _load_sentence_transformer(self.model_name, self.local_files_only)
         return self._model
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -46,7 +45,10 @@ class SentenceTransformerEmbeddingClient:
 
     def get_model_info(self) -> EmbeddingModelInfo:
         model = self._load()
-        dimension = int(model.get_sentence_embedding_dimension())
+        if hasattr(model, "get_embedding_dimension"):
+            dimension = int(model.get_embedding_dimension())
+        else:
+            dimension = int(model.get_sentence_embedding_dimension())
         max_seq_length = getattr(model, "max_seq_length", None)
         return EmbeddingModelInfo(
             model_name=self.model_name,
@@ -66,6 +68,13 @@ class LangChainEmbeddingAdapter:
 
     def embed_query(self, text: str) -> list[float]:
         return self.client.embed_query(text)
+
+
+@lru_cache(maxsize=4)
+def _load_sentence_transformer(model_name: str, local_files_only: bool):
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(model_name, local_files_only=local_files_only)
 
 
 def safe_collection_name(prefix: str, model_name: str) -> str:

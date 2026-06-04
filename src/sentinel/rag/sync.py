@@ -37,7 +37,11 @@ def sync_solodit(stale_ok: bool = True, settings: Settings | None = None) -> Sol
     paths["root"].mkdir(parents=True, exist_ok=True)
     if stale_ok and _fresh(cfg) and rag_index_available(cfg):
         data = json.loads(paths["sync_state"].read_text(encoding="utf-8"))
-        return SoloditSyncState.model_validate({**data, "status": ToolStatus.OK, "stale_ok": True})
+        stale_message = str(data.get("message") or "")
+        if cfg.solodit_api_key and "SOLODIT_API_KEY is not configured" not in stale_message:
+            return SoloditSyncState.model_validate({**data, "status": ToolStatus.OK, "stale_ok": True})
+        if not cfg.solodit_api_key:
+            return SoloditSyncState.model_validate({**data, "status": ToolStatus.OK, "stale_ok": True})
     if not cfg.solodit_api_key:
         if rag_index_available(cfg) and not paths["index_metadata"].exists():
             HistoricalFindingStore(cfg).build(load_findings(cfg))

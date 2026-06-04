@@ -74,6 +74,16 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         if confirmed_findings
         else (1.0 if allow_no_findings else 0.0)
     )
+    production_evidence_coverage = (
+        sum(
+            1
+            for finding in confirmed_findings
+            if any(getattr(item, "source_type", "unknown") == "production" for item in finding.evidence)
+        )
+        / len(confirmed_findings)
+        if confirmed_findings
+        else (1.0 if allow_no_findings else 0.0)
+    )
     rag_context_coverage = (
         sum(1 for finding in confirmed_findings if getattr(finding, "historical_matches", [])) / len(confirmed_findings)
         if confirmed_findings
@@ -90,6 +100,8 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         notes.append(f"Expected recall not met: matched {len(matched_items)}/{len(expected_items)}; missing {missing}")
     if confirmed_findings and not evidence_present:
         notes.append("At least one generated finding is missing local evidence.")
+    if confirmed_findings and production_evidence_coverage < 1.0:
+        notes.append("At least one confirmed/likely finding lacks production-source evidence.")
     if expected.get("allow_no_findings", False) and false_positive_count:
         notes.append(f"False positives in negative fixture: {false_positive_count}")
 
@@ -108,9 +120,11 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         hypothesis_recall=hypothesis_recall,
         finding_recall=finding_recall,
         evidence_coverage=evidence_coverage,
+        production_evidence_coverage=production_evidence_coverage,
         rag_context_coverage=rag_context_coverage,
         unsupported_claim_rate=unsupported_claim_rate,
         false_positive_count=false_positive_count,
+        invariant_candidate_count=len(state.get("invariant_candidates", [])),
         score=float(score),
         notes=notes,
     )

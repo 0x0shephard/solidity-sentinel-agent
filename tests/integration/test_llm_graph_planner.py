@@ -44,3 +44,42 @@ def test_real_mode_graph_uses_planner_and_keeps_guardrails(monkeypatch, tmp_path
     assert "LLM omitted required input for repo.read_file" in state["errors"]
     assert any(record.tool_name == "repo.list_files" for record in state["tool_ledger"])
     assert Path("runs/llm-run/state.json").exists()
+
+
+def test_real_mode_graph_falls_back_when_planner_provider_fails(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    _write_fixture_repo(repo)
+    monkeypatch.chdir(tmp_path)
+
+    class FailingPlanner:
+        def plan(self, prompt, tools):
+            raise RuntimeError("hosted model quota exceeded")
+
+    monkeypatch.setattr("sentinel.graphs.parent.get_planner", lambda mock=False: FailingPlanner())
+
+    state = run_audit(str(repo), "Find bugs", run_id="llm-fallback-run", mock_llm=False)
+
+    assert state["current_focus"] == "done"
+    assert state["last_outputs"]["llm.plan_with_llm"]["fallback"] == "deterministic_graph"
+    assert any("Primary LLM planner unavailable" in warning for warning in state["warnings"])
+    assert Path("runs/llm-fallback-run/report.md").exists()
+
+
+def test_real_mode_graph_uses_ollama_fallback_when_primary_planner_fails(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    _write_fixture_repo(repo)
+    monkeypatch.chdir(tmp_path)
+
+    class FailingPlanner:
+        def plan(self, prompt, tools):
+            raise RuntimeError("hf credits exhausted")
+
+    monkeypatch.setattr("sentinel.graphs.parent.get_planner", lambda mock=False: FailingPlanner())
+    monkeypatch.setattr("sentinel.graphs.parent.get_ollama_fallback_planner", lambda: FakePlanner())
+    monkeypatch.setattr("sentinel.graphs.research.llm_provider.get_research_refiner", lambda mock=False: FakeRefiner())
+
+    state = run_audit(str(repo), "Find bugs", run_id="llm-ollama-fallback-run", mock_llm=False)
+
+    assert state["current_focus"] == "done"
+    assert state["last_outputs"]["llm.plan_with_llm"]["planner_source"] == "ollama_fallback"
+    assert any("Ollama fallback planner succeeded" in warning for warning in state["warnings"])
