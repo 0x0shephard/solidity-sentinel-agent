@@ -14,7 +14,8 @@ from sentinel.rag.ranking import rank_matches
 from sentinel.rag.solodit import SoloditClient
 from sentinel.rag.store import HistoricalFindingStore, load_findings, rag_paths, write_findings
 from sentinel.schemas.common import ToolStatus
-from sentinel.schemas.rag import HistoricalFinding, HistoricalFindingQuery, RepoRAGProfile, RepoRAGSearchIntent, TargetedRAGState
+from sentinel.schemas.protocol_ir import ProtocolIR
+from sentinel.schemas.rag import HistoricalFinding, HistoricalFindingQuery, RAGChecklistItem, RepoRAGProfile, RepoRAGSearchIntent, TargetedRAGState
 
 
 DOMAIN_HINTS = {
@@ -82,18 +83,26 @@ def _intent(intent_id: str, query: str, purpose: str, vulnerability_class: str |
 
 
 def build_repo_rag_profile(repo_path: str, static_facts: dict[str, Any]) -> RepoRAGProfile:
+    protocol_ir = _protocol_ir_from_facts(static_facts)
     contract_names = sorted({
-        str(fact.get("contract"))
+        str(contract)
         for fact in static_facts.get("contracts", [])
-        if fact.get("contract")
+        for contract in _contract_names_from_fact(fact)
+        if contract
     })
+    if protocol_ir:
+        contract_names = sorted(set([*contract_names, *protocol_ir.contract_names()]))
     function_names = sorted({
         str(fact.get("function"))
         for fact in static_facts.get("functions", [])
         if fact.get("function")
     })
+    if protocol_ir:
+        function_names = sorted(set([*function_names, *protocol_ir.function_names()]))
     all_names = [*contract_names, *function_names]
     source_terms = _source_terms(static_facts)
+    if protocol_ir:
+        source_terms.extend(_source_terms_from_ir(protocol_ir))
     role_terms = sorted(set(_terms_from_names([*all_names, *source_terms], ROLE_TERMS)))
     asset_terms = sorted(set(_terms_from_names([*all_names, *source_terms], ASSET_TERMS)))
     upgrade_terms = sorted(set(_terms_from_names([*all_names, *source_terms], UPGRADE_TERMS)))
@@ -160,6 +169,120 @@ def build_repo_rag_profile(repo_path: str, static_facts: dict[str, Any]) -> Repo
         invariant_candidates=invariant_candidates[:12],
         search_intents=unique_intents[:8],
     )
+
+
+def build_rag_checklist(profile: RepoRAGProfile, findings: list[HistoricalFinding]) -> list[RAGChecklistItem]:
+    items: dict[str, RAGChecklistItem] = {}
+    for finding in findings[:80]:
+        cls = finding.vulnerability_class if finding.vulnerability_class != "manual_review" else _class_from_finding_terms(finding)
+        terms = [*finding.root_cause_terms, *finding.tags, *finding.protocol_categories]
+        key = f"{cls}:{','.join(sorted(term.lower() for term in terms[:4]))}"[:120]
+        required = _required_local_evidence(cls, profile)
+        if not required:
+            continue
+        current = items.get(key)
+        if not current:
+            current = RAGChecklistItem(
+                checklist_id=f"rag-{len(items) + 1}",
+                historical_pattern=finding.title,
+                vulnerability_class=cls,
+                required_local_evidence=required,
+                negative_indicators=_negative_indicators(cls),
+                exploit_preconditions=_exploit_preconditions(cls),
+                validation_questions=_validation_questions(cls),
+                safe_to_cite=True,
+                source_finding_ids=[],
+            )
+            items[key] = current
+        if finding.id not in current.source_finding_ids:
+            current.source_finding_ids.append(finding.id)
+    return list(items.values())[:20]
+
+
+def _protocol_ir_from_facts(static_facts: dict[str, Any]) -> ProtocolIR | None:
+    raw = static_facts.get("protocol_ir")
+    if not raw:
+        return None
+    try:
+        return ProtocolIR.model_validate(raw)
+    except Exception:
+        return None
+
+
+def _contract_names_from_fact(fact: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    if fact.get("contract"):
+        names.append(str(fact["contract"]))
+    for name in fact.get("contracts") or []:
+        names.append(str(name))
+    return names
+
+
+def _source_terms_from_ir(ir: ProtocolIR) -> list[str]:
+    texts = [
+        *[edge.expression for edge in ir.call_edges],
+        *[flow.expression for flow in ir.asset_flows],
+        *[auth.expression for auth in ir.auth_constraints],
+        *[transition.expression for transition in ir.lifecycle_transitions],
+    ]
+    return re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", " ".join(texts).lower())[:80]
+
+
+def _class_from_finding_terms(finding: HistoricalFinding) -> str:
+    text = " ".join([finding.title, finding.summary or "", " ".join(finding.tags), " ".join(finding.root_cause_terms)]).lower()
+    if "random" in text or "entropy" in text:
+        return "weak_randomness"
+    if "access" in text or "owner" in text or "role" in text:
+        return "access_control"
+    if "account" in text or "vault" in text or "balance" in text:
+        return "accounting"
+    if "oracle" in text or "price" in text:
+        return "oracle_staleness_logic"
+    return "business_logic"
+
+
+def _required_local_evidence(vulnerability_class: str, profile: RepoRAGProfile) -> list[str]:
+    if vulnerability_class == "weak_randomness":
+        return ["reward/game decision", "predictable chain or caller entropy", "mint/claim/payout effect"]
+    if vulnerability_class in {"accounting", "accounting_invariant", "vault_accounting_spoof"}:
+        return ["asset flow", "storage accounting write", "withdraw/deposit/custody relation"]
+    if vulnerability_class in {"access_control", "missing_access_control"}:
+        return ["privileged state write or sensitive external call", "missing or bypassable auth constraint"]
+    if vulnerability_class in {"oracle_staleness_logic"}:
+        return ["oracle/price read", "freshness/value validation"]
+    if profile.asset_terms:
+        return ["local asset/accounting evidence", "reachable production function"]
+    return []
+
+
+def _negative_indicators(vulnerability_class: str) -> list[str]:
+    if vulnerability_class == "weak_randomness":
+        return ["commit-reveal", "VRF/verifiable randomness", "owner-only non-reward path"]
+    if vulnerability_class in {"access_control", "missing_access_control"}:
+        return ["onlyOwner/onlyRole modifier", "explicit msg.sender authorization"]
+    if vulnerability_class in {"accounting", "accounting_invariant", "vault_accounting_spoof"}:
+        return ["accounting bound to msg.sender", "balance-delta reconciliation", "trusted-only deposit entrypoint"]
+    return ["local counterevidence defeats historical analogy"]
+
+
+def _exploit_preconditions(vulnerability_class: str) -> list[str]:
+    if vulnerability_class == "weak_randomness":
+        return ["attacker can influence timing/caller input", "reward outcome depends on predictable entropy"]
+    if vulnerability_class in {"accounting", "accounting_invariant", "vault_accounting_spoof"}:
+        return ["attacker can reach custody/accounting transition", "accounting and asset custody can diverge"]
+    if vulnerability_class in {"access_control", "missing_access_control"}:
+        return ["unauthorized caller can reach sensitive function"]
+    return ["historical root cause matches local evidence"]
+
+
+def _validation_questions(vulnerability_class: str) -> list[str]:
+    if vulnerability_class == "weak_randomness":
+        return ["Can attacker bias or predict the reward branch?"]
+    if vulnerability_class in {"accounting", "accounting_invariant", "vault_accounting_spoof"}:
+        return ["Can accounting state be assigned to a party different from asset owner/custodian?"]
+    if vulnerability_class in {"access_control", "missing_access_control"}:
+        return ["Can an unauthorized account execute the sensitive transition?"]
+    return ["What local fact proves the historical analogy applies?"]
 
 
 def _targeted_filters(settings: Settings, intent: RepoRAGSearchIntent) -> dict[str, Any]:
@@ -238,6 +361,7 @@ def build_targeted_rag(repo_path: str, static_facts: dict[str, Any], settings: S
 
     write_findings(cfg, raw, findings, root=root)
     chroma_path = HistoricalFindingStore(cfg, root=root).build(findings)
+    checklist_items = build_rag_checklist(profile, findings)
     state = TargetedRAGState(
         status=ToolStatus.OK,
         repo_id=profile.repo_id,
@@ -247,6 +371,7 @@ def build_targeted_rag(repo_path: str, static_facts: dict[str, Any], settings: S
         finding_count=len(findings),
         fetched_count=fetched_count,
         selected_from_global_count=len(selected),
+        checklist_items=checklist_items,
     )
     (root / "targeted_state.json").write_text(json.dumps(state.model_dump(mode="json"), indent=2) + "\n", encoding="utf-8")
     return state

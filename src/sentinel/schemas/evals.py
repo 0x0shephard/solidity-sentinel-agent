@@ -23,5 +23,10 @@ class EvalScore(BaseModel):
     unsupported_claim_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     false_positive_count: int = Field(default=0, ge=0)
     invariant_candidate_count: int = Field(default=0, ge=0)
+    proof_success_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    cross_contract_evidence_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
+    rag_useful_context_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    novel_pattern_discovery_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    validation_artifacts_compile: bool = False
     score: float = Field(ge=0.0, le=100.0)
     notes: list[str] = Field(default_factory=list)

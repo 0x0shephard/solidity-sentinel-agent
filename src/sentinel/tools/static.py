@@ -163,6 +163,15 @@ def _line_has_any(line: str, terms: tuple[str, ...]) -> bool:
     return any(term.lower() in lower for term in terms)
 
 
+def _strip_inline_comment(line: str) -> str:
+    return line.split("//", 1)[0].strip()
+
+
+def _is_comment_or_empty(line: str) -> bool:
+    stripped = line.strip()
+    return not stripped or stripped.startswith(("//", "/*", "*", "*/"))
+
+
 def _iter_source_lines(repo_path: str):
     for path in _solidity_files(repo_path):
         rel = str(path.relative_to(repo_path))
@@ -293,6 +302,10 @@ def find_oracle_patterns(inp: RepoPathInput, state) -> StaticFactsOutput:
     return StaticFactsOutput(status=ToolStatus.OK, facts=facts)
 
 
+def extract_token_types(inp: RepoPathInput, state) -> StaticFactsOutput:
+    return StaticFactsOutput(status=ToolStatus.OK, facts=_token_type_facts(inp.repo_path))
+
+
 def map_function_ranges(inp: RepoPathInput, state) -> FunctionRangesOutput:
     return FunctionRangesOutput(status=ToolStatus.OK, ranges=build_function_ranges(inp.repo_path))
 
@@ -390,21 +403,31 @@ def detect_oracle_staleness_logic(inp: RepoPathInput, state) -> StaticDetections
 
 def detect_unchecked_erc20_returns(inp: RepoPathInput, state) -> StaticDetectionsOutput:
     ranges = build_function_ranges(inp.repo_path)
+    token_types = _token_type_map(inp.repo_path)
     evidence = []
     for rel, line_no, line in _iter_source_lines(inp.repo_path):
-        compact = line.replace(" ", "")
-        lower = line.lower()
+        if _is_comment_or_empty(line):
+            continue
+        code = _strip_inline_comment(line)
+        compact = code.replace(" ", "")
+        lower = code.lower()
         if "safeTransfer".lower() in lower or "safeapprove" in lower:
             continue
         direct_call = any(term in compact for term in [".transfer(", ".transferFrom(", ".approve("])
         if direct_call and compact.startswith("to.transfer("):
             continue
-        low_level_token_call = "call(" in line and any(term in line for term in ["IERC20", "transfer.selector", "transferFrom.selector", "approve(", "approve.selector"])
+        receiver = _call_receiver(code, ("transfer", "transferFrom", "approve"))
+        receiver_kind = _receiver_token_kind(receiver, token_types)
+        if direct_call and receiver_kind in {"erc721", "erc1155"}:
+            continue
+        low_level_token_call = "call(" in code and any(term in code for term in ["IERC20", "ERC20", "transfer.selector", "transferFrom.selector", "approve(", "approve.selector"])
+        if direct_call and receiver_kind not in {"erc20", "unknown"}:
+            continue
         ignores_return = (
             direct_call
             and not compact.startswith("require(")
             and "require(" not in compact
-            and "=" not in compact.split("//", 1)[0].split(".transfer", 1)[0]
+            and "=" not in compact.split(".transfer", 1)[0]
         )
         low_level_checks_only_status = low_level_token_call and "abi.decode" not in line and "returndata" not in lower
         if ignores_return or low_level_checks_only_status:
@@ -421,6 +444,43 @@ def detect_unchecked_erc20_returns(inp: RepoPathInput, state) -> StaticDetection
                 ["unchecked ERC20 return", "low-level token call", "SafeERC20"],
                 "Use SafeERC20 or decode and require the returned boolean when return data is present.",
                 ["solodit-token-return"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def detect_weak_randomness(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    ranges = build_function_ranges(inp.repo_path)
+    evidence = []
+    entropy_terms = ("block.timestamp", "block.prevrandao", "blockhash", "msg.sender", "tx.origin", "block.number")
+    random_terms = ("keccak256", "random", "rand", "%")
+    reward_terms = ("mint", "win", "reward", "prize", "egg", "lottery", "claim", "payout")
+    for fn in ranges:
+        lines = (Path(inp.repo_path) / fn.file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        fn_lines = [(line_no, _strip_inline_comment(line)) for line_no, line in enumerate(lines[fn.start_line - 1 : fn.end_line], start=fn.start_line)]
+        body = "\n".join(line for _, line in fn_lines).lower()
+        if not any(term in body for term in entropy_terms):
+            continue
+        if not any(term in body for term in random_terms):
+            continue
+        if not any(term in body for term in reward_terms):
+            continue
+        for line_no, code in fn_lines:
+            lower = code.lower()
+            if any(term in lower for term in entropy_terms) or "keccak256" in lower or "%" in code:
+                evidence.append(_evidence(inp.repo_path, ranges, fn.file_path, line_no, "Predictable on-chain values are used for reward/game randomness."))
+    detections = []
+    if evidence:
+        detections.append(
+            _detection(
+                "static.detect_weak_randomness",
+                "weak_randomness",
+                "Game or reward randomness uses predictable chain/user inputs",
+                0.84,
+                evidence[:8],
+                ["weak randomness", "predictable entropy", "miner/user influence", "modulo randomness"],
+                "Use a commit-reveal scheme or verifiable randomness source for user-reward decisions.",
+                ["solodit-weak-randomness"],
             )
         )
     return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
@@ -451,6 +511,132 @@ def detect_dangerous_delegatecall(inp: RepoPathInput, state) -> StaticDetections
             )
         )
     return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def detect_public_vault_accounting_spoof(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    ranges = build_function_ranges(inp.repo_path)
+    evidence = []
+    for fn in ranges:
+        signature = fn.signature.lower()
+        if not ("public" in signature or "external" in signature):
+            continue
+        if any(term in signature for term in ["onlyowner", "onlyrole", "auth", "internal"]):
+            continue
+        lines = (Path(inp.repo_path) / fn.file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        body_lines = list(enumerate(lines[fn.start_line - 1 : fn.end_line], start=fn.start_line))
+        body = "\n".join(_strip_inline_comment(line) for _, line in body_lines).lower()
+        if "ownerof(" not in body or "address(this)" not in body:
+            continue
+        if not any(term in body for term in ["depositor", "beneficiary", "recipient", "owner", "account"]):
+            continue
+        if not any(term in body for term in ["depositors[", "stored", "deposited", "ownerof"]):
+            continue
+        for line_no, line in body_lines:
+            lower = _strip_inline_comment(line).lower()
+            if "ownerof(" in lower or "depositor" in lower or "stored" in lower:
+                evidence.append(_evidence(inp.repo_path, ranges, fn.file_path, line_no, "Public vault accounting records caller-supplied ownership/depositor metadata after asset custody check."))
+    detections = []
+    if evidence:
+        detections.append(
+            _detection(
+                "static.detect_public_vault_accounting_spoof",
+                "vault_accounting_spoof",
+                "Public vault accounting may allow depositor attribution spoofing",
+                0.76,
+                evidence[:10],
+                ["vault accounting", "depositor spoofing", "asset custody", "authorization"],
+                "Bind deposits to msg.sender or require a trusted game/vault entrypoint for depositor attribution.",
+                ["solodit-vault-accounting"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def _token_type_facts(repo_path: str) -> list[dict]:
+    facts = []
+    files = _solidity_files(repo_path)
+    repo_contract_kinds: dict[str, str] = {}
+    for path in files:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for contract_match in re.finditer(r"\bcontract\s+(\w+)\s*(?:is\s+([^{]+))?", text):
+            inherits = contract_match.group(2) or ""
+            lower = f"{contract_match.group(1)} {inherits}".lower()
+            if "erc721" in lower:
+                repo_contract_kinds[contract_match.group(1)] = "erc721"
+            elif "erc1155" in lower:
+                repo_contract_kinds[contract_match.group(1)] = "erc1155"
+            elif "erc20" in lower:
+                repo_contract_kinds[contract_match.group(1)] = "erc20"
+
+    for path in files:
+        rel = str(path.relative_to(repo_path))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        imports_erc721 = "ERC721" in text or "IERC721" in text
+        imports_erc1155 = "ERC1155" in text or "IERC1155" in text
+        imports_erc20 = "ERC20" in text or "IERC20" in text or "SafeERC20" in text
+        for contract_match in re.finditer(r"\bcontract\s+(\w+)\s*(?:is\s+([^{]+))?", text):
+            token_kind = repo_contract_kinds.get(contract_match.group(1))
+            if token_kind:
+                facts.append({"file_path": rel, "symbol": contract_match.group(1), "kind": token_kind, "source": "contract"})
+        for match in re.finditer(r"\b([A-Za-z_]\w*)\s+(?:public|private|internal|external)?\s*(\w+)\s*;", text):
+            type_name, var_name = match.group(1), match.group(2)
+            lower_type = type_name.lower()
+            kind = None
+            if type_name in repo_contract_kinds:
+                kind = repo_contract_kinds[type_name]
+            elif "erc721" in lower_type or (imports_erc721 and "nft" in lower_type):
+                kind = "erc721"
+            elif "erc1155" in lower_type:
+                kind = "erc1155"
+            elif "erc20" in lower_type or lower_type in {"ierc20", "token"}:
+                kind = "erc20"
+            elif imports_erc20 and var_name.lower() in {"token", "asset", "underlying"}:
+                kind = "erc20"
+            if kind:
+                facts.append({"file_path": rel, "symbol": var_name, "type": type_name, "kind": kind, "source": "state_variable"})
+    return facts
+
+
+def _token_type_map(repo_path: str) -> dict[str, str]:
+    token_types: dict[str, str] = {}
+    for fact in _token_type_facts(repo_path):
+        symbol = str(fact.get("symbol") or "")
+        kind = str(fact.get("kind") or "")
+        if symbol and kind:
+            token_types[symbol] = kind
+    return token_types
+
+
+def _call_receiver(line: str, method_names: tuple[str, ...]) -> str | None:
+    for method in method_names:
+        match = re.search(rf"\b([A-Za-z_]\w*)\s*\.\s*{re.escape(method)}\s*\(", line)
+        if match:
+            return match.group(1)
+    cast_match = re.search(r"\b(I?ERC20)\s*\([^)]+\)\s*\.\s*(?:transfer|transferFrom|approve)\s*\(", line)
+    if cast_match:
+        return cast_match.group(1)
+    return None
+
+
+def _receiver_token_kind(receiver: str | None, token_types: dict[str, str]) -> str:
+    if not receiver:
+        return "unknown"
+    lower = receiver.lower()
+    if lower in {"ierc20", "erc20"}:
+        return "erc20"
+    if lower in {"ierc721", "erc721"}:
+        return "erc721"
+    if lower in {"ierc1155", "erc1155"}:
+        return "erc1155"
+    if receiver in token_types:
+        return token_types[receiver]
+    if "nft" in lower or "erc721" in lower:
+        return "erc721"
+    if "erc1155" in lower:
+        return "erc1155"
+    if "token" in lower or "erc20" in lower or "asset" in lower:
+        return "erc20"
+    return "unknown"
 
 
 def detect_unsafe_or_guards(inp: RepoPathInput, state) -> StaticDetectionsOutput:
@@ -617,6 +803,7 @@ def register(registry) -> None:
         RegisteredTool(namespace="static", name="extract_external_calls", description="Extract low-level/external call sites.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_external_calls, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_delegatecalls", description="Extract delegatecall sites.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_delegatecalls, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_token_transfers", description="Extract token transfer patterns.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_token_transfers, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="extract_token_types", description="Infer ERC20/ERC721/ERC1155 receiver types from Solidity declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_token_types, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_storage_writes", description="Extract likely storage write lines.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_storage_writes, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="find_oracle_patterns", description="Find oracle and price-read patterns.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=find_oracle_patterns, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="build_solodit_checklist", description="Build Solodit-informed detector checklists from local RAG cache.", input_model=RepoPathInput, output_model=ChecklistBuildOutput, fn=build_solodit_checklist, side_effects=[SideEffect.WRITE_FILES]),
@@ -624,10 +811,12 @@ def register(registry) -> None:
         RegisteredTool(namespace="static", name="detect_unguarded_initializer", description="Detect public/external initializers without one-time guards.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_unguarded_initializer, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="detect_oracle_staleness_logic", description="Detect stale or incomplete oracle validation logic.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_oracle_staleness_logic, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="detect_unchecked_erc20_returns", description="Detect unchecked ERC20 transfer/approve return handling.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_unchecked_erc20_returns, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_weak_randomness", description="Detect predictable on-chain randomness in games/reward flows.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_weak_randomness, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="detect_dangerous_delegatecall", description="Detect dangerous delegatecall target and payload patterns.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_dangerous_delegatecall, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="detect_unsafe_or_guards", description="Detect security-sensitive OR-combined guards.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_unsafe_or_guards, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="detect_external_call_before_accounting", description="Detect external calls before related accounting updates.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_external_call_before_accounting, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="detect_strategy_accounting_trust", description="Detect strategy accounting that trusts external strategy state.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_strategy_accounting_trust, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_public_vault_accounting_spoof", description="Detect public vault accounting attribution that can be spoofed.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_public_vault_accounting_spoof, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="run_slither", description="Run Slither and write JSON artifact.", input_model=RepoPathInput, output_model=RunSlitherOutput, fn=run_slither, side_effects=[SideEffect.EXECUTE_LOCAL], chaining_hints=["Use raw_json_path as static.parse_slither.raw_json_path."]),
         RegisteredTool(namespace="static", name="parse_slither", description="Parse Slither JSON artifact into typed findings.", input_model=ParseSlitherInput, output_model=ParseSlitherOutput, fn=parse_slither, side_effects=[SideEffect.READ_FILES]),
     ]:

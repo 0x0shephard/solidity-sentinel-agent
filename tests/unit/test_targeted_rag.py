@@ -1,6 +1,6 @@
 from sentinel.config import Settings
 from sentinel.rag.store import HistoricalFindingStore, write_findings
-from sentinel.rag.targeted import build_repo_rag_profile, build_targeted_rag
+from sentinel.rag.targeted import build_rag_checklist, build_repo_rag_profile, build_targeted_rag
 from sentinel.schemas.common import ToolStatus
 from sentinel.schemas.rag import EmbeddingModelInfo, HistoricalFinding
 
@@ -48,6 +48,43 @@ def test_repo_profile_extracts_domain_and_targeted_intents():
     assert any("bursary" in candidate for candidate in profile.invariant_candidates)
 
 
+def test_repo_profile_reads_contracts_field_and_protocol_ir_contracts():
+    static_facts = {
+        "contracts": [{"contracts": ["EggVault", "EggGame"]}],
+        "functions": [],
+        "protocol_ir": {
+            "repo_path": "repo",
+            "contracts": [
+                {"name": "VaultFromIR", "file_path": "src/VaultFromIR.sol", "functions": [{"name": "deposit", "file_path": "src/VaultFromIR.sol"}]}
+            ],
+            "asset_flows": [{"file_path": "src/VaultFromIR.sol", "expression": "nft.transferFrom(msg.sender, address(this), tokenId);"}],
+        },
+    }
+
+    profile = build_repo_rag_profile("Test/egg", static_facts)
+
+    assert {"EggVault", "EggGame", "VaultFromIR"}.issubset(set(profile.contract_names))
+    assert "deposit" in profile.function_names
+
+
+def test_rag_checklist_produces_local_evidence_requirements():
+    profile = build_repo_rag_profile("Test/egg", _static_facts())
+    findings = [
+        _finding(
+            "random-1",
+            "Predictable game randomness",
+            "reward randomness block timestamp caller entropy",
+            "weak_randomness",
+        )
+    ]
+
+    items = build_rag_checklist(profile, findings)
+
+    assert items
+    assert items[0].safe_to_cite is True
+    assert "predictable chain or caller entropy" in items[0].required_local_evidence
+
+
 def test_targeted_rag_builds_repo_cache_from_global_fallback(tmp_path, monkeypatch):
     settings = Settings(rag_dir=tmp_path / "rag", solodit_api_key=None)
     global_findings = [
@@ -70,5 +107,6 @@ def test_targeted_rag_builds_repo_cache_from_global_fallback(tmp_path, monkeypat
     assert result.status == ToolStatus.OK
     assert result.finding_count >= 1
     assert result.selected_from_global_count >= 1
+    assert result.checklist_items
     assert result.profile_path
     assert result.normalized_path

@@ -48,6 +48,8 @@ class Finding(BaseModel):
     recommendation: str | None = None
     limitations: list[str] = Field(default_factory=list)
     historical_matches: list[dict] = Field(default_factory=list)
+    graph_slice_ids: list[str] = Field(default_factory=list)
+    proof_status: str = "setup_required"
     status: str = "likely"
 
 

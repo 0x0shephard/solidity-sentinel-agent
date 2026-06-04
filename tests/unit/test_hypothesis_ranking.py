@@ -64,6 +64,23 @@ def test_rank_hypotheses_detects_unchecked_token_transfer():
     assert output.hypotheses[0].affected_functions == ["withdraw"]
 
 
+def test_rank_hypotheses_ignores_known_erc721_transfer_from():
+    output = rank_hypotheses(
+        RankHypothesesInput(
+            objective="Find unchecked transfer bugs",
+            static_facts=[
+                {"file_path": "src/Game.sol", "function": "depositEggToVault"},
+                {"file_path": "src/Game.sol", "line": 23, "function": "depositEggToVault", "text": "eggNFT.transferFrom(msg.sender, address(vault), tokenId);"},
+                {"file_path": "src/Game.sol", "symbol": "eggNFT", "type": "EggToken", "kind": "erc721", "source": "state_variable"},
+            ],
+        ),
+        {},
+    )
+
+    assert output.status == ToolStatus.OK
+    assert all(hypothesis.vulnerability_class != "unchecked_transfer" for hypothesis in output.hypotheses)
+
+
 def test_rank_hypotheses_ignores_checked_token_transfer():
     output = rank_hypotheses(
         RankHypothesesInput(

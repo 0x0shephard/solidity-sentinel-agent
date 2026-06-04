@@ -5,11 +5,13 @@ from sentinel.tools.static import (
     detect_dangerous_delegatecall,
     detect_external_call_before_accounting,
     detect_oracle_staleness_logic,
+    detect_public_vault_accounting_spoof,
     detect_strategy_accounting_trust,
     detect_tx_origin_auth,
     detect_unguarded_initializer,
     detect_unchecked_erc20_returns,
     detect_unsafe_or_guards,
+    detect_weak_randomness,
 )
 from sentinel.tools.repo import RepoPathInput
 
@@ -63,6 +65,66 @@ def test_detect_unchecked_erc20_returns(tmp_path):
     )
 
     assert "unchecked_erc20_return" in _classes(detect_unchecked_erc20_returns(RepoPathInput(repo_path=str(repo)), {}))
+
+
+def test_unchecked_erc20_detector_ignores_erc721_transfer_from(tmp_path):
+    repo = _repo(
+        tmp_path,
+        "\n".join(
+            [
+                "pragma solidity ^0.8.20;",
+                "import '@openzeppelin/contracts/token/ERC721/ERC721.sol';",
+                "contract Egg is ERC721 { constructor() ERC721('E','E') {} }",
+                "contract Target {",
+                "Egg eggNFT;",
+                "function x(uint256 tokenId) external {",
+                "eggNFT.transferFrom(msg.sender, address(this), tokenId);",
+                "}",
+                "}",
+            ]
+        ),
+    )
+
+    output = detect_unchecked_erc20_returns(RepoPathInput(repo_path=str(repo)), {})
+
+    assert output.status == ToolStatus.OK
+    assert output.detections == []
+
+
+def test_unchecked_erc20_detector_ignores_cross_file_custom_erc721(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "Egg.sol").write_text(
+        "pragma solidity ^0.8.20;\nimport '@openzeppelin/contracts/token/ERC721/ERC721.sol';\ncontract EggToken is ERC721 { constructor() ERC721('E','E') {} }",
+        encoding="utf-8",
+    )
+    (repo / "src" / "Vault.sol").write_text(
+        "pragma solidity ^0.8.20;\nimport './Egg.sol';\ncontract Vault { EggToken public eggNFT; function x(uint256 tokenId) external { eggNFT.transferFrom(msg.sender, address(this), tokenId); } }",
+        encoding="utf-8",
+    )
+
+    output = detect_unchecked_erc20_returns(RepoPathInput(repo_path=str(repo)), {})
+
+    assert output.status == ToolStatus.OK
+    assert output.detections == []
+
+
+def test_detect_weak_randomness(tmp_path):
+    repo = _repo(
+        tmp_path,
+        "pragma solidity ^0.8.20;\ncontract Target {\nuint eggCounter;\nfunction searchForEgg() external {\nuint r = uint(keccak256(abi.encodePacked(block.timestamp, block.prevrandao, msg.sender, eggCounter))) % 100;\nif (r < 20) { eggCounter++; }\n}\n}",
+    )
+
+    assert "weak_randomness" in _classes(detect_weak_randomness(RepoPathInput(repo_path=str(repo)), {}))
+
+
+def test_detect_public_vault_accounting_spoof(tmp_path):
+    repo = _repo(
+        tmp_path,
+        "pragma solidity ^0.8.20;\ninterface N { function ownerOf(uint256) external view returns(address); }\ncontract Target {\nN nft;\nmapping(uint256 => address) depositors;\nmapping(uint256 => bool) stored;\nfunction deposit(uint256 id, address depositor) public {\nrequire(nft.ownerOf(id) == address(this));\nstored[id] = true;\ndepositors[id] = depositor;\n}\n}",
+    )
+
+    assert "vault_accounting_spoof" in _classes(detect_public_vault_accounting_spoof(RepoPathInput(repo_path=str(repo)), {}))
 
 
 def test_detect_dangerous_delegatecall(tmp_path):

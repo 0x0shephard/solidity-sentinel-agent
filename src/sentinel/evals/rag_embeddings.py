@@ -82,6 +82,7 @@ class ModelRAGEvalResult(BaseModel):
 class RAGEvalReport(BaseModel):
     fixture_name: str
     models: list[ModelRAGEvalResult]
+    skipped_models: list[dict[str, str]] = Field(default_factory=list)
     best_model_by_recall: str | None = None
     best_model_by_latency: str | None = None
     best_balanced_model: str | None = None
@@ -309,30 +310,35 @@ def evaluate_embedding_models(
         raise ValueError("Global Solodit normalized cache is empty; run `sentinel rag sync` first.")
 
     results = []
+    skipped_models: list[dict[str, str]] = []
     for model in models:
-        model_settings = cfg.model_copy(update={"rag_embed_model": model, "rag_auto_rebuild": True})
-        root = _model_root(out_dir, model)
-        write_findings(model_settings, [], corpus, root=root)
-        store = HistoricalFindingStore(model_settings, root=root)
-        if rebuild or store.load_metadata() is None:
-            store.rebuild()
-        metadata = store.validate_index()
-        raw_result = evaluate_query_mode(store, fixture, "raw_query")
-        canonical_result = evaluate_query_mode(store, fixture, "canonical_query")
-        combined = canonical_result.metrics
-        results.append(
-            ModelRAGEvalResult(
-                model=model,
-                dimension=metadata.embedding_dim,
-                provider=metadata.embedding_provider,
-                raw_query=raw_result,
-                canonical_query=canonical_result,
-                balanced_score=round(balanced_score(combined), 4),
+        try:
+            model_settings = cfg.model_copy(update={"rag_embed_model": model, "rag_auto_rebuild": True})
+            root = _model_root(out_dir, model)
+            write_findings(model_settings, [], corpus, root=root)
+            store = HistoricalFindingStore(model_settings, root=root)
+            if rebuild or store.load_metadata() is None:
+                store.rebuild()
+            metadata = store.validate_index()
+            raw_result = evaluate_query_mode(store, fixture, "raw_query")
+            canonical_result = evaluate_query_mode(store, fixture, "canonical_query")
+            combined = canonical_result.metrics
+            results.append(
+                ModelRAGEvalResult(
+                    model=model,
+                    dimension=metadata.embedding_dim,
+                    provider=metadata.embedding_provider,
+                    raw_query=raw_result,
+                    canonical_query=canonical_result,
+                    balanced_score=round(balanced_score(combined), 4),
+                )
             )
-        )
+        except Exception as exc:
+            skipped_models.append({"model": model, "error": f"{type(exc).__name__}: {str(exc)[:500]}"})
     report = RAGEvalReport(
         fixture_name=fixture.fixture_name,
         models=results,
+        skipped_models=skipped_models,
         best_model_by_recall=max(results, key=lambda item: item.canonical_query.metrics.recall_at_10).model if results else None,
         best_model_by_latency=min(results, key=lambda item: item.canonical_query.metrics.average_latency_ms).model if results else None,
         best_balanced_model=max(results, key=lambda item: item.balanced_score).model if results else None,
@@ -357,6 +363,10 @@ def render_rag_eval_markdown(report: RAGEvalReport) -> str:
             f"{metrics.mrr_at_10:.2f} | {metrics.class_match_rate:.2f} | {metrics.root_cause_term_overlap:.2f} | "
             f"{metrics.safe_to_cite_rate:.2f} | {metrics.average_latency_ms:.0f} |"
         )
+    if report.skipped_models:
+        lines.extend(["", "## Skipped Models", ""])
+        for skipped in report.skipped_models:
+            lines.append(f"- `{skipped['model']}`: {skipped['error']}")
     lines.extend(
         [
             "",

@@ -89,6 +89,31 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         if confirmed_findings
         else 0.0
     )
+    cross_contract_evidence_coverage = (
+        sum(
+            1
+            for finding in confirmed_findings
+            if len({item.file_path for item in finding.evidence}) >= 2
+        )
+        / len(confirmed_findings)
+        if confirmed_findings
+        else (1.0 if allow_no_findings else 0.0)
+    )
+    validation_compile_output = state.get("last_outputs", {}).get("dynamic.compile_validation_artifacts", {})
+    validation_run_output = state.get("last_outputs", {}).get("dynamic.run_validation_artifacts", {})
+    validation_compile_status = str(validation_compile_output.get("status", "")).lower()
+    validation_compile_message = str(validation_compile_output.get("message", "")).lower()
+    validation_artifacts_compile = (
+        validation_compile_status.endswith("ok")
+        or validation_compile_status.endswith("skipped")
+        or "no foundry validation test" in validation_compile_message
+    )
+    validation_classification = str(validation_run_output.get("data", {}).get("classification", ""))
+    proof_success_rate = 1.0 if validation_classification in {"security_invariant_held_or_test_passed", "security_invariant_violation_or_test_needs_review"} else 0.0
+    rag_useful_context_rate = rag_context_coverage
+    simple_classes = {"missing_access_control", "unchecked_transfer", "unchecked_erc20_return", "reentrancy", "tx_origin_authorization"}
+    novel_confirmed = [finding for finding in confirmed_findings if finding.vulnerability_class not in simple_classes]
+    novel_pattern_discovery_rate = len(novel_confirmed) / len(confirmed_findings) if confirmed_findings else 0.0
     unsupported_claim_rate = 1.0 - evidence_coverage if confirmed_findings else 0.0
     score += min(20, int(20 * finding_recall))
     score += 15 if expected_function_found and expected_file_found and evidence_present else 0
@@ -104,6 +129,10 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         notes.append("At least one confirmed/likely finding lacks production-source evidence.")
     if expected.get("allow_no_findings", False) and false_positive_count:
         notes.append(f"False positives in negative fixture: {false_positive_count}")
+    if confirmed_findings and cross_contract_evidence_coverage < 0.8:
+        notes.append(f"Cross-contract evidence coverage below target: {cross_contract_evidence_coverage:.2f}")
+    if not validation_artifacts_compile:
+        notes.append("Generated validation artifacts did not compile or were not safely skipped.")
 
     return EvalScore(
         fixture=fixture,
@@ -125,6 +154,11 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         unsupported_claim_rate=unsupported_claim_rate,
         false_positive_count=false_positive_count,
         invariant_candidate_count=len(state.get("invariant_candidates", [])),
+        proof_success_rate=proof_success_rate,
+        cross_contract_evidence_coverage=cross_contract_evidence_coverage,
+        rag_useful_context_rate=rag_useful_context_rate,
+        novel_pattern_discovery_rate=novel_pattern_discovery_rate,
+        validation_artifacts_compile=validation_artifacts_compile,
         score=float(score),
         notes=notes,
     )

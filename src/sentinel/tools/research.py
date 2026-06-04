@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field
 
 from sentinel.artifacts import append_jsonl
@@ -203,6 +205,23 @@ def _is_unchecked_token_transfer(fact: dict) -> bool:
     return True
 
 
+def _token_type_map_from_facts(facts: list[dict]) -> dict[str, str]:
+    token_types: dict[str, str] = {}
+    for fact in facts:
+        if fact.get("source") not in {"contract", "state_variable"}:
+            continue
+        symbol = str(fact.get("symbol") or "")
+        kind = str(fact.get("kind") or "")
+        if symbol and kind:
+            token_types[symbol] = kind
+    return token_types
+
+
+def _transfer_receiver(text: str) -> str | None:
+    match = re.search(r"\b([A-Za-z_]\w*)\s*\.\s*(?:transfer|transferFrom)\s*\(", text)
+    return match.group(1) if match else None
+
+
 def _slither_confidence_score(finding: dict) -> float:
     impact = str(finding.get("impact") or "").lower()
     confidence = str(finding.get("confidence") or "").lower()
@@ -232,7 +251,7 @@ def _validation_for_class(vulnerability_class: str, function_name: str | None = 
     target = function_name or "the affected function"
     if vulnerability_class in {"reentrancy", "external_call_before_accounting"}:
         return [f"Add a callback/reentrancy regression test around {target} and assert accounting remains invariant."]
-    if vulnerability_class == "unchecked_erc20_return":
+    if vulnerability_class in {"unchecked_erc20_return", "unchecked_transfer"}:
         return [f"Use a mock ERC20 that returns false and assert {target} handles the failure."]
     if vulnerability_class in {"missing_access_control", "tx_origin_authorization"}:
         return [f"Call {target} through unauthorized direct and intermediary callers."]
@@ -242,6 +261,10 @@ def _validation_for_class(vulnerability_class: str, function_name: str | None = 
         return [f"Mock stale and zero oracle responses and assert {target} rejects each case independently."]
     if vulnerability_class == "dangerous_delegatecall":
         return [f"Attempt to execute a malicious delegatecall payload through {target}."]
+    if vulnerability_class == "weak_randomness":
+        return [f"Model attacker-controlled timing/caller inputs around {target} and verify rewards cannot be predicted or biased."]
+    if vulnerability_class == "vault_accounting_spoof":
+        return [f"Transfer an asset into custody, call {target} with a spoofed depositor, and assert withdrawals cannot be redirected."]
     return [f"Add a targeted regression test for {target}."]
 
 
@@ -272,6 +295,7 @@ def _hypothesis_from_detection(index: int, detection: StaticDetection) -> Vulner
         root_cause_terms=detection.root_cause_terms,
         recommended_validation=_validation_for_class(detection.vulnerability_class, affected_functions[0] if affected_functions else None),
         source_detection_ids=[detection.detector_id],
+        proof_status="static_proof_complete" if detection.confidence >= 0.75 else "strong_local_path",
     )
 
 
@@ -365,6 +389,10 @@ def _profile_invariant_hypotheses(static_facts: list[dict]) -> list[Vulnerabilit
 
 def _class_from_invariant_type(invariant_type: str) -> str:
     mapping = {
+        "custody_accounting_consistency": "accounting_invariant",
+        "authorization_to_state_write_consistency": "missing_access_control",
+        "lifecycle_transition_gating": "business_logic",
+        "randomness_unpredictability": "weak_randomness",
         "configured_but_not_enforced": "business_logic",
         "checked_but_never_updated": "business_logic",
         "percentage_distribution_math": "accounting_invariant",
@@ -373,6 +401,14 @@ def _class_from_invariant_type(invariant_type: str) -> str:
         "unbounded_loop_dos": "denial_of_service",
         "external_state_accounting_trust": "accounting_invariant",
     }
+    if invariant_type.startswith("rag_checklist_"):
+        suffix = invariant_type.removeprefix("rag_checklist_")
+        return {
+            "access_control": "missing_access_control",
+            "accounting": "accounting_invariant",
+            "weak_randomness": "weak_randomness",
+            "oracle_staleness_logic": "oracle_staleness_logic",
+        }.get(suffix, "business_logic")
     return mapping.get(invariant_type, "business_logic")
 
 
@@ -391,6 +427,23 @@ def _hypotheses_from_invariant_candidates(static_facts: list[dict]) -> list[Vuln
         affected_files = list(dict.fromkeys(item.file_path for item in evidence))
         affected_functions = list(dict.fromkeys([*candidate.affected_functions, *(item.function_name for item in evidence if item.function_name)]))
         vulnerability_class = _class_from_invariant_type(candidate.invariant_type)
+        validation_steps = [
+            step
+            for step in [
+                candidate.required_proof,
+                *candidate.validation_questions,
+                f"Use validation template `{candidate.recommended_validation_template}` to prove or refute this invariant candidate.",
+                candidate.description,
+            ]
+            if step
+        ]
+        roots = [
+            candidate.invariant_type,
+            candidate.invariant_family or "",
+            *candidate.missing_guard_terms,
+            *candidate.suspicious_terms,
+            *candidate.affected_state_variables,
+        ]
         hypotheses.append(
             VulnerabilityHypothesis(
                 id=f"hyp-invariant-{index}",
@@ -403,15 +456,14 @@ def _hypotheses_from_invariant_candidates(static_facts: list[dict]) -> list[Vuln
                 affected_contract=candidate.affected_contracts[0] if candidate.affected_contracts else evidence[0].contract_name,
                 affected_function=affected_functions[0] if affected_functions else evidence[0].function_name,
                 evidence_lines=evidence,
-                root_cause_terms=list(dict.fromkeys([candidate.invariant_type, *candidate.missing_guard_terms, *candidate.suspicious_terms])),
-                recommended_validation=[
-                    f"Use validation template `{candidate.recommended_validation_template}` to prove or refute this invariant candidate.",
-                    candidate.description,
-                ],
-                source_detection_ids=[candidate.id],
-                exploit_precondition_terms=candidate.suspicious_terms,
+                root_cause_terms=list(dict.fromkeys([term for term in roots if term])),
+                recommended_validation=validation_steps,
+                source_detection_ids=list(dict.fromkeys([candidate.id, *candidate.detector_ids, *candidate.rag_checklist_refs])),
+                graph_slice_ids=candidate.graph_slice_ids,
+                proof_status=candidate.proof_status,
+                exploit_precondition_terms=list(dict.fromkeys([*candidate.suspicious_terms, *(candidate.local_facts[:3])])),
                 suggested_rag_queries=[
-                    f"{vulnerability_class} {candidate.invariant_type} {' '.join(candidate.suspicious_terms)}"
+                    f"{vulnerability_class} {candidate.invariant_type} {candidate.invariant_family or ''} {' '.join(candidate.suspicious_terms)}"
                 ],
                 status="needs_manual_review",
             )
@@ -479,13 +531,16 @@ def _detect_reentrancy(functions: list[dict], external_calls: list[dict], storag
     return None
 
 
-def _detect_unchecked_transfer(functions: list[dict], token_transfers: list[dict]) -> VulnerabilityHypothesis | None:
+def _detect_unchecked_transfer(functions: list[dict], token_transfers: list[dict], token_types: dict[str, str]) -> VulnerabilityHypothesis | None:
     for transfer in token_transfers:
         if not _is_unchecked_token_transfer(transfer):
             continue
+        receiver = _transfer_receiver(str(transfer.get("text", "")))
+        if receiver and token_types.get(receiver) in {"erc721", "erc1155"}:
+            continue
         file_path = str(transfer.get("file_path", "unknown"))
         function_fact = _sensitive_function_for_file(functions, file_path)
-        function_name = str(function_fact.get("function", "unknown")) if function_fact else "unknown"
+        function_name = str(transfer.get("function") or (function_fact.get("function") if function_fact else None) or "unknown")
         return VulnerabilityHypothesis(
             id="hyp-1",
             title=f"Unchecked token transfer candidate in {function_name}",
@@ -542,6 +597,7 @@ def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
     functions = _facts_with_key(target_facts, "function")
     external_calls = _facts_containing(target_facts, (".transfer(", ".call(", ".call{", ".send(", ".delegatecall(", ".delegatecall{"))
     token_transfers = _facts_containing(target_facts, (".transfer(", ".transferFrom("))
+    token_types = _token_type_map_from_facts(inp.static_facts)
     storage_writes = [fact for fact in target_facts if "line" in fact and ("=" in fact.get("text", "") or "+=" in fact.get("text", "") or "-=" in fact.get("text", ""))]
     slither_findings = [
         fact
@@ -557,7 +613,7 @@ def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
     for detector in [
         lambda: _detect_slither_finding(functions, slither_findings),
         lambda: _detect_reentrancy(functions, external_calls, storage_writes),
-        lambda: _detect_unchecked_transfer(functions, token_transfers),
+        lambda: _detect_unchecked_transfer(functions, token_transfers, token_types),
         lambda: _detect_missing_access_control(functions, external_calls, access_facts),
     ]:
         hypothesis = detector()

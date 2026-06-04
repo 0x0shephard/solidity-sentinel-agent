@@ -14,6 +14,8 @@ SEVERITY_BY_CLASS = {
     "strategy_accounting_trust": "medium",
     "unchecked_transfer": "medium",
     "unchecked_erc20_return": "medium",
+    "weak_randomness": "medium",
+    "vault_accounting_spoof": "medium",
     "oracle_staleness_logic": "medium",
     "unsafe_or_guard": "medium",
     "unguarded_initializer": "medium",
@@ -88,13 +90,31 @@ def _has_primary_production_evidence(evidence: list[Evidence]) -> bool:
     return any(item.source_type == "production" and item.evidence_role == "primary" and item.file_path and item.line_start for item in evidence)
 
 
+def _has_executable_primary_evidence(evidence: list[Evidence]) -> bool:
+    weak_markers = (
+        "Source term overlaps repo-profile intent",
+        "suspicious protocol invariant pattern: ///",
+        "suspicious protocol invariant pattern: //",
+    )
+    for item in evidence:
+        if item.source_type != "production" or item.evidence_role != "primary" or not item.file_path or not item.line_start:
+            continue
+        message = item.message.strip()
+        if any(marker in message for marker in weak_markers):
+            continue
+        if message.endswith(":") or message.endswith(": ///") or message.endswith(": //"):
+            continue
+        return True
+    return False
+
+
 def _status_with_evidence_gate(status: str, evidence: list[Evidence]) -> tuple[str, list[str]]:
     if status not in {"confirmed", "likely"}:
         return status, []
-    if _has_primary_production_evidence(evidence):
+    if _has_executable_primary_evidence(evidence):
         return status, []
     return "needs_manual_review", [
-        "Demoted because the hypothesis lacks primary production-source evidence. Test, script, documentation, RAG, or dependency evidence is supporting context only."
+        "Demoted because the hypothesis lacks executable primary production-source evidence. Test, script, documentation, comments, RAG, or dependency evidence is supporting context only."
     ]
 
 
@@ -170,6 +190,8 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
                 recommendation="Use the cited local source evidence to add a targeted regression test and patch the root cause.",
                 limitations=limitations,
                 historical_matches=_historical_matches_for(hypothesis, research),
+                graph_slice_ids=hypothesis.graph_slice_ids,
+                proof_status=hypothesis.proof_status,
                 status=gated_status,
             )
         )
@@ -241,6 +263,8 @@ def render_markdown_report(report: ReportDocument) -> str:
                     f"- Severity: {finding.severity}",
                     f"- Confidence: {finding.confidence:.2f}",
                     f"- Class: {finding.vulnerability_class}",
+                    f"- Proof status: {finding.proof_status}",
+                    f"- Graph slices: {', '.join(finding.graph_slice_ids) or 'n/a'}",
                     f"- Files: {', '.join(finding.affected_files) or 'n/a'}",
                     f"- Functions: {', '.join(finding.affected_functions) or 'n/a'}",
                     "",

@@ -115,6 +115,18 @@ class RepoRAGProfile(BaseModel):
     search_intents: list[RepoRAGSearchIntent] = Field(default_factory=list)
 
 
+class RAGChecklistItem(BaseModel):
+    checklist_id: str
+    historical_pattern: str
+    vulnerability_class: str | None = None
+    required_local_evidence: list[str] = Field(default_factory=list)
+    negative_indicators: list[str] = Field(default_factory=list)
+    exploit_preconditions: list[str] = Field(default_factory=list)
+    validation_questions: list[str] = Field(default_factory=list)
+    safe_to_cite: bool = False
+    source_finding_ids: list[str] = Field(default_factory=list)
+
+
 class TargetedRAGState(BaseModel):
     status: ToolStatus
     repo_id: str
@@ -124,6 +136,7 @@ class TargetedRAGState(BaseModel):
     finding_count: int = 0
     fetched_count: int = 0
     selected_from_global_count: int = 0
+    checklist_items: list[RAGChecklistItem] = Field(default_factory=list)
     message: str | None = None
 
 

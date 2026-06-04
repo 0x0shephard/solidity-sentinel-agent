@@ -44,7 +44,7 @@ def test_dynamic_create_and_patch_poc_test(tmp_path):
     assert Path(patched.data["path"]).exists()
 
 
-def test_dynamic_generate_validation_artifact_in_run_dir(tmp_path):
+def test_dynamic_generate_validation_artifact_plan_only_when_setup_unknown(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     run_dir = tmp_path / "runs" / "run-1"
@@ -64,13 +64,13 @@ def test_dynamic_generate_validation_artifact_in_run_dir(tmp_path):
 
     generated = executor.execute("dynamic.generate_validation_artifacts", {"repo_path": str(repo)}, state)
 
-    artifact_path = Path(generated.data["path"])
-    content = artifact_path.read_text(encoding="utf-8")
+    plan_path = Path(generated.data["plan_path"])
     assert generated.status == ToolStatus.OK
-    assert artifact_path.exists()
-    assert "SentinelFalseReturnToken" in content
-    assert "target.withdraw(1 ether);" in content
-    assert state["artifacts"][0].kind == "foundry_validation_test"
+    assert generated.data["path"] is None
+    assert generated.data["generated_test"] is False
+    assert plan_path.exists()
+    assert "mock ERC20 that returns false" in plan_path.read_text(encoding="utf-8")
+    assert state["artifacts"][0].kind == "validation_plan"
 
 
 def test_dynamic_compile_validation_artifact_uses_temporary_worktree(monkeypatch, tmp_path):
@@ -83,12 +83,12 @@ def test_dynamic_compile_validation_artifact_uses_temporary_worktree(monkeypatch
     state["hypotheses"] = [
         VulnerabilityHypothesis(
             id="hyp-1",
-            title="Manual review",
-            vulnerability_class="manual_review",
+            title="Missing access control",
+            vulnerability_class="missing_access_control",
             affected_files=["src/Vault.sol"],
-            affected_functions=["check"],
-            evidence_summary="Review target",
-            confidence=0.3,
+            affected_functions=["emergencyWithdraw"],
+            evidence_summary="Sensitive function lacks auth",
+            confidence=0.7,
         )
     ]
     captured = {}
@@ -128,12 +128,12 @@ def test_dynamic_run_validation_artifact_classifies_failure(monkeypatch, tmp_pat
     state["hypotheses"] = [
         VulnerabilityHypothesis(
             id="hyp-1",
-            title="Manual review",
-            vulnerability_class="manual_review",
+            title="Missing access control",
+            vulnerability_class="missing_access_control",
             affected_files=["src/Vault.sol"],
-            affected_functions=["check"],
-            evidence_summary="Review target",
-            confidence=0.3,
+            affected_functions=["emergencyWithdraw"],
+            evidence_summary="Sensitive function lacks auth",
+            confidence=0.7,
         )
     ]
 
@@ -154,7 +154,7 @@ def test_dynamic_run_validation_artifact_classifies_failure(monkeypatch, tmp_pat
     assert executed.status == ToolStatus.OK
     assert executed.data["command"] == ["forge", "test", "--match-contract", "Sentinel"]
     assert executed.data["classification"] == "security_invariant_violation_or_test_needs_review"
-    assert executed.data["test_names"] == ["SentinelManualReviewcheckTest"]
+    assert executed.data["test_names"] == ["SentinelMissingAccessControlemergencyWithdrawTest"]
     assert manifest.exists()
     assert not (repo / "test").exists()
     assert any(artifact.kind == "validation_run_result" for artifact in state["artifacts"])
@@ -169,12 +169,12 @@ def test_dynamic_run_validation_artifact_classifies_runtime_error(monkeypatch, t
     state["hypotheses"] = [
         VulnerabilityHypothesis(
             id="hyp-1",
-            title="Manual review",
-            vulnerability_class="manual_review",
+            title="Missing access control",
+            vulnerability_class="missing_access_control",
             affected_files=["src/Vault.sol"],
-            affected_functions=["check"],
-            evidence_summary="Review target",
-            confidence=0.3,
+            affected_functions=["emergencyWithdraw"],
+            evidence_summary="Sensitive function lacks auth",
+            confidence=0.7,
         )
     ]
 

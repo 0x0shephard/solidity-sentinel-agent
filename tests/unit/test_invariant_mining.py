@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from sentinel.analysis.invariants import build_protocol_model, mine_invariant_candidates
+from sentinel.analysis.protocol_ir import build_protocol_ir
 from sentinel.schemas.invariants import InvariantCandidate
 from sentinel.tools.research import RankHypothesesInput, rank_hypotheses
 from sentinel.tools.static import map_function_ranges
@@ -58,6 +59,32 @@ def test_protocol_model_extracts_surface_terms():
     assert "bursary" in model.accounting_terms
 
 
+def test_invariant_miner_ignores_comment_only_percentage_terms(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "Game.sol").write_text(
+        "\n".join(
+            [
+                "pragma solidity ^0.8.20;",
+                "contract Game {",
+                "    /// Chance (in percent) to find a reward.",
+                "    // The player must first approve the transfer.",
+                "    uint256 public eggFindThreshold = 20;",
+                "    function setThreshold(uint256 threshold) external {",
+                "        eggFindThreshold = threshold;",
+                "    }",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ranges = map_function_ranges(RepoPathInput(repo_path=str(tmp_path)), {}).model_dump(mode="json")["ranges"]
+
+    candidates = mine_invariant_candidates(str(tmp_path), {"function_ranges": ranges, "contracts": [{"contract": "Game"}]})
+
+    assert "percentage_distribution_math" not in {candidate.invariant_type for candidate in candidates}
+
+
 def test_rank_hypotheses_converts_invariant_candidates():
     candidate = InvariantCandidate(
         id="inv-configured",
@@ -93,3 +120,55 @@ def test_rank_hypotheses_converts_invariant_candidates():
     assert output.hypotheses[0].vulnerability_class == "business_logic"
     assert output.hypotheses[0].status == "needs_manual_review"
     assert output.hypotheses[0].evidence_lines[0].file_path == "src/School.sol"
+
+
+def test_invariant_miner_consumes_protocol_ir_and_checklist_items(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "Vault.sol").write_text(
+        "\n".join(
+            [
+                "pragma solidity ^0.8.20;",
+                "interface IERC721 { function transferFrom(address from, address to, uint256 id) external; }",
+                "contract Vault {",
+                "    IERC721 public nft;",
+                "    mapping(uint256 => address) public depositedBy;",
+                "    function deposit(uint256 tokenId, address creditedTo) external {",
+                "        nft.transferFrom(msg.sender, address(this), tokenId);",
+                "        depositedBy[tokenId] = creditedTo;",
+                "    }",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ranges = map_function_ranges(RepoPathInput(repo_path=str(tmp_path)), {}).model_dump(mode="json")["ranges"]
+    ir = build_protocol_ir(
+        str(tmp_path),
+        {
+            "function_ranges": ranges,
+            "token_types": [{"symbol": "nft", "kind": "erc721", "source": "state_variable"}],
+        },
+    )
+
+    candidates = mine_invariant_candidates(
+        str(tmp_path),
+        {
+            "function_ranges": ranges,
+            "protocol_ir": ir.model_dump(mode="json"),
+            "rag_checklist_items": [
+                {
+                    "checklist_id": "rag-1",
+                    "historical_pattern": "Vault accounting attribution can diverge from NFT custody.",
+                    "vulnerability_class": "accounting",
+                    "required_local_evidence": ["asset flow", "storage accounting write"],
+                    "negative_indicators": [],
+                    "validation_questions": ["Can creditedTo differ from msg.sender?"],
+                }
+            ],
+        },
+    )
+    types = {candidate.invariant_type for candidate in candidates}
+
+    assert "custody_accounting_consistency" in types
+    assert any(candidate.rag_checklist_refs == ["rag-1"] for candidate in candidates)

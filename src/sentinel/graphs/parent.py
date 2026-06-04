@@ -8,6 +8,7 @@ from langgraph.graph import END, START, StateGraph
 
 from sentinel.artifacts import ensure_run_dir, write_json, write_text
 from sentinel.analysis.invariants import build_protocol_model as build_protocol_model_from_facts, mine_invariant_candidates
+from sentinel.analysis.protocol_ir import build_protocol_graph, build_protocol_ir as build_protocol_ir_from_facts, protocol_ir_summary
 from sentinel.config import get_settings
 from sentinel.graphs.research import DEFAULT_RESEARCH_TOOLS, run_research_subgraph
 from sentinel.graphs.rag_subgraph import initial_rag_state, run_rag_subgraph
@@ -60,7 +61,11 @@ def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: Vulnerabili
     affected_functions = set(hypothesis.affected_functions)
     grouped_snippets: dict[str, list[dict]] = {}
     for fact_group, facts in state.get("static_facts", {}).items():
+        if not isinstance(facts, list):
+            continue
         for fact in facts:
+            if not isinstance(fact, dict):
+                continue
             fact_files = set()
             if fact.get("file_path"):
                 fact_files.add(fact["file_path"])
@@ -113,16 +118,30 @@ def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: Vulnerabili
 def _tool_prompt(state: AuditState) -> str:
     remaining_budget = max(0, get_settings().max_tool_calls - state.get("tool_call_count", 0))
     rag_context = state.get("last_outputs", {}).get("research.retrieve_historical_findings", {})
+    protocol_ir = state.get("protocol_ir")
+    protocol_summary = protocol_ir_summary(protocol_ir) if protocol_ir else {}
+    protocol_graph = state.get("protocol_graph")
+    graph_summary = {
+        "slices": len(protocol_graph.slices),
+        "attack_paths": len(protocol_graph.attack_paths),
+        "top_attack_paths": [path.model_dump(mode="json") for path in protocol_graph.attack_paths[:5]],
+    } if protocol_graph else {}
+    targeted = _model_or_mapping_json(state.get("targeted_rag"))
+    checklist_items = targeted.get("checklist_items", [])[:8] if targeted else []
     return (
         f"Objective: {state['objective']}\n"
         f"Repository path: {state['repo_path']}\n"
         f"Current focus: {state.get('current_focus', 'initialize')}\n"
         f"Compressed context: {state.get('compressed_context', '')}\n\n"
         f"Remaining approximate tool budget: {remaining_budget}\n"
+        f"Protocol IR summary: {protocol_summary}\n"
+        f"Protocol graph summary: {graph_summary}\n"
+        f"RAG checklist items: {checklist_items}\n"
         f"Available RAG context: {rag_context}\n\n"
-        "Return a concise plan for the next safe audit tools to run. "
-        "Prefer repo/build/static/research tools. Include repo_path in inputs when needed. "
-        "Use output_references when one tool output should feed another input."
+        "Return strict JSON for the next safe audit tools to run. "
+        "Reason like a protocol auditor over call graph slices, asset flows, state writes, auth constraints, lifecycle transitions, "
+        "historical checklist items, and known analysis gaps. Prefer hypotheses that can be proven from local source evidence. "
+        "Include repo_path in inputs when needed and use output_references when one tool output should feed another input."
     )
 
 
@@ -215,9 +234,10 @@ def initialize_run(state: AuditState) -> AuditState:
         PlanStep(id="inspect_repo", description="Inspect repository files and Solidity contracts"),
         PlanStep(id="detect_framework", description="Detect Solidity framework and compiler pragmas"),
         PlanStep(id="run_static_analysis", description="Extract static facts and run safe analyzers"),
+        PlanStep(id="build_protocol_ir", description="Build Protocol IR, cross-contract graph facts, asset flows, auth constraints, and completeness gaps"),
         PlanStep(id="build_protocol_model", description="Summarize protocol roles, assets, lifecycle, accounting, and upgrade surfaces"),
-        PlanStep(id="mine_invariant_candidates", description="Mine protocol invariant candidates from production source evidence"),
-        PlanStep(id="build_targeted_rag_context", description="Build repo profile and targeted Solodit context"),
+        PlanStep(id="build_targeted_rag_context", description="Build graph-derived repo profile and Solodit checklist context before ranking"),
+        PlanStep(id="mine_invariant_candidates", description="Mine protocol invariant candidates from Protocol IR and local checklist evidence"),
         PlanStep(id="rank_hypotheses", description="Create early vulnerability hypotheses"),
         PlanStep(id="finish", description="Persist state artifacts"),
     ]
@@ -274,16 +294,19 @@ def run_static_analysis(state: AuditState) -> AuditState:
     _run_tool(state, "static.find_access_control_terms", {"repo_path": repo_path})
     _run_tool(state, "static.extract_external_calls", {"repo_path": repo_path})
     _run_tool(state, "static.extract_token_transfers", {"repo_path": repo_path})
+    _run_tool(state, "static.extract_token_types", {"repo_path": repo_path})
     _run_tool(state, "static.extract_storage_writes", {"repo_path": repo_path})
     detector_names = [
         "static.detect_tx_origin_auth",
         "static.detect_unguarded_initializer",
         "static.detect_oracle_staleness_logic",
         "static.detect_unchecked_erc20_returns",
+        "static.detect_weak_randomness",
         "static.detect_dangerous_delegatecall",
         "static.detect_unsafe_or_guards",
         "static.detect_external_call_before_accounting",
         "static.detect_strategy_accounting_trust",
+        "static.detect_public_vault_accounting_spoof",
     ]
     for detector_name in detector_names:
         _run_tool(state, detector_name, {"repo_path": repo_path})
@@ -301,6 +324,7 @@ def run_static_analysis(state: AuditState) -> AuditState:
         "access_control": state["last_outputs"].get("static.find_access_control_terms", {}).get("facts", []),
         "external_calls": state["last_outputs"].get("static.extract_external_calls", {}).get("facts", []),
         "token_transfers": state["last_outputs"].get("static.extract_token_transfers", {}).get("facts", []),
+        "token_types": state["last_outputs"].get("static.extract_token_types", {}).get("facts", []),
         "storage_writes": state["last_outputs"].get("static.extract_storage_writes", {}).get("facts", []),
         "slither_findings": state["last_outputs"].get("static.parse_slither", {}).get("findings", []),
         "detections": [
@@ -309,16 +333,43 @@ def run_static_analysis(state: AuditState) -> AuditState:
             for detection in state["last_outputs"].get(detector_name, {}).get("detections", [])
         ],
     }
-    state["current_focus"] = "rank_hypotheses"
+    state["current_focus"] = "build_protocol_ir"
+    return state
+
+
+def build_protocol_ir(state: AuditState) -> AuditState:
+    ir = build_protocol_ir_from_facts(state["repo_path"], state.get("static_facts", {}))
+    graph = build_protocol_graph(ir)
+    state["protocol_ir"] = ir
+    state["protocol_graph"] = graph
+    state.setdefault("static_facts", {})["protocol_ir"] = ir.model_dump(mode="json")
+    state.setdefault("static_facts", {})["protocol_graph"] = graph.model_dump(mode="json")
+    summary = protocol_ir_summary(ir)
+    state["last_outputs"]["analysis.build_protocol_ir"] = {
+        "status": "ok",
+        "protocol_ir": ir.model_dump(mode="json"),
+        "protocol_graph": graph.model_dump(mode="json"),
+        "summary": summary,
+    }
+    if ir.completeness_gaps:
+        state.setdefault("warnings", []).extend(f"Protocol IR gap: {gap}" for gap in ir.completeness_gaps)
+    _record_step(
+        state,
+        "analysis.build_protocol_ir",
+        f"Protocol IR: contracts={len(ir.contracts)}, slices={len(graph.slices)}, paths={len(graph.attack_paths)}, calls={len(ir.call_edges)}, asset_flows={len(ir.asset_flows)}",
+    )
+    state["current_focus"] = "build_protocol_model"
     return state
 
 
 def build_protocol_model(state: AuditState) -> AuditState:
+    if state.get("protocol_ir"):
+        state.setdefault("static_facts", {})["protocol_ir"] = state["protocol_ir"].model_dump(mode="json")
     model = build_protocol_model_from_facts(state.get("static_facts", {}))
     state["protocol_model"] = model
     state["last_outputs"]["analysis.build_protocol_model"] = {"status": "ok", "protocol_model": model.model_dump(mode="json")}
     _record_step(state, "analysis.build_protocol_model", f"Protocol model terms: roles={len(model.roles)}, accounting={len(model.accounting_terms)}")
-    state["current_focus"] = "mine_invariant_candidates"
+    state["current_focus"] = "build_targeted_rag_context"
     return state
 
 
@@ -330,7 +381,7 @@ def mine_invariants(state: AuditState) -> AuditState:
         "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
     }
     _record_step(state, "analysis.mine_invariant_candidates", f"Mined {len(candidates)} protocol invariant candidates")
-    state["current_focus"] = "build_targeted_rag_context"
+    state["current_focus"] = "rank_hypotheses"
     return state
 
 
@@ -348,7 +399,22 @@ def build_targeted_rag_context(state: AuditState) -> AuditState:
         {"repo_path": repo_path, "static_facts": state.get("static_facts", {})},
     )
     state["targeted_rag"] = getattr(targeted, "state", None)
-    state["current_focus"] = "rank_hypotheses"
+    targeted_state = _model_or_mapping_json(state.get("targeted_rag"))
+    if targeted_state.get("checklist_items"):
+        state.setdefault("static_facts", {})["rag_checklist_items"] = targeted_state["checklist_items"]
+    state["last_outputs"]["llm.protocol_auditor_context"] = {
+        "status": "ok",
+        "protocol_ir_summary": protocol_ir_summary(state["protocol_ir"]) if state.get("protocol_ir") else {},
+        "protocol_graph_summary": {
+            "slices": len(state.get("protocol_graph").slices) if state.get("protocol_graph") else 0,
+            "attack_paths": len(state.get("protocol_graph").attack_paths) if state.get("protocol_graph") else 0,
+            "completeness": state.get("protocol_graph").completeness.model_dump(mode="json") if state.get("protocol_graph") else {},
+        },
+        "repo_profile": _model_or_mapping_json(state.get("repo_rag_profile")),
+        "rag_checklist_items": targeted_state.get("checklist_items", [])[:10],
+        "guidance": "Use checklist items as historical prompts only; require local Protocol IR evidence before promoting hypotheses.",
+    }
+    state["current_focus"] = "mine_invariant_candidates"
     return state
 
 
@@ -362,6 +428,7 @@ def rank_hypotheses(state: AuditState) -> AuditState:
                 *state.get("static_facts", {}).get("functions", []),
                 *state.get("static_facts", {}).get("external_calls", []),
                 *state.get("static_facts", {}).get("token_transfers", []),
+                *state.get("static_facts", {}).get("token_types", []),
                 *state.get("static_facts", {}).get("storage_writes", []),
                 *state.get("static_facts", {}).get("slither_findings", []),
                 *state.get("static_facts", {}).get("access_control", []),
@@ -371,6 +438,8 @@ def rank_hypotheses(state: AuditState) -> AuditState:
                     for candidate in state.get("invariant_candidates", [])
                 ],
                 _model_or_mapping_json(state.get("repo_rag_profile")),
+                {"protocol_ir": state["protocol_ir"].model_dump(mode="json")} if state.get("protocol_ir") else {},
+                {"rag_checklist_items": _model_or_mapping_json(state.get("targeted_rag")).get("checklist_items", [])},
             ],
         },
     )
@@ -495,6 +564,7 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_node("inspect_repo", inspect_repo)
     graph.add_node("detect_framework", detect_framework)
     graph.add_node("run_static_analysis", run_static_analysis)
+    graph.add_node("build_protocol_ir", build_protocol_ir)
     graph.add_node("build_protocol_model", build_protocol_model)
     graph.add_node("mine_invariant_candidates", mine_invariants)
     graph.add_node("build_targeted_rag_context", build_targeted_rag_context)
@@ -510,10 +580,11 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_edge("plan_with_llm", "inspect_repo")
     graph.add_edge("inspect_repo", "detect_framework")
     graph.add_edge("detect_framework", "run_static_analysis")
-    graph.add_edge("run_static_analysis", "build_protocol_model")
-    graph.add_edge("build_protocol_model", "mine_invariant_candidates")
-    graph.add_edge("mine_invariant_candidates", "build_targeted_rag_context")
-    graph.add_edge("build_targeted_rag_context", "rank_hypotheses")
+    graph.add_edge("run_static_analysis", "build_protocol_ir")
+    graph.add_edge("build_protocol_ir", "build_protocol_model")
+    graph.add_edge("build_protocol_model", "build_targeted_rag_context")
+    graph.add_edge("build_targeted_rag_context", "mine_invariant_candidates")
+    graph.add_edge("mine_invariant_candidates", "rank_hypotheses")
     graph.add_edge("rank_hypotheses", "rag_retrieve_context")
     graph.add_edge("rag_retrieve_context", "research_subgraph")
     graph.add_edge("research_subgraph", "summarize_context")

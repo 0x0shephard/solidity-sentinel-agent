@@ -43,6 +43,10 @@ def write_eval_summary(scores: list) -> Path:
             f"hypothesis_recall={score.hypothesis_recall:.2f}, "
             f"finding_recall={score.finding_recall:.2f}, "
             f"production_evidence={score.production_evidence_coverage:.2f}, "
+            f"cross_contract_evidence={score.cross_contract_evidence_coverage:.2f}, "
+            f"proof_success={score.proof_success_rate:.2f}, "
+            f"rag_useful={score.rag_useful_context_rate:.2f}, "
+            f"validation_compile={score.validation_artifacts_compile}, "
             f"invariant_candidates={score.invariant_candidate_count}"
         )
         for note in score.notes:

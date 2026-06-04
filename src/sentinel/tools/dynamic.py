@@ -60,6 +60,34 @@ def _target_details(hypothesis: VulnerabilityHypothesis) -> tuple[str, str, str]
     return target_file, target_contract, target_function
 
 
+def _constructor_arg_count(repo_path: str, target_file: str, target_contract: str) -> int | None:
+    source_path = Path(repo_path) / target_file
+    if not source_path.exists():
+        return None
+    text = source_path.read_text(encoding="utf-8", errors="replace")
+    contract_match = re.search(rf"\bcontract\s+{re.escape(target_contract)}\b", text)
+    start = contract_match.start() if contract_match else 0
+    match = re.search(r"\bconstructor\s*\(([^)]*)\)", text[start:], flags=re.DOTALL)
+    if not match:
+        return 0
+    args = match.group(1).strip()
+    if not args:
+        return 0
+    return len([part for part in args.split(",") if part.strip()])
+
+
+def _can_generate_executable_validation(repo_path: str, hypothesis: VulnerabilityHypothesis) -> tuple[bool, str]:
+    target_file, target_contract, _target_function = _target_details(hypothesis)
+    if hypothesis.vulnerability_class not in {"missing_access_control", "reentrancy"}:
+        return False, "No safe generic executable template exists for this vulnerability class; emitting a proof plan instead."
+    arg_count = _constructor_arg_count(repo_path, target_file, target_contract)
+    if arg_count is None:
+        return False, f"Could not inspect constructor setup for {target_contract}; emitting a proof plan instead."
+    if arg_count > 0:
+        return False, f"{target_contract} constructor requires {arg_count} argument(s); setup inference is incomplete, so executable validation is deferred."
+    return True, "Target contract has no constructor arguments and a generic executable scaffold is available."
+
+
 def _missing_access_control_test(hypothesis: VulnerabilityHypothesis) -> str:
     target_file, target_contract, target_function = _target_details(hypothesis)
     return "\n".join(
@@ -245,6 +273,8 @@ def _validation_plan_content(hypothesis: VulnerabilityHypothesis) -> str:
     template_notes = {
         "accounting_invariant": "Assert accounting conservation before and after the action: total balances, rewards, fees, or payout sums should reconcile.",
         "business_logic": "Assert the intended business rule against an attacker-controlled or boundary-value scenario.",
+        "unchecked_transfer": "Use a mock ERC20 that returns false and assert the target handles the failed token operation.",
+        "unchecked_erc20_return": "Use a mock ERC20 that returns false and assert the target handles the failed token operation.",
         "upgradeability": "Assert upgrade authorization, implementation transitions, and initializer/reinitializer constraints.",
         "storage_layout": "Compare storage layouts across versions and assert state variables retain slot/order compatibility.",
         "denial_of_service": "Exercise the largest realistic dynamic collection and assert gas/runtime remains bounded.",
@@ -434,18 +464,9 @@ def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     test_name = _artifact_test_name(hypothesis)
     test_path = artifact_dir / test_name
-    content = _validation_test_content(hypothesis)
-    test_path.write_text(content, encoding="utf-8")
     plan_path = artifact_dir / f"{test_path.stem}.plan.md"
     plan_content = _validation_plan_content(hypothesis)
     plan_path.write_text(plan_content, encoding="utf-8")
-
-    ref = ArtifactRef(
-        kind="foundry_validation_test",
-        path=str(test_path),
-        description=f"Generated Foundry validation test for {hypothesis.vulnerability_class}; copy into the audited repo's test/ directory before running.",
-    )
-    state.setdefault("artifacts", []).append(ref)
     state.setdefault("artifacts", []).append(
         ArtifactRef(
             kind="validation_plan",
@@ -453,12 +474,30 @@ def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
             description=f"Hypothesis-specific validation plan for {hypothesis.vulnerability_class}.",
         )
     )
+    can_generate, setup_reason = _can_generate_executable_validation(inp.repo_path, hypothesis)
+    content = ""
+    generated_test = False
+    if can_generate:
+        content = _validation_test_content(hypothesis)
+        test_path.write_text(content, encoding="utf-8")
+        generated_test = True
+        state.setdefault("artifacts", []).append(
+            ArtifactRef(
+                kind="foundry_validation_test",
+                path=str(test_path),
+                description=f"Generated Foundry validation test for {hypothesis.vulnerability_class}; setup was inferred from local constructor shape.",
+            )
+        )
+    else:
+        state.setdefault("warnings", []).append(f"Validation artifact for {hypothesis.id} is plan-only: {setup_reason}")
     data = {
-        "path": str(test_path),
+        "path": str(test_path) if generated_test else None,
         "plan_path": str(plan_path),
         "test_name": test_name,
         "hypothesis_id": hypothesis.id,
         "vulnerability_class": hypothesis.vulnerability_class,
+        "generated_test": generated_test,
+        "setup_reason": setup_reason,
         "content": content,
         "plan": plan_content,
     }
