@@ -35,6 +35,9 @@ class VulnerabilityHypothesis(BaseModel):
     historical_matches: list[dict] = Field(default_factory=list)
     source_detection_ids: list[str] = Field(default_factory=list)
     graph_slice_ids: list[str] = Field(default_factory=list)
+    proof_packet_id: str | None = None
+    proof_obligations: list[str] = Field(default_factory=list)
+    counterevidence: list[str] = Field(default_factory=list)
     proof_status: str = "setup_required"
     exploit_precondition_terms: list[str] = Field(default_factory=list)
     suggested_rag_queries: list[str] = Field(default_factory=list)

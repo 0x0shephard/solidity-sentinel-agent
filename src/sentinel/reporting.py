@@ -6,6 +6,7 @@ from sentinel.state import AuditState
 
 
 SEVERITY_BY_CLASS = {
+    "transaction_ordering": "high",
     "missing_access_control": "high",
     "tx_origin_authorization": "high",
     "dangerous_delegatecall": "high",
@@ -19,6 +20,8 @@ SEVERITY_BY_CLASS = {
     "oracle_staleness_logic": "medium",
     "unsafe_or_guard": "medium",
     "unguarded_initializer": "medium",
+    "accounting_invariant": "medium",
+    "business_logic": "medium",
 }
 
 
@@ -118,6 +121,30 @@ def _status_with_evidence_gate(status: str, evidence: list[Evidence]) -> tuple[s
     ]
 
 
+def _status_with_counterevidence_gate(status: str, hypothesis, research) -> tuple[str, list[str]]:
+    if status not in {"confirmed", "likely"}:
+        return status, []
+    negative_text = " ".join(
+        [
+            *(getattr(hypothesis, "counterevidence", []) or []),
+            *(getattr(research, "limitations", []) if research else []),
+            getattr(research, "likely_impact", "") if research else "",
+        ]
+    ).lower()
+    blocking_markers = (
+        "low to none",
+        "no concrete secondary target",
+        "cei-safe",
+        "safeerc20-only",
+        "missing concrete",
+        "blocking counterevidence",
+        "no unprivileged impact",
+    )
+    if any(marker in negative_text for marker in blocking_markers):
+        return "rejected", ["Demoted because research/counterevidence identified a blocking negative indicator."]
+    return status, []
+
+
 def _tool_status_from_last_output(output: dict | None) -> AnalysisToolStatus:
     if not output:
         return AnalysisToolStatus()
@@ -174,7 +201,8 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
         severity = SEVERITY_BY_CLASS.get(hypothesis.vulnerability_class, "info")
         status = research.finding_status if research else hypothesis.status
         gated_status, gating_limitations = _status_with_evidence_gate(status, local_evidence)
-        limitations = [*(research.limitations if research else ["Generated before research subgraph refinement."]), *gating_limitations]
+        gated_status, counterevidence_limitations = _status_with_counterevidence_gate(gated_status, hypothesis, research)
+        limitations = [*(research.limitations if research else ["Generated before research subgraph refinement."]), *gating_limitations, *counterevidence_limitations]
         findings.append(
             Finding(
                 id=hypothesis.id.replace("hyp", "finding"),
@@ -191,6 +219,9 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
                 limitations=limitations,
                 historical_matches=_historical_matches_for(hypothesis, research),
                 graph_slice_ids=hypothesis.graph_slice_ids,
+                proof_packet_id=hypothesis.proof_packet_id,
+                proof_obligations=hypothesis.proof_obligations,
+                counterevidence=hypothesis.counterevidence,
                 proof_status=hypothesis.proof_status,
                 status=gated_status,
             )
@@ -199,6 +230,7 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
 
 
 def build_report_document(state: AuditState) -> ReportDocument:
+    contest = state.get("last_outputs", {}).get("analysis.contest_reasoning", {})
     return ReportDocument(
         run_id=state["run_id"],
         objective=state["objective"],
@@ -208,6 +240,10 @@ def build_report_document(state: AuditState) -> ReportDocument:
         suspicious_hypotheses=[finding for finding in state.get("findings", []) if finding.status == "suspicious"],
         rejected_hypotheses=[finding for finding in state.get("findings", []) if finding.status == "rejected"],
         analysis_completeness=build_analysis_completeness(state),
+        actor_model=contest.get("actor_model", []),
+        transaction_race_edges=contest.get("race_edges", []),
+        reasoning_packets=contest.get("reasoning_packets", [])[:20],
+        working_memory=contest.get("working_memory", {}),
         artifacts=state.get("artifacts", []),
         tool_call_count=state.get("tool_call_count", 0),
         subgraphs_spawned=len(state.get("subgraph_results", [])),
@@ -246,6 +282,28 @@ def render_markdown_report(report: ReportDocument) -> str:
         if report.analysis_completeness.limitations:
             lines.append("- Limitations: " + "; ".join(report.analysis_completeness.limitations))
         lines.append("")
+    if report.actor_model:
+        lines.extend(["## Actor / Intent Model", ""])
+        for actor in report.actor_model:
+            evidence_count = len(actor.get("evidence", [])) if isinstance(actor, dict) else 0
+            capabilities = ", ".join(actor.get("capabilities", [])[:3]) if isinstance(actor, dict) else ""
+            lines.append(f"- {actor.get('role', 'unknown')}: {capabilities} (evidence={evidence_count})")
+        lines.append("")
+    if report.transaction_race_edges:
+        lines.extend(["## Transaction Race Model", ""])
+        for edge in report.transaction_race_edges[:8]:
+            affected_state = ", ".join(edge.get("affected_state", [])[:5])
+            lines.append(f"- {edge.get('edge_id')}: {edge.get('edge_type')} over {affected_state}; confidence={edge.get('confidence', 0):.2f}")
+            for step in edge.get("adversarial_trace", [])[:3]:
+                lines.append(f"  - {step}")
+        lines.append("")
+    if report.working_memory:
+        lessons = report.working_memory.get("benchmark_lessons", [])[:5]
+        if lessons:
+            lines.extend(["## Audit Memory Notes", ""])
+            for lesson in lessons:
+                lines.append(f"- {lesson}")
+            lines.append("")
     if not report.findings and not report.needs_manual_review and not report.suspicious_hypotheses and not report.rejected_hypotheses:
         lines.append("No findings were generated.")
         return "\n".join(lines) + "\n"
@@ -264,6 +322,7 @@ def render_markdown_report(report: ReportDocument) -> str:
                     f"- Confidence: {finding.confidence:.2f}",
                     f"- Class: {finding.vulnerability_class}",
                     f"- Proof status: {finding.proof_status}",
+                    f"- Proof packet: {finding.proof_packet_id or 'n/a'}",
                     f"- Graph slices: {', '.join(finding.graph_slice_ids) or 'n/a'}",
                     f"- Files: {', '.join(finding.affected_files) or 'n/a'}",
                     f"- Functions: {', '.join(finding.affected_functions) or 'n/a'}",
@@ -280,6 +339,14 @@ def render_markdown_report(report: ReportDocument) -> str:
                 if item.function:
                     location += f"::{item.function}"
                 lines.append(f"- `{location}` [{item.source_type}/{item.evidence_role}]: {item.message}")
+            if finding.proof_obligations:
+                lines.extend(["", "#### Proof Obligations"])
+                for obligation in finding.proof_obligations:
+                    lines.append(f"- {obligation}")
+            if finding.counterevidence:
+                lines.extend(["", "#### Counterevidence / Negative Indicators"])
+                for item in finding.counterevidence:
+                    lines.append(f"- {item}")
             if finding.reproduction_steps:
                 lines.extend(["", "#### Suggested Tests"])
                 for step in finding.reproduction_steps:

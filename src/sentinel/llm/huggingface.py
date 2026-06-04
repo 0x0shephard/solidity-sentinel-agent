@@ -6,7 +6,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 
 from sentinel.llm.base import BasePlanner, BaseResearchRefiner, ToolPlan
-from sentinel.llm.ollama import extract_json_object
+from sentinel.llm.ollama import extract_json_object, parse_research_refinement
 from sentinel.schemas.research import ResearchRefinement
 
 
@@ -80,4 +80,4 @@ class HuggingFaceResearchRefiner(BaseResearchRefiner):
             ]
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
-        return ResearchRefinement.model_validate_json(extract_json_object(content))
+        return parse_research_refinement(content)

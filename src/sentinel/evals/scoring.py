@@ -40,6 +40,8 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
 
     matched_items = [item for item in expected_items if _matches_expected(item)]
     matched_hypotheses = [item for item in expected_items if _hypothesis_matches_expected(item)]
+    high_expected_items = [item for item in expected_items if str(item.get("severity", "")).lower() in {"high", "critical"}]
+    high_matched_items = [item for item in high_expected_items if _matches_expected(item)]
     minimum_expected = int(expected["minimum_expected_findings"]) if "minimum_expected_findings" in expected else len(expected_items)
     expected_class_found = len(matched_items) >= minimum_expected
     expected_function_found = expected_class_found
@@ -114,6 +116,30 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
     simple_classes = {"missing_access_control", "unchecked_transfer", "unchecked_erc20_return", "reentrancy", "tx_origin_authorization"}
     novel_confirmed = [finding for finding in confirmed_findings if finding.vulnerability_class not in simple_classes]
     novel_pattern_discovery_rate = len(novel_confirmed) / len(confirmed_findings) if confirmed_findings else 0.0
+    high_severity_recall = len(high_matched_items) / max(1, len(high_expected_items)) if high_expected_items else finding_recall
+    contest_recall = finding_recall
+    false_likely_count = false_positive_count
+    rejected_findings = [finding for finding in findings if getattr(finding, "status", "") == "rejected"]
+    rejected_counterevidence_quality = (
+        sum(1 for finding in rejected_findings if getattr(finding, "counterevidence", [])) / len(rejected_findings)
+        if rejected_findings
+        else 1.0
+    )
+    foundry_validation_artifacts = [
+        artifact
+        for artifact in state.get("artifacts", [])
+        if (getattr(artifact, "kind", None) if not isinstance(artifact, dict) else artifact.get("kind")) == "foundry_validation_test"
+    ]
+    executable_poc_rate = min(1.0, len(foundry_validation_artifacts) / max(1, len(confirmed_findings))) if confirmed_findings else 0.0
+    contest_output = state.get("last_outputs", {}).get("analysis.contest_reasoning", {})
+    actor_model_coverage = 1.0 if contest_output.get("actor_model") else 0.0
+    transaction_race_coverage = 1.0 if contest_output.get("race_edges") else 0.0
+    gap_agent_hypotheses = [
+        hypothesis
+        for hypothesis in hypotheses
+        if any(str(source).endswith("_gap_agent") or "_gap_agent" in str(source) for source in getattr(hypothesis, "source_detection_ids", []))
+    ]
+    gap_agent_contribution_rate = len(gap_agent_hypotheses) / max(1, len(hypotheses))
     unsupported_claim_rate = 1.0 - evidence_coverage if confirmed_findings else 0.0
     score += min(20, int(20 * finding_recall))
     score += 15 if expected_function_found and expected_file_found and evidence_present else 0
@@ -133,6 +159,13 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         notes.append(f"Cross-contract evidence coverage below target: {cross_contract_evidence_coverage:.2f}")
     if not validation_artifacts_compile:
         notes.append("Generated validation artifacts did not compile or were not safely skipped.")
+    if expected.get("contest_fixture", False):
+        if high_severity_recall < float(expected.get("minimum_high_recall", 1.0)):
+            notes.append(f"High severity recall below contest target: {high_severity_recall:.2f}")
+        if transaction_race_coverage < 1.0:
+            notes.append("Transaction-race coverage missing for contest fixture.")
+        if gap_agent_contribution_rate <= 0:
+            notes.append("No hypotheses came from gap-hunter agents.")
 
     return EvalScore(
         fixture=fixture,
@@ -158,6 +191,14 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         cross_contract_evidence_coverage=cross_contract_evidence_coverage,
         rag_useful_context_rate=rag_useful_context_rate,
         novel_pattern_discovery_rate=novel_pattern_discovery_rate,
+        high_severity_recall=high_severity_recall,
+        contest_recall=contest_recall,
+        false_likely_count=false_likely_count,
+        rejected_counterevidence_quality=rejected_counterevidence_quality,
+        executable_poc_rate=executable_poc_rate,
+        actor_model_coverage=actor_model_coverage,
+        transaction_race_coverage=transaction_race_coverage,
+        gap_agent_contribution_rate=gap_agent_contribution_rate,
         validation_artifacts_compile=validation_artifacts_compile,
         score=float(score),
         notes=notes,

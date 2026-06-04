@@ -49,6 +49,9 @@ class Finding(BaseModel):
     limitations: list[str] = Field(default_factory=list)
     historical_matches: list[dict] = Field(default_factory=list)
     graph_slice_ids: list[str] = Field(default_factory=list)
+    proof_packet_id: str | None = None
+    proof_obligations: list[str] = Field(default_factory=list)
+    counterevidence: list[str] = Field(default_factory=list)
     proof_status: str = "setup_required"
     status: str = "likely"
 
@@ -62,6 +65,10 @@ class ReportDocument(BaseModel):
     suspicious_hypotheses: list[Finding] = Field(default_factory=list)
     rejected_hypotheses: list[Finding] = Field(default_factory=list)
     analysis_completeness: AnalysisCompleteness | None = None
+    actor_model: list[dict] = Field(default_factory=list)
+    transaction_race_edges: list[dict] = Field(default_factory=list)
+    reasoning_packets: list[dict] = Field(default_factory=list)
+    working_memory: dict = Field(default_factory=dict)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     tool_call_count: int = Field(ge=0)
     subgraphs_spawned: int = Field(ge=0)

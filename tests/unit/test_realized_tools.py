@@ -111,7 +111,7 @@ def test_dynamic_compile_validation_artifact_uses_temporary_worktree(monkeypatch
     manifest = run_dir / "artifacts" / "validation-compile-result.json"
     assert generated.status == ToolStatus.OK
     assert compiled.status == ToolStatus.OK
-    assert captured["command"] == ["forge", "build"]
+    assert captured["command"] == ["forge", "build", "--offline"]
     assert captured["cwd"].endswith("artifacts/validation-worktree")
     assert manifest.exists()
     assert not (repo / "test").exists()
@@ -152,7 +152,7 @@ def test_dynamic_run_validation_artifact_classifies_failure(monkeypatch, tmp_pat
 
     manifest = run_dir / "artifacts" / "validation-run-result.json"
     assert executed.status == ToolStatus.OK
-    assert executed.data["command"] == ["forge", "test", "--match-contract", "Sentinel"]
+    assert executed.data["command"] == ["forge", "test", "--offline", "--match-contract", "Sentinel"]
     assert executed.data["classification"] == "security_invariant_violation_or_test_needs_review"
     assert executed.data["test_names"] == ["SentinelMissingAccessControlemergencyWithdrawTest"]
     assert manifest.exists()

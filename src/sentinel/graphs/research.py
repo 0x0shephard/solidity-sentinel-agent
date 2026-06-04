@@ -102,9 +102,13 @@ def _evidence_records(snippets: list[dict]) -> list[dict]:
                 "line_end": snippet.get("line"),
                 "function": snippet.get("function") or (snippet.get("functions") or [None])[0],
                 "message": message,
+                "proof_packet_id": snippet.get("proof_packet_id"),
+                "proof_obligations": snippet.get("proof_obligations", []),
+                "counterevidence": snippet.get("counterevidence", []),
+                "local_facts": snippet.get("local_facts", []),
             }
         )
-    return records[:6]
+    return records[:8]
 
 
 def _refinement_prompt(state: ResearchState) -> str:
@@ -114,9 +118,11 @@ def _refinement_prompt(state: ResearchState) -> str:
         "objective": state["objective"],
         "hypothesis": hypothesis.model_dump(mode="json"),
         "evidence": evidence,
+        "proof_packets": [record for record in evidence if record.get("kind") == "proof_packet"],
         "instruction": (
+            "Act as a protocol auditor over the supplied proof packet and source evidence. "
             "Refine the impact, exploit preconditions, and regression tests. "
-            "Use only the supplied evidence. If exploitability is uncertain, say what remains uncertain."
+            "Use only supplied local evidence for claims; use proof obligations to say what remains uncertain."
         ),
     }
     return json.dumps(payload, indent=2)
@@ -222,8 +228,12 @@ def create_result(state: ResearchState) -> ResearchState:
     exploit_preconditions = refinement.exploit_preconditions or (["Attacker can reach the affected function"] if functions else [])
     limitations = refinement.limitations or deterministic_limitations
     confidence = min(0.95, max(0.0, hypothesis.confidence + 0.1 + refinement.confidence_delta))
-    if hypothesis.status == "rejected":
+    if hypothesis.status == "rejected" or hypothesis.proof_status == "rejected_by_counterevidence":
         finding_status = "rejected"
+    elif hypothesis.proof_status == "static_proof_complete" and state.get("evidence_records"):
+        finding_status = "confirmed"
+    elif hypothesis.proof_status == "strong_local_path" and state.get("evidence_records"):
+        finding_status = "likely"
     elif hypothesis.status == "needs_manual_review" and not state.get("llm_refinement"):
         finding_status = "needs_manual_review"
     elif state.get("evidence_records") and confidence >= 0.85:

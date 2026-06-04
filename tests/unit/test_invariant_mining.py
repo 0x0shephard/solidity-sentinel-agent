@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sentinel.analysis.invariants import build_protocol_model, mine_invariant_candidates
+from sentinel.analysis.invariants import build_invariant_proof_packets, build_protocol_model, mine_invariant_candidates
 from sentinel.analysis.protocol_ir import build_protocol_ir
 from sentinel.schemas.invariants import InvariantCandidate
 from sentinel.tools.research import RankHypothesesInput, rank_hypotheses
@@ -172,3 +172,31 @@ def test_invariant_miner_consumes_protocol_ir_and_checklist_items(tmp_path: Path
 
     assert "custody_accounting_consistency" in types
     assert any(candidate.rag_checklist_refs == ["rag-1"] for candidate in candidates)
+
+
+def test_invariant_miner_builds_debuggable_proof_packets(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "School.sol").write_text(
+        "\n".join(
+            [
+                "pragma solidity ^0.8.20;",
+                "contract School {",
+                "    uint256 public cutOffScore;",
+                "    function start(uint256 score) external { cutOffScore = score; }",
+                "    function graduate() external { }",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ranges = map_function_ranges(RepoPathInput(repo_path=str(tmp_path)), {}).model_dump(mode="json")["ranges"]
+    candidates = mine_invariant_candidates(str(tmp_path), {"function_ranges": ranges, "contracts": [{"contract": "School"}]})
+
+    packets = build_invariant_proof_packets(candidates, {})
+
+    assert packets
+    configured = next(packet for packet in packets if packet.invariant_type == "configured_but_not_enforced")
+    assert configured.packet_id.startswith("proof-")
+    assert configured.proof_obligations
+    assert configured.source_evidence[0].file_path == "src/School.sol"

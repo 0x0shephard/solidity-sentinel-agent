@@ -4,7 +4,7 @@ from sentinel.config import Settings
 from sentinel.errors import ConfigurationError, NonRetryableExternalError
 from sentinel.llm.base import ToolDecision, ToolPlan
 from sentinel.llm.huggingface import HuggingFacePlanner
-from sentinel.llm.ollama import OllamaPlanner, extract_json_object
+from sentinel.llm.ollama import OllamaPlanner, extract_json_object, parse_research_refinement
 from sentinel.llm.provider import get_ollama_fallback_planner, get_planner, get_research_refiner
 
 
@@ -94,3 +94,15 @@ def test_tool_plan_schema():
     plan = ToolPlan(decisions=[ToolDecision(tool_name="repo.list_files", tool_input={"repo_path": "."}, rationale="inspect")])
 
     assert plan.decisions[0].tool_name == "repo.list_files"
+
+
+def test_research_refinement_parser_coerces_common_model_schema_drift():
+    refinement = parse_research_refinement(
+        '{"likely_impact":"impact","exploit_preconditions":"reachable",'
+        '"recommended_tests":"write a test","limitations":"needs setup","confidence_delta":1.5}'
+    )
+
+    assert refinement.exploit_preconditions == ["reachable"]
+    assert refinement.recommended_tests == ["write a test"]
+    assert refinement.limitations == ["needs setup"]
+    assert refinement.confidence_delta == 0.2

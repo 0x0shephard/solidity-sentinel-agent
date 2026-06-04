@@ -1,0 +1,37 @@
+{
+  "contest_fixture": true,
+  "minimum_expected_findings": 4,
+  "minimum_high_recall": 1.0,
+  "expected_findings": [
+    {
+      "vulnerability_class": "transaction_ordering",
+      "severity": "high",
+      "affected_file_contains": "OrderBook.sol",
+      "affected_function": "buyOrder"
+    },
+    {
+      "vulnerability_class": "transaction_ordering",
+      "severity": "high",
+      "affected_file_contains": "OrderBook.sol",
+      "affected_function": "amendSellOrder"
+    },
+    {
+      "vulnerability_class": "accounting_invariant",
+      "severity": "medium",
+      "affected_file_contains": "OrderBook.sol",
+      "affected_function": "buyOrder"
+    },
+    {
+      "vulnerability_class": "business_logic",
+      "severity": "medium",
+      "affected_file_contains": "OrderBook.sol",
+      "affected_function": "cancelSellOrder"
+    },
+    {
+      "vulnerability_class": "business_logic",
+      "severity": "medium",
+      "affected_file_contains": "OrderBook.sol",
+      "affected_function": "buyOrder"
+    }
+  ]
+}

@@ -9,6 +9,7 @@ Test/
 .venv/
 runs/
 data/rag/
+data/memory/
 __pycache__/
 .pytest_cache/
 *.egg-info/

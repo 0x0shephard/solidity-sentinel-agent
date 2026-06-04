@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 from sentinel.schemas.common import ArtifactRef, CompletedStep, PlanStep, ToolCallRecord
-from sentinel.schemas.invariants import InvariantCandidate, ProtocolModel
+from sentinel.schemas.invariants import AuditWorkingMemory, GapFindingCandidate, InvariantCandidate, InvariantProofPacket, ProtocolModel, ReasoningDisciplinePacket
 from sentinel.schemas.protocol_ir import ProtocolGraph, ProtocolIR
 from sentinel.schemas.rag import RAGContextBundle, RepoRAGProfile, TargetedRAGState
 from sentinel.schemas.report import Finding
@@ -37,6 +37,10 @@ class AuditState(TypedDict, total=False):
     protocol_ir: ProtocolIR | None
     protocol_graph: ProtocolGraph | None
     invariant_candidates: list[InvariantCandidate]
+    proof_packets: list[InvariantProofPacket]
+    reasoning_packets: list[ReasoningDisciplinePacket]
+    gap_candidates: list[GapFindingCandidate]
+    working_memory: AuditWorkingMemory | None
     analysis_completeness: dict
     hypotheses: list[VulnerabilityHypothesis]
     subgraph_results: list[ResearchSubgraphResult]
@@ -94,6 +98,10 @@ def initial_audit_state(run_id: str, repo: str, objective: str, run_dir: str) ->
         "protocol_ir": None,
         "protocol_graph": None,
         "invariant_candidates": [],
+        "proof_packets": [],
+        "reasoning_packets": [],
+        "gap_candidates": [],
+        "working_memory": None,
         "analysis_completeness": {},
         "hypotheses": [],
         "subgraph_results": [],

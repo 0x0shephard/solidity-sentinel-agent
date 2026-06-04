@@ -14,7 +14,7 @@ from sentinel.rag.store import HistoricalFindingStore
 from sentinel.rag.sync import sync_solodit
 from sentinel.rag.targeted import build_repo_rag_profile, build_targeted_rag, repo_profile_root
 from sentinel.schemas.common import SideEffect, ToolStatus
-from sentinel.schemas.invariants import InvariantCandidate
+from sentinel.schemas.invariants import GapFindingCandidate, InvariantCandidate
 from sentinel.schemas.rag import (
     HistoricalFindingMatch,
     HistoricalFindingQuery,
@@ -437,6 +437,14 @@ def _hypotheses_from_invariant_candidates(static_facts: list[dict]) -> list[Vuln
             ]
             if step
         ]
+        proof_obligations = [
+            step
+            for step in [
+                candidate.required_proof,
+                *candidate.validation_questions,
+            ]
+            if step
+        ]
         roots = [
             candidate.invariant_type,
             candidate.invariant_family or "",
@@ -460,12 +468,63 @@ def _hypotheses_from_invariant_candidates(static_facts: list[dict]) -> list[Vuln
                 recommended_validation=validation_steps,
                 source_detection_ids=list(dict.fromkeys([candidate.id, *candidate.detector_ids, *candidate.rag_checklist_refs])),
                 graph_slice_ids=candidate.graph_slice_ids,
+                proof_packet_id=candidate.proof_packet_id,
+                proof_obligations=proof_obligations,
+                counterevidence=[fact for fact in candidate.local_facts if "counter" in fact.lower()],
                 proof_status=candidate.proof_status,
                 exploit_precondition_terms=list(dict.fromkeys([*candidate.suspicious_terms, *(candidate.local_facts[:3])])),
                 suggested_rag_queries=[
                     f"{vulnerability_class} {candidate.invariant_type} {candidate.invariant_family or ''} {' '.join(candidate.suspicious_terms)}"
                 ],
                 status="needs_manual_review",
+            )
+        )
+    return hypotheses
+
+
+def _hypotheses_from_gap_candidates(static_facts: list[dict]) -> list[VulnerabilityHypothesis]:
+    hypotheses: list[VulnerabilityHypothesis] = []
+    raw_candidates = [
+        fact.get("gap_candidate")
+        for fact in static_facts
+        if isinstance(fact, dict) and fact.get("gap_candidate")
+    ]
+    for index, raw in enumerate(raw_candidates, start=1):
+        candidate = GapFindingCandidate.model_validate(raw)
+        evidence = candidate.evidence
+        if not evidence:
+            continue
+        affected_files = list(dict.fromkeys(item.file_path for item in evidence))
+        affected_functions = list(dict.fromkeys([*candidate.affected_functions, *(item.function_name for item in evidence if item.function_name)]))
+        status = "rejected" if candidate.status == "rejected" else "likely" if candidate.status == "likely" and candidate.adversarial_trace else "needs_manual_review"
+        proof_status = "rejected_by_counterevidence" if status == "rejected" else "strong_local_path" if status == "likely" else "setup_required"
+        hypotheses.append(
+            VulnerabilityHypothesis(
+                id=f"hyp-gap-{index}",
+                title=f"{candidate.agent_id.replace('_', ' ')}: {candidate.title}",
+                vulnerability_class=candidate.vulnerability_class,
+                affected_files=affected_files,
+                affected_functions=affected_functions,
+                evidence_summary="; ".join(candidate.adversarial_trace or [candidate.title]),
+                confidence=candidate.confidence,
+                affected_contract=evidence[0].contract_name,
+                affected_function=affected_functions[0] if affected_functions else evidence[0].function_name,
+                evidence_lines=evidence,
+                root_cause_terms=list(dict.fromkeys([candidate.gap_type, candidate.agent_id, candidate.validation_template, *candidate.affected_state_variables])),
+                recommended_validation=[
+                    *candidate.proof_obligations,
+                    f"Use validation template `{candidate.validation_template}`.",
+                    *candidate.adversarial_trace,
+                ],
+                source_detection_ids=[candidate.id, candidate.agent_id],
+                proof_obligations=candidate.proof_obligations,
+                counterevidence=candidate.counterevidence,
+                proof_status=proof_status,
+                exploit_precondition_terms=candidate.adversarial_trace,
+                suggested_rag_queries=[
+                    f"{candidate.vulnerability_class} {candidate.gap_type} {' '.join(candidate.affected_state_variables)} mempool slippage lifecycle"
+                ],
+                status=status,
             )
         )
     return hypotheses
@@ -621,6 +680,7 @@ def rank_hypotheses(inp: RankHypothesesInput, state) -> RankHypothesesOutput:
             hypotheses.append(hypothesis)
 
     hypotheses.extend(_hypotheses_from_invariant_candidates(inp.static_facts))
+    hypotheses.extend(_hypotheses_from_gap_candidates(inp.static_facts))
     hypotheses.extend(_profile_invariant_hypotheses(inp.static_facts))
 
     hypotheses = _dedupe_hypotheses(hypotheses)

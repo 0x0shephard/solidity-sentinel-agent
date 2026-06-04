@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 from sentinel.evidence import classify_source_path
+from sentinel.analysis.contest import build_transaction_race_graph
 from sentinel.schemas.protocol_ir import (
     AttackPathCandidate,
     AssetFlow,
@@ -29,6 +30,8 @@ ASSIGNMENT = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[[^\]]+\])?\s*(?:=|\+=|-=|\*=|/
 STATE_DECL = re.compile(r"^\s*(?:mapping\s*\([^;]+\)|[A-Za-z_]\w*(?:\[\])?)\s+(?:(public|private|internal|external)\s+)?([A-Za-z_]\w*)\s*(?:=|;)")
 CALL_EXPR = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(")
 INTERNAL_CALL = re.compile(r"(?<![.\w])([A-Za-z_]\w*)\s*\(")
+STORAGE_ALIAS = re.compile(r"\b[A-Za-z_]\w*(?:\s*\[[^\]]+\])?\s+storage\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*(?:\[|;|$)")
+MEMBER_ASSIGNMENT = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*(?:=|\+=|-=|\*=|/=|\+\+|--)")
 AUTH_TERMS = ("onlyOwner", "onlyRole", "hasRole", "owner", "admin", "msg.sender", "tx.origin", "_checkOwner")
 LIFECYCLE_TERMS = ("initialize", "start", "end", "pause", "unpause", "deposit", "withdraw", "claim", "mint", "burn", "upgrade")
 
@@ -44,6 +47,7 @@ def build_protocol_ir(repo_path: str, static_facts: dict) -> ProtocolIR:
         for item in static_facts.get("token_types", [])
         if item.get("symbol") and item.get("kind")
     }
+    storage_aliases_by_function: dict[tuple[str, str | None, str], dict[str, str]] = {}
 
     for path in _production_solidity_files(repo_path):
         rel = _relative(repo_path, path)
@@ -58,6 +62,8 @@ def build_protocol_ir(repo_path: str, static_facts: dict) -> ProtocolIR:
                 current_contract = contract_match.group(1)
                 inherits = [item.strip().split()[0] for item in (contract_match.group(2) or "").split(",") if item.strip()]
                 contracts_by_name.setdefault(current_contract, ContractIR(name=current_contract, file_path=rel, inherits=inherits))
+            if containing_function(ranges, rel, line_no):
+                continue
             modifier_match = re.search(r"\bmodifier\s+(\w+)", code)
             if modifier_match:
                 contract = _contract_for_line(contracts_by_name, rel, current_contract)
@@ -78,6 +84,8 @@ def build_protocol_ir(repo_path: str, static_facts: dict) -> ProtocolIR:
             scope = (rel, fn.contract_name)
             fn_lines = lines[fn.start_line - 1 : fn.end_line]
             body = "\n".join(_strip_comment(line) for line in fn_lines)
+            storage_aliases = _storage_aliases_for_body(body, state_vars_by_scope.get(scope, set()))
+            storage_aliases_by_function[(rel, fn.contract_name, fn.function_name)] = storage_aliases
             function_ir = FunctionIR(
                 name=fn.function_name,
                 contract_name=contract.name,
@@ -87,8 +95,8 @@ def build_protocol_ir(repo_path: str, static_facts: dict) -> ProtocolIR:
                 signature=fn.signature,
                 visibility=_visibility(fn.signature),
                 modifiers=_modifiers(fn.signature),
-                reads=_reads_for_body(body, state_vars_by_scope.get(scope, set())),
-                writes=_writes_for_body(body),
+                reads=_reads_for_body(body, state_vars_by_scope.get(scope, set()), storage_aliases),
+                writes=_writes_for_body(body, state_vars_by_scope.get(scope, set()), storage_aliases),
                 calls=_calls_for_body(body),
                 parameters=_parameters(fn.signature),
                 payable="payable" in fn.signature,
@@ -107,17 +115,19 @@ def build_protocol_ir(repo_path: str, static_facts: dict) -> ProtocolIR:
             contract_name = fn.contract_name if fn else _contract_at_line(contract_ranges_by_file.get(rel, []), line_no) or _contract_name_for_file(contracts_by_name, rel)
             function_name = fn.function_name if fn else None
             scope = (rel, contract_name)
-            ir.storage_accesses.extend(_storage_accesses(contract_name, function_name, rel, line_no, code, state_vars_by_scope.get(scope, set())))
+            storage_aliases = storage_aliases_by_function.get((rel, contract_name, function_name or ""), {})
+            ir.storage_accesses.extend(_storage_accesses(contract_name, function_name, rel, line_no, code, state_vars_by_scope.get(scope, set()), storage_aliases))
             ir.call_edges.extend(_call_edges(contract_name, function_name, rel, line_no, code, state_var_types_by_scope.get(scope, {})))
             ir.asset_flows.extend(_asset_flows(contract_name, function_name, rel, line_no, code, token_kinds))
             ir.auth_constraints.extend(_auth_constraints(contract_name, function_name, rel, line_no, code))
-            ir.lifecycle_transitions.extend(_lifecycle_transitions(contract_name, function_name, rel, line_no, code))
+            ir.lifecycle_transitions.extend(_lifecycle_transitions(contract_name, function_name, rel, line_no, code, state_vars_by_scope.get(scope, set())))
             ir.trust_boundaries.extend(_trust_boundaries(contract_name, function_name, rel, line_no, code))
 
     if not static_facts.get("slither_findings"):
         ir.completeness_gaps.append("Slither/AST-enriched call/dataflow was unavailable; Protocol IR was built from source/range/static facts.")
     if not ir.contracts:
         ir.completeness_gaps.append("No production contract declarations were extracted.")
+    ir.transaction_race_graph = build_transaction_race_graph(repo_path, ir)
     return ir
 
 
@@ -188,6 +198,8 @@ def protocol_ir_summary(ir: ProtocolIR) -> dict:
         "auth_constraints": len(ir.auth_constraints),
         "lifecycle_transitions": len(ir.lifecycle_transitions),
         "trust_boundaries": len(ir.trust_boundaries),
+        "transaction_actions": len(ir.transaction_race_graph.actions),
+        "transaction_race_edges": len(ir.transaction_race_graph.race_edges),
         "completeness_gaps": ir.completeness_gaps,
     }
 
@@ -302,13 +314,37 @@ def _parameters(signature: str) -> list[str]:
     return params
 
 
-def _writes_for_body(body: str) -> list[str]:
-    return [match.group(1) for match in ASSIGNMENT.finditer(body) if match.group(1) not in {"return", "if", "for", "while", "require"}]
+def _storage_aliases_for_body(body: str, state_vars: set[str]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for match in STORAGE_ALIAS.finditer(body):
+        alias, root = match.group(1), match.group(2)
+        if root in state_vars:
+            aliases[alias] = root
+    return aliases
 
 
-def _reads_for_body(body: str, state_vars: set[str]) -> list[str]:
+def _member_state_terms(body: str, storage_aliases: dict[str, str]) -> list[str]:
+    terms = []
+    for alias, member in re.findall(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\b", body):
+        root = storage_aliases.get(alias)
+        if root:
+            terms.append(f"{root}.{member}")
+    return list(dict.fromkeys(terms))
+
+
+def _writes_for_body(body: str, state_vars: set[str] | None = None, storage_aliases: dict[str, str] | None = None) -> list[str]:
+    names = [match.group(1) for match in ASSIGNMENT.finditer(body) if match.group(1) not in {"return", "if", "for", "while", "require"}]
+    aliases = storage_aliases or {}
+    member_writes = [f"{aliases[match.group(1)]}.{match.group(2)}" for match in MEMBER_ASSIGNMENT.finditer(body) if match.group(1) in aliases]
+    if state_vars is None:
+        return list(dict.fromkeys([*names, *member_writes]))
+    state_writes = [name for name in names if name in state_vars]
+    return list(dict.fromkeys([*state_writes, *member_writes]))
+
+
+def _reads_for_body(body: str, state_vars: set[str], storage_aliases: dict[str, str] | None = None) -> list[str]:
     words = set(re.findall(r"\b[A-Za-z_]\w*\b", body))
-    return sorted(words.intersection(state_vars))
+    return sorted(set(words.intersection(state_vars)).union(_member_state_terms(body, storage_aliases or {})))
 
 
 def _calls_for_body(body: str) -> list[str]:
@@ -320,7 +356,7 @@ def _calls_for_body(body: str) -> list[str]:
     return list(dict.fromkeys(calls))
 
 
-def _storage_accesses(contract: str | None, function: str | None, file_path: str, line: int, code: str, state_vars: set[str]) -> list[StorageAccess]:
+def _storage_accesses(contract: str | None, function: str | None, file_path: str, line: int, code: str, state_vars: set[str], storage_aliases: dict[str, str] | None = None) -> list[StorageAccess]:
     accesses = []
     writes = set(_writes_for_body(code))
     for name in sorted(state_vars.intersection(set(re.findall(r"\b[A-Za-z_]\w*\b", code)))):
@@ -331,6 +367,23 @@ def _storage_accesses(contract: str | None, function: str | None, file_path: str
                 function_name=function,
                 variable_name=name,
                 access="write" if is_write else "read",
+                file_path=file_path,
+                line=line,
+                expression=code,
+            )
+        )
+    aliases = storage_aliases or {}
+    for alias, member in re.findall(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\b", code):
+        root = aliases.get(alias)
+        if not root:
+            continue
+        variable_name = f"{root}.{member}"
+        accesses.append(
+            StorageAccess(
+                contract_name=contract,
+                function_name=function,
+                variable_name=variable_name,
+                access="write" if variable_name in _writes_for_body(code, state_vars, aliases) else "read",
                 file_path=file_path,
                 line=line,
                 expression=code,
@@ -402,11 +455,14 @@ def _auth_constraints(contract: str | None, function: str | None, file_path: str
     return [AuthConstraint(contract_name=contract, function_name=function, role=role, expression=code, file_path=file_path, line=line)]
 
 
-def _lifecycle_transitions(contract: str | None, function: str | None, file_path: str, line: int, code: str) -> list[LifecycleTransition]:
+def _lifecycle_transitions(contract: str | None, function: str | None, file_path: str, line: int, code: str, state_vars: set[str]) -> list[LifecycleTransition]:
     lower = f"{function or ''} {code}".lower()
     if not any(term in lower for term in LIFECYCLE_TERMS):
         return []
-    variables = [match.group(1) for match in ASSIGNMENT.finditer(code)]
+    variables = [match.group(1) for match in ASSIGNMENT.finditer(code) if match.group(1) in state_vars]
+    variables.extend(member for _alias, member in re.findall(r"\b([A-Za-z_]\w*)\s*\.\s*(isActive|active|deadline\w*)\s*=", code))
+    if not variables:
+        return []
     return [LifecycleTransition(contract_name=contract, function_name=function, transition=function or "state_transition", state_variables=variables, file_path=file_path, line=line, expression=code)]
 
 

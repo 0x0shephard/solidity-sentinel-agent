@@ -5,7 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from sentinel.evidence import classify_source_path
-from sentinel.schemas.invariants import InvariantCandidate, ProtocolModel
+from sentinel.schemas.invariants import InvariantCandidate, InvariantProofPacket, ProofObligation, ProtocolModel
 from sentinel.schemas.protocol_ir import GraphSlice, ProtocolGraph, ProtocolIR
 from sentinel.schemas.static import FunctionRange, SourceEvidence
 from sentinel.solidity.ranges import containing_function
@@ -92,13 +92,18 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
                 contract_name = contract_match.group(1) or contract_match.group(2)
             if _is_comment_or_empty(stripped):
                 continue
-            state_var = _state_variable_name(code)
+            fn = containing_function(ranges, rel, line_no)
+            state_var = None if fn else _state_variable_name(code)
             if contract_name and state_var:
                 contract_state_vars[contract_name].append(state_var)
             for name in _assigned_variables(code):
+                if contract_name and contract_state_vars.get(contract_name) and name not in contract_state_vars[contract_name]:
+                    continue
                 ev = _evidence(repo_path, ranges, rel, line_no, "state/accounting variable is written")
                 variable_writes[name].append(ev)
             for name in _guard_variables(code):
+                if contract_name and contract_state_vars.get(contract_name) and name not in contract_state_vars[contract_name]:
+                    continue
                 ev = _evidence(repo_path, ranges, rel, line_no, "variable participates in a guard or branch")
                 variable_reads[name].append(ev)
 
@@ -112,6 +117,10 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
                         ["percentage", "loop", "total payout", "precision"],
                         "percentage_distribution_math",
                         0.70,
+                        invariant_family="accounting conservation",
+                        required_proof="Show total distributed value across recipients cannot exceed available funds and does not omit a required divisor.",
+                        proof_status="strong_local_path",
+                        validation_questions=["Does the per-recipient payout need to be divided by the number of recipients?"],
                     )
                 )
             if _looks_like_upgrade_authorizer(code) and not _file_contains(lines, ("upgradeTo(", "upgradeToAndCall(")):
@@ -123,6 +132,10 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
                         ["upgrade authorization", "implementation lifecycle"],
                         "upgrade_authorization_without_upgrade",
                         0.66,
+                        invariant_family="upgrade flow correctness",
+                        required_proof="Show whether the upgrade authorization hook is reachable only through the intended proxy upgrade path.",
+                        proof_status="setup_required",
+                        validation_questions=["Does the code call `_authorizeUpgrade` directly instead of `upgradeTo`/`upgradeToAndCall`?"],
                     )
                 )
             if _looks_like_unbounded_loop(code):
@@ -134,6 +147,9 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
                         ["unbounded loop", "dynamic array", "gas griefing"],
                         "unbounded_loop_dos",
                         0.62,
+                        invariant_family="gas-bounded lifecycle/accounting",
+                        required_proof="Show attacker or normal protocol growth can make the loop exceed practical gas limits.",
+                        validation_questions=["Is the collection length externally growable or unbounded?"],
                     )
                 )
             if _looks_like_external_balance_trust(code):
@@ -145,6 +161,9 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
                         ["external state", "accounting trust", "reconciliation"],
                         "external_state_accounting_trust",
                         0.64,
+                        invariant_family="external-state accounting trust",
+                        required_proof="Show external reported state can influence local accounting without reconciliation.",
+                        validation_questions=["Is the external value reconciled against token balance deltas or trusted blindly?"],
                     )
                 )
 
@@ -152,6 +171,72 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
     candidates.extend(_checked_but_not_updated(variable_reads, variable_writes))
     candidates.extend(_storage_layout_candidates(contract_state_vars, files, repo_path, ranges))
     return _dedupe_candidates(candidates)[:12]
+
+
+def build_invariant_proof_packets(candidates: list[InvariantCandidate], static_facts: dict) -> list[InvariantProofPacket]:
+    protocol_graph = _protocol_graph_from_static_facts(static_facts)
+    slices_by_id = {item.slice_id: item for item in protocol_graph.slices} if protocol_graph else {}
+    packets: list[InvariantProofPacket] = []
+    for candidate in candidates:
+        candidate.proof_packet_id = candidate.proof_packet_id or f"proof-{candidate.id}"
+        related_slices = [slices_by_id[slice_id] for slice_id in candidate.graph_slice_ids if slice_id in slices_by_id]
+        counterevidence = list(candidate.validation_questions)
+        for graph_slice in related_slices:
+            counterevidence.extend(graph_slice.counterevidence)
+        obligations = _proof_obligations_for_candidate(candidate, related_slices)
+        packets.append(
+            InvariantProofPacket(
+                packet_id=candidate.proof_packet_id,
+                candidate_id=candidate.id,
+                invariant_type=candidate.invariant_type,
+                invariant_family=candidate.invariant_family or candidate.invariant_type,
+                title=candidate.description,
+                proof_status=candidate.proof_status,
+                confidence=candidate.confidence,
+                affected_contracts=candidate.affected_contracts,
+                affected_functions=candidate.affected_functions,
+                affected_state_variables=candidate.affected_state_variables,
+                graph_slice_ids=candidate.graph_slice_ids,
+                source_evidence=candidate.production_evidence,
+                local_facts=candidate.local_facts,
+                proof_obligations=obligations,
+                counterevidence=list(dict.fromkeys(item for item in counterevidence if item)),
+                rag_checklist_refs=candidate.rag_checklist_refs,
+                validation_template=candidate.recommended_validation_template,
+            )
+        )
+    return packets
+
+
+def _proof_obligations_for_candidate(candidate: InvariantCandidate, related_slices: list[GraphSlice]) -> list[ProofObligation]:
+    obligations: list[ProofObligation] = []
+    base_missing = []
+    if candidate.required_proof:
+        base_missing.append(candidate.required_proof)
+    for graph_slice in related_slices:
+        base_missing.extend(graph_slice.missing_proof)
+    obligations.append(
+        ProofObligation(
+            obligation_id=f"{candidate.id}-local-proof",
+            description="Tie the suspected invariant violation to concrete target-repo source lines.",
+            local_evidence=candidate.production_evidence,
+            missing_evidence=list(dict.fromkeys(base_missing or ["Collect a local proof path from entrypoint to violated state/asset effect."])),
+            negative_indicators=list(dict.fromkeys(item for graph_slice in related_slices for item in graph_slice.counterevidence)),
+            validation_question=(candidate.validation_questions[0] if candidate.validation_questions else None),
+        )
+    )
+    if candidate.rag_checklist_refs:
+        obligations.append(
+            ProofObligation(
+                obligation_id=f"{candidate.id}-rag-localization",
+                description="Use historical checklist context only after matching its required evidence locally.",
+                local_evidence=candidate.production_evidence[:3],
+                missing_evidence=["Verify Solodit analogy has the same root cause and exploit preconditions in this repo."],
+                negative_indicators=["Historical similarity is not proof of a local vulnerability."],
+                validation_question="Does the historical pattern share the same local root cause?",
+            )
+        )
+    return obligations
 
 
 def _protocol_ir_from_static_facts(static_facts: dict) -> ProtocolIR | None:
@@ -470,8 +555,9 @@ def _candidate(
     rag_checklist_refs: list[str] | None = None,
     local_facts: list[str] | None = None,
 ) -> InvariantCandidate:
+    candidate_id = f"inv-{invariant_type}-{evidence[0].file_path.replace('/', '-')}-{evidence[0].line_start}"
     return InvariantCandidate(
-        id=f"inv-{invariant_type}-{evidence[0].file_path.replace('/', '-')}-{evidence[0].line_start}",
+        id=candidate_id,
         invariant_type=invariant_type,
         invariant_family=invariant_family or invariant_type,
         description=description,
@@ -484,6 +570,7 @@ def _candidate(
         local_facts=[fact for fact in (local_facts or []) if fact],
         required_proof=required_proof,
         proof_status=proof_status,
+        proof_packet_id=f"proof-{candidate_id}",
         graph_slice_ids=graph_slice_ids or [],
         validation_questions=validation_questions or [],
         detector_ids=detector_ids or [],
@@ -555,7 +642,7 @@ def _configured_but_not_enforced(
     variable_reads: dict[str, list[SourceEvidence]],
 ) -> list[InvariantCandidate]:
     candidates = []
-    config_terms = ("limit", "cap", "threshold", "cutoff", "cut_off", "fee", "max", "min", "score")
+    config_terms = ("limit", "cap", "threshold", "cutoff", "cut_off", "max", "min", "score")
     for name, writes in variable_writes.items():
         lower = name.lower()
         if not any(term in lower for term in config_terms):
@@ -570,6 +657,10 @@ def _configured_but_not_enforced(
                 [name, "configured but not enforced", "missing guard"],
                 "configured_but_not_enforced",
                 0.72,
+                invariant_family="configuration-used-as-enforcement consistency",
+                required_proof="Show the configured value is never used in an enforcement guard on the affected lifecycle path.",
+                proof_status="strong_local_path",
+                validation_questions=[f"Can the protected action succeed even when `{name}` should block it?"],
             )
         )
     return candidates
@@ -594,6 +685,10 @@ def _checked_but_not_updated(
                 [name, "checked but not updated", "stale guard"],
                 "checked_but_never_updated",
                 0.68,
+                invariant_family="state update completeness",
+                required_proof="Show the checked counter/nonce/round value is not updated after the guarded action.",
+                proof_status="strong_local_path",
+                validation_questions=[f"Can repeated calls bypass the intended limit because `{name}` never changes?"],
             )
         )
     return candidates
@@ -627,6 +722,9 @@ def _storage_layout_candidates(
                     ["storage layout", "upgrade compatibility", left, right],
                     "storage_layout_mismatch",
                     0.60,
+                    invariant_family="storage layout compatibility",
+                    required_proof="Compare storage slots across related upgrade implementations.",
+                    validation_questions=["Can an upgrade reinterpret existing proxy storage incorrectly?"],
                 )
             )
     return candidates

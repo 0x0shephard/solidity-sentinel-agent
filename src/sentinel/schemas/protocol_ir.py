@@ -124,6 +124,62 @@ class TrustBoundary(BaseModel):
     source: SourceKind = "derived"
 
 
+class ActorModel(BaseModel):
+    actor_id: str
+    role: Literal["seller", "buyer", "owner", "admin", "keeper", "external_token", "mev_searcher", "inactive_user", "unknown"]
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+
+
+class UserIntent(BaseModel):
+    intent_id: str
+    actor_role: str
+    function_name: str
+    plain_english: str
+    assumed_state: list[str] = Field(default_factory=list)
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+
+
+class TransactionAction(BaseModel):
+    action_id: str
+    actor_role: str
+    function_name: str
+    file_path: str
+    line: int | None = None
+    mutates: list[str] = Field(default_factory=list)
+    reads: list[str] = Field(default_factory=list)
+    asset_effects: list[str] = Field(default_factory=list)
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+
+
+class TransactionRaceEdge(BaseModel):
+    edge_id: str
+    edge_type: Literal["can_front_run", "can_mutate_before", "can_cancel_before", "victim_assumes_state", "state_changes_between_submission_and_execution"]
+    from_action_id: str
+    to_action_id: str
+    affected_state: list[str] = Field(default_factory=list)
+    adversarial_trace: list[str] = Field(default_factory=list)
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class MutableStateAssumption(BaseModel):
+    assumption_id: str
+    victim_action_id: str
+    mutable_by_action_ids: list[str] = Field(default_factory=list)
+    state_variables: list[str] = Field(default_factory=list)
+    missing_bounds: list[str] = Field(default_factory=list)
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+
+
+class TransactionRaceGraph(BaseModel):
+    actors: list[ActorModel] = Field(default_factory=list)
+    intents: list[UserIntent] = Field(default_factory=list)
+    actions: list[TransactionAction] = Field(default_factory=list)
+    race_edges: list[TransactionRaceEdge] = Field(default_factory=list)
+    mutable_assumptions: list[MutableStateAssumption] = Field(default_factory=list)
+
+
 class ProtocolIR(BaseModel):
     repo_path: str
     contracts: list[ContractIR] = Field(default_factory=list)
@@ -133,6 +189,7 @@ class ProtocolIR(BaseModel):
     auth_constraints: list[AuthConstraint] = Field(default_factory=list)
     lifecycle_transitions: list[LifecycleTransition] = Field(default_factory=list)
     trust_boundaries: list[TrustBoundary] = Field(default_factory=list)
+    transaction_race_graph: TransactionRaceGraph = Field(default_factory=TransactionRaceGraph)
     completeness_gaps: list[str] = Field(default_factory=list)
     source: SourceKind = "derived"
 

@@ -169,3 +169,53 @@ def test_report_requires_local_evidence_and_separates_historical_context():
     assert "Historical Similar Findings" in markdown
     assert "not proof of a bug" in markdown
     assert "Delegatecall to user-controlled target" in markdown
+
+
+def test_report_renders_actor_model_and_demotes_blocking_counterevidence():
+    state = initial_audit_state("run-1", "./repo", "Find bugs", "runs/run-1")
+    state["last_outputs"]["analysis.contest_reasoning"] = {
+        "actor_model": [{"role": "buyer", "capabilities": ["fill active orders"], "evidence": [{"line_start": 10}]}],
+        "race_edges": [
+            {
+                "edge_id": "race-1",
+                "edge_type": "can_mutate_before",
+                "affected_state": ["orders.priceInUSDC"],
+                "adversarial_trace": ["Seller amends before buyer fill."],
+                "confidence": 0.86,
+            }
+        ],
+        "working_memory": {"benchmark_lessons": ["Mutable order terms require slippage or min/max bound reasoning."]},
+    }
+    state["hypotheses"] = [
+        VulnerabilityHypothesis(
+            id="hyp-1",
+            title="CEI-safe transfer",
+            vulnerability_class="business_logic",
+            affected_files=["src/OrderBook.sol"],
+            affected_functions=["buyOrder"],
+            evidence_summary="safe transfer",
+            confidence=0.7,
+            evidence_lines=[
+                SourceEvidence(
+                    file_path="src/OrderBook.sol",
+                    line_start=33,
+                    line_end=33,
+                    contract_name="OrderBook",
+                    function_name="buyOrder",
+                    source_text="order.isActive = false;",
+                    reason="state changed before SafeERC20 transfer",
+                )
+            ],
+            counterevidence=["CEI-safe SafeERC20-only candidate with no concrete secondary target"],
+            status="likely",
+        )
+    ]
+
+    state["findings"] = create_findings_from_state(state)
+    report = build_report_document(state)
+    markdown = render_markdown_report(report)
+
+    assert state["findings"][0].status == "rejected"
+    assert "## Actor / Intent Model" in markdown
+    assert "## Transaction Race Model" in markdown
+    assert "## Audit Memory Notes" in markdown

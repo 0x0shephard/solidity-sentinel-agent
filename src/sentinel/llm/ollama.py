@@ -29,6 +29,35 @@ def _ollama_client_kwargs(api_key: str | None) -> dict:
     return {"headers": {"Authorization": f"Bearer {api_key}"}}
 
 
+def coerce_research_refinement_payload(payload: dict) -> dict:
+    coerced = dict(payload)
+    for key in ("exploit_preconditions", "recommended_tests", "limitations"):
+        value = coerced.get(key)
+        if value is None:
+            coerced[key] = []
+        elif isinstance(value, str):
+            coerced[key] = [value]
+        elif isinstance(value, list):
+            coerced[key] = [str(item) for item in value if item is not None]
+        else:
+            coerced[key] = [str(value)]
+    if coerced.get("likely_impact") is not None:
+        coerced["likely_impact"] = str(coerced["likely_impact"])
+    try:
+        delta = float(coerced.get("confidence_delta", 0.0))
+    except (TypeError, ValueError):
+        delta = 0.0
+    coerced["confidence_delta"] = max(-0.2, min(0.2, delta))
+    return coerced
+
+
+def parse_research_refinement(content: str) -> ResearchRefinement:
+    payload = json.loads(extract_json_object(content))
+    if not isinstance(payload, dict):
+        raise NonRetryableExternalError("Research refinement JSON must be an object.")
+    return ResearchRefinement.model_validate(coerce_research_refinement_payload(payload))
+
+
 class OllamaPlanner(BasePlanner):
     def __init__(self, model: str, base_url: str, api_key: str | None = None, llm: ChatOllama | None = None) -> None:
         self.llm = llm or ChatOllama(
@@ -87,4 +116,4 @@ class OllamaResearchRefiner(BaseResearchRefiner):
             ]
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
-        return ResearchRefinement.model_validate_json(extract_json_object(content))
+        return parse_research_refinement(content)

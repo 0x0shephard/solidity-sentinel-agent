@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 import uuid
 
 from langgraph.graph import END, START, StateGraph
 
 from sentinel.artifacts import ensure_run_dir, write_json, write_text
-from sentinel.analysis.invariants import build_protocol_model as build_protocol_model_from_facts, mine_invariant_candidates
+from sentinel.analysis.contest import build_reasoning_packets, build_working_memory, run_gap_hunters
+from sentinel.analysis.invariants import build_invariant_proof_packets, build_protocol_model as build_protocol_model_from_facts, mine_invariant_candidates
 from sentinel.analysis.protocol_ir import build_protocol_graph, build_protocol_ir as build_protocol_ir_from_facts, protocol_ir_summary
 from sentinel.config import get_settings
 from sentinel.graphs.research import DEFAULT_RESEARCH_TOOLS, run_research_subgraph
@@ -17,7 +19,7 @@ from sentinel.observability.logging import log_event
 from sentinel.observability.tracing import trace_span
 from sentinel.rag.sync import sync_solodit
 from sentinel.reporting import build_report_document, create_findings_from_state, render_markdown_report
-from sentinel.schemas.common import CompletedStep, PlanStep
+from sentinel.schemas.common import ArtifactRef, CompletedStep, PlanStep
 from sentinel.schemas.research import VulnerabilityHypothesis
 from sentinel.state import AuditState, initial_audit_state, initial_research_state
 from sentinel.tools import build_default_registry
@@ -43,8 +45,24 @@ def _run_tool(state: AuditState, tool_name: str, raw_input: dict):
 
 
 def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: VulnerabilityHypothesis) -> list[dict]:
+    proof_packet = next((packet for packet in state.get("proof_packets", []) if packet.packet_id == hypothesis.proof_packet_id), None)
+    proof_snippets: list[dict] = []
+    if proof_packet:
+        proof_snippets.append(
+            {
+                "kind": "proof_packet",
+                "proof_packet_id": proof_packet.packet_id,
+                "invariant_type": proof_packet.invariant_type,
+                "proof_status": proof_packet.proof_status,
+                "text": proof_packet.title,
+                "message": "Protocol invariant proof packet",
+                "proof_obligations": [item.model_dump(mode="json") for item in proof_packet.proof_obligations],
+                "counterevidence": proof_packet.counterevidence,
+                "local_facts": proof_packet.local_facts,
+            }
+        )
     if hypothesis.evidence_lines:
-        return [
+        return (proof_snippets + [
             {
                 "kind": "source_evidence",
                 "file_path": item.file_path,
@@ -56,7 +74,7 @@ def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: Vulnerabili
                 "message": item.reason,
             }
             for item in hypothesis.evidence_lines
-        ][:8]
+        ])[:10]
     affected_files = set(hypothesis.affected_files)
     affected_functions = set(hypothesis.affected_functions)
     grouped_snippets: dict[str, list[dict]] = {}
@@ -112,7 +130,7 @@ def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: Vulnerabili
                 "text": hypothesis.evidence_summary,
             }
         )
-    return snippets[:8]
+    return (proof_snippets + snippets)[:10]
 
 
 def _tool_prompt(state: AuditState) -> str:
@@ -173,6 +191,32 @@ def _model_or_mapping_json(value) -> dict:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _persist_long_term_memory(state: AuditState) -> ArtifactRef | None:
+    working_memory = state.get("working_memory")
+    if not working_memory:
+        return None
+    memory_dir = Path("data") / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    path = memory_dir / "benchmark_lessons.jsonl"
+    lessons = getattr(working_memory, "benchmark_lessons", []) or []
+    if not lessons:
+        return None
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    with path.open("a", encoding="utf-8") as handle:
+        for lesson in lessons:
+            record = {
+                "run_id": state["run_id"],
+                "repo_path": state["repo_path"],
+                "lesson": lesson,
+                "created_at": datetime.now(UTC).isoformat(),
+                "advisory_only": True,
+            }
+            serialized = json.dumps(record, sort_keys=True)
+            if serialized not in existing:
+                handle.write(serialized + "\n")
+    return ArtifactRef(kind="long_term_memory", path=str(path), description="Gitignored advisory benchmark lessons persisted across runs.")
 
 
 def plan_with_llm(state: AuditState) -> AuditState:
@@ -358,6 +402,38 @@ def build_protocol_ir(state: AuditState) -> AuditState:
         "analysis.build_protocol_ir",
         f"Protocol IR: contracts={len(ir.contracts)}, slices={len(graph.slices)}, paths={len(graph.attack_paths)}, calls={len(ir.call_edges)}, asset_flows={len(ir.asset_flows)}",
     )
+    state["current_focus"] = "contest_reasoning"
+    return state
+
+
+def contest_reasoning(state: AuditState) -> AuditState:
+    ir = state.get("protocol_ir")
+    if not ir:
+        state.setdefault("warnings", []).append("Contest reasoning skipped because Protocol IR is unavailable.")
+        state["current_focus"] = "build_protocol_model"
+        return state
+    reasoning_packets = build_reasoning_packets(ir)
+    gap_candidates = run_gap_hunters(state["repo_path"], ir, reasoning_packets)
+    working_memory = build_working_memory(reasoning_packets, gap_candidates)
+    state["reasoning_packets"] = reasoning_packets
+    state["gap_candidates"] = gap_candidates
+    state["working_memory"] = working_memory
+    state.setdefault("static_facts", {})["reasoning_packets"] = [packet.model_dump(mode="json") for packet in reasoning_packets]
+    state.setdefault("static_facts", {})["gap_candidates"] = [candidate.model_dump(mode="json") for candidate in gap_candidates]
+    state.setdefault("static_facts", {})["working_memory"] = working_memory.model_dump(mode="json")
+    state["last_outputs"]["analysis.contest_reasoning"] = {
+        "status": "ok",
+        "actor_model": [actor.model_dump(mode="json") for actor in ir.transaction_race_graph.actors],
+        "race_edges": [edge.model_dump(mode="json") for edge in ir.transaction_race_graph.race_edges],
+        "reasoning_packets": [packet.model_dump(mode="json") for packet in reasoning_packets],
+        "gap_candidates": [candidate.model_dump(mode="json") for candidate in gap_candidates],
+        "working_memory": working_memory.model_dump(mode="json"),
+    }
+    _record_step(
+        state,
+        "analysis.contest_reasoning",
+        f"Contest reasoning: actors={len(ir.transaction_race_graph.actors)}, races={len(ir.transaction_race_graph.race_edges)}, gaps={len(gap_candidates)}",
+    )
     state["current_focus"] = "build_protocol_model"
     return state
 
@@ -375,12 +451,16 @@ def build_protocol_model(state: AuditState) -> AuditState:
 
 def mine_invariants(state: AuditState) -> AuditState:
     candidates = mine_invariant_candidates(state["repo_path"], state.get("static_facts", {}))
+    proof_packets = build_invariant_proof_packets(candidates, state.get("static_facts", {}))
     state["invariant_candidates"] = candidates
+    state["proof_packets"] = proof_packets
+    state.setdefault("static_facts", {})["proof_packets"] = [packet.model_dump(mode="json") for packet in proof_packets]
     state["last_outputs"]["analysis.mine_invariant_candidates"] = {
         "status": "ok",
         "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
+        "proof_packets": [packet.model_dump(mode="json") for packet in proof_packets],
     }
-    _record_step(state, "analysis.mine_invariant_candidates", f"Mined {len(candidates)} protocol invariant candidates")
+    _record_step(state, "analysis.mine_invariant_candidates", f"Mined {len(candidates)} protocol invariant candidates and {len(proof_packets)} proof packets")
     state["current_focus"] = "rank_hypotheses"
     return state
 
@@ -436,6 +516,10 @@ def rank_hypotheses(state: AuditState) -> AuditState:
                 *[
                     {"invariant_candidate": candidate.model_dump(mode="json")}
                     for candidate in state.get("invariant_candidates", [])
+                ],
+                *[
+                    {"gap_candidate": candidate.model_dump(mode="json")}
+                    for candidate in state.get("gap_candidates", [])
                 ],
                 _model_or_mapping_json(state.get("repo_rag_profile")),
                 {"protocol_ir": state["protocol_ir"].model_dump(mode="json")} if state.get("protocol_ir") else {},
@@ -533,6 +617,38 @@ def finish(state: AuditState) -> AuditState:
         _run_tool(state, "dynamic.generate_validation_artifacts", {"repo_path": repo_path})
     _run_tool(state, "dynamic.compile_validation_artifacts", {"repo_path": repo_path})
     _run_tool(state, "dynamic.run_validation_artifacts", {"repo_path": repo_path})
+    run_dir = Path(state["run_dir"])
+    if state.get("proof_packets"):
+        write_json(run_dir / "proof_packets.json", [packet.model_dump(mode="json") for packet in state["proof_packets"]])
+        state.setdefault("artifacts", []).append(
+            ArtifactRef(kind="proof_packets", path=str(run_dir / "proof_packets.json"), description="Invariant proof packets used for hypothesis ranking.")
+        )
+    if state.get("protocol_graph"):
+        write_json(run_dir / "protocol_graph.json", state["protocol_graph"].model_dump(mode="json"))
+        state.setdefault("artifacts", []).append(
+            ArtifactRef(kind="protocol_graph", path=str(run_dir / "protocol_graph.json"), description="Protocol graph slices and attack-path candidates.")
+        )
+    if state.get("working_memory"):
+        write_json(run_dir / "working_memory.json", state["working_memory"].model_dump(mode="json"))
+        state.setdefault("artifacts", []).append(
+            ArtifactRef(kind="working_memory", path=str(run_dir / "working_memory.json"), description="Short-term audit memory with summaries, assumptions, and lessons.")
+        )
+        memory_artifact = _persist_long_term_memory(state)
+        if memory_artifact:
+            state.setdefault("artifacts", []).append(memory_artifact)
+    if state.get("hypotheses"):
+        write_json(
+            run_dir / "candidate_rank_trace.json",
+            {
+                "hypotheses": [hypothesis.model_dump(mode="json") for hypothesis in state["hypotheses"]],
+                "invariant_candidates": [candidate.model_dump(mode="json") for candidate in state.get("invariant_candidates", [])],
+                "gap_candidates": [candidate.model_dump(mode="json") for candidate in state.get("gap_candidates", [])],
+                "reasoning_packets": [packet.model_dump(mode="json") for packet in state.get("reasoning_packets", [])],
+            },
+        )
+        state.setdefault("artifacts", []).append(
+            ArtifactRef(kind="candidate_rank_trace", path=str(run_dir / "candidate_rank_trace.json"), description="Hypothesis ranking and source candidate trace.")
+        )
     state["findings"] = create_findings_from_state(state)
     report = build_report_document(state)
     write_json(Path(state["run_dir"]) / "report.json", report.model_dump(mode="json"))
@@ -565,6 +681,7 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_node("detect_framework", detect_framework)
     graph.add_node("run_static_analysis", run_static_analysis)
     graph.add_node("build_protocol_ir", build_protocol_ir)
+    graph.add_node("contest_reasoning", contest_reasoning)
     graph.add_node("build_protocol_model", build_protocol_model)
     graph.add_node("mine_invariant_candidates", mine_invariants)
     graph.add_node("build_targeted_rag_context", build_targeted_rag_context)
@@ -581,7 +698,8 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_edge("inspect_repo", "detect_framework")
     graph.add_edge("detect_framework", "run_static_analysis")
     graph.add_edge("run_static_analysis", "build_protocol_ir")
-    graph.add_edge("build_protocol_ir", "build_protocol_model")
+    graph.add_edge("build_protocol_ir", "contest_reasoning")
+    graph.add_edge("contest_reasoning", "build_protocol_model")
     graph.add_edge("build_protocol_model", "build_targeted_rag_context")
     graph.add_edge("build_targeted_rag_context", "mine_invariant_candidates")
     graph.add_edge("mine_invariant_candidates", "rank_hypotheses")

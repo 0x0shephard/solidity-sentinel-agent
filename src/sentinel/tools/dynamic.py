@@ -76,8 +76,41 @@ def _constructor_arg_count(repo_path: str, target_file: str, target_contract: st
     return len([part for part in args.split(",") if part.strip()])
 
 
+def _constructor_args(repo_path: str, target_file: str, target_contract: str) -> list[str] | None:
+    source_path = Path(repo_path) / target_file
+    if not source_path.exists():
+        return None
+    text = source_path.read_text(encoding="utf-8", errors="replace")
+    contract_match = re.search(rf"\bcontract\s+{re.escape(target_contract)}\b", text)
+    start = contract_match.start() if contract_match else 0
+    match = re.search(r"\bconstructor\s*\(([^)]*)\)", text[start:], flags=re.DOTALL)
+    if not match:
+        return []
+    args = match.group(1).strip()
+    if not args:
+        return []
+    return [part.strip() for part in args.split(",") if part.strip()]
+
+
+def _is_orderbook_like_hypothesis(hypothesis: VulnerabilityHypothesis) -> bool:
+    functions = {name.lower() for name in hypothesis.affected_functions}
+    terms = {term.lower() for term in hypothesis.root_cause_terms}
+    if hypothesis.vulnerability_class == "transaction_ordering" and "buyorder" in functions:
+        return True
+    if hypothesis.vulnerability_class == "accounting_invariant" and "low_price_zero_fee_rounding" in terms:
+        return True
+    if hypothesis.vulnerability_class == "business_logic" and terms.intersection({"expired_order_non_seller_cancel", "expired_order_remains_active"}):
+        return True
+    return False
+
+
 def _can_generate_executable_validation(repo_path: str, hypothesis: VulnerabilityHypothesis) -> tuple[bool, str]:
     target_file, target_contract, _target_function = _target_details(hypothesis)
+    if _is_orderbook_like_hypothesis(hypothesis):
+        args = _constructor_args(repo_path, target_file, target_contract)
+        if args is not None and len(args) == 2 and all("IERC20" in arg or "ERC20" in arg for arg in args):
+            return True, "OrderBook-like constructor and affected functions were inferred; generating a contest-style executable validation scaffold."
+        return False, "OrderBook-like hypothesis detected, but constructor/setup inference was incomplete; emitting a proof plan instead."
     if hypothesis.vulnerability_class not in {"missing_access_control", "reentrancy"}:
         return False, "No safe generic executable template exists for this vulnerability class; emitting a proof plan instead."
     arg_count = _constructor_arg_count(repo_path, target_file, target_contract)
@@ -252,7 +285,106 @@ def _generic_validation_test(hypothesis: VulnerabilityHypothesis) -> str:
     )
 
 
+def _orderbook_like_validation_test(hypothesis: VulnerabilityHypothesis) -> str:
+    target_file, target_contract, _target_function = _target_details(hypothesis)
+    contract_name = re.sub(r"[^A-Za-z0-9_]", "", _artifact_test_name(hypothesis).replace(".t.sol", ""))
+    terms = {term.lower() for term in hypothesis.root_cause_terms}
+    if hypothesis.vulnerability_class == "transaction_ordering":
+        test_body = [
+            "        uint256 orderId = _createOrder(100, 1, block.timestamp + 1 days);",
+            "        book.amendSellOrder(orderId, 100, 10, block.timestamp + 1 days);",
+            "        buyerApprove(1_000_000);",
+            "        book.buyOrder(orderId);",
+            "        require(usdc.balanceOf(seller) == 1000, \"buyer filled amended price without max bound\");",
+        ]
+    elif "expired_order_non_seller_cancel" in terms:
+        test_body = [
+            "        uint256 orderId = _createOrder(100, 1, block.timestamp + 1);",
+            "        VM.warp(block.timestamp + 2);",
+            "        VM.prank(buyer);",
+            "        VM.expectRevert();",
+            "        book.cancelSellOrder(orderId);",
+            "        require(asset.balanceOf(address(book)) == 100, \"expired assets should still be stuck\");",
+        ]
+    elif "expired_order_remains_active" in terms:
+        test_body = [
+            "        uint256 orderId = _createOrder(100, 1, block.timestamp + 1);",
+            "        VM.warp(block.timestamp + 2);",
+            "        buyerApprove(1_000_000);",
+            "        VM.expectRevert();",
+            "        book.buyOrder(orderId);",
+            "        (,,,, bool active) = book.orders(orderId);",
+            "        require(active, \"expired order remains active after reverted fill\");",
+        ]
+    else:
+        test_body = [
+            "        uint256 orderId = _createOrder(1, 1, block.timestamp + 1 days);",
+            "        buyerApprove(1_000_000);",
+            "        book.buyOrder(orderId);",
+            "        require(book.totalFees() == 0, \"small order should demonstrate zero-fee rounding threshold\");",
+        ]
+    return "\n".join(
+        [
+            "// SPDX-License-Identifier: MIT",
+            "pragma solidity ^0.8.20;",
+            "",
+            f'import {{{target_contract}, IERC20}} from "../{target_file}";',
+            "",
+            "interface Vm {",
+            "    function prank(address msgSender) external;",
+            "    function expectRevert() external;",
+            "    function warp(uint256 newTimestamp) external;",
+            "}",
+            "",
+            "contract SentinelMockERC20 {",
+            "    mapping(address => uint256) public balanceOf;",
+            "    mapping(address => mapping(address => uint256)) public allowance;",
+            "    function mint(address to, uint256 amount) external { balanceOf[to] += amount; }",
+            "    function approve(address spender, uint256 amount) external returns (bool) { allowance[msg.sender][spender] = amount; return true; }",
+            "    function transfer(address to, uint256 amount) external returns (bool) { require(balanceOf[msg.sender] >= amount, \"balance\"); balanceOf[msg.sender] -= amount; balanceOf[to] += amount; return true; }",
+            "    function transferFrom(address from, address to, uint256 amount) external returns (bool) { require(balanceOf[from] >= amount, \"balance\"); require(allowance[from][msg.sender] >= amount, \"allowance\"); allowance[from][msg.sender] -= amount; balanceOf[from] -= amount; balanceOf[to] += amount; return true; }",
+            "}",
+            "",
+            f"contract {contract_name} {{",
+            '    Vm internal constant VM = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));',
+            "    address internal seller = address(0x51);",
+            "    address internal buyer = address(0xB0B);",
+            "    SentinelMockERC20 internal asset;",
+            "    SentinelMockERC20 internal usdc;",
+            f"    {target_contract} internal book;",
+            "",
+            "    function setUp() public {",
+            "        asset = new SentinelMockERC20();",
+            "        usdc = new SentinelMockERC20();",
+            f"        book = new {target_contract}(IERC20(address(asset)), IERC20(address(usdc)));",
+            "        asset.mint(seller, 1_000_000);",
+            "        usdc.mint(buyer, 1_000_000);",
+            "    }",
+            "",
+            "    function buyerApprove(uint256 amount) internal {",
+            "        VM.prank(buyer);",
+            "        usdc.approve(address(book), amount);",
+            "    }",
+            "",
+            "    function _createOrder(uint256 amount, uint256 price, uint256 deadline) internal returns (uint256 orderId) {",
+            "        VM.prank(seller);",
+            "        asset.approve(address(book), amount);",
+            "        VM.prank(seller);",
+            "        orderId = book.createSellOrder(amount, price, deadline);",
+            "    }",
+            "",
+            f"    function test_{hypothesis.vulnerability_class}_{(hypothesis.affected_functions or ['target'])[0]}() public {{",
+            *test_body,
+            "    }",
+            "}",
+            "",
+        ]
+    )
+
+
 def _validation_test_content(hypothesis: VulnerabilityHypothesis) -> str:
+    if _is_orderbook_like_hypothesis(hypothesis):
+        return _orderbook_like_validation_test(hypothesis)
     if hypothesis.vulnerability_class == "missing_access_control":
         return _missing_access_control_test(hypothesis)
     if hypothesis.vulnerability_class == "reentrancy":
@@ -279,7 +411,16 @@ def _validation_plan_content(hypothesis: VulnerabilityHypothesis) -> str:
         "storage_layout": "Compare storage layouts across versions and assert state variables retain slot/order compatibility.",
         "denial_of_service": "Exercise the largest realistic dynamic collection and assert gas/runtime remains bounded.",
         "external_call_before_accounting": "Use a callback receiver and assert state is updated before observable external interaction.",
+        "transaction_ordering": "Model two actors submitting transactions against shared mutable state; assert the victim's expected terms are bound by explicit min/max parameters or the transaction reverts.",
     }
+    template_by_validation = {
+        "mempool_order_race": "Construct a seller action that amends/cancels mutable order terms immediately before a buyer fill; assert the buyer cannot receive worse price/amount than their signed or parameterized intent.",
+        "low_price_zero_fee_rounding": "Compute the smallest successful order amount where `(value * fee) / precision` truncates to zero; assert fee accounting records the intended minimum fee or rejects the split order.",
+        "expired_order_non_seller_cancel": "Advance time beyond the deadline, use a non-seller cleanup actor, and assert expired funds can be released or inactive state is cleared.",
+        "expired_order_remains_active": "Advance time beyond deadline and call the fill path; assert expired state is marked inactive or a separate cleanup path exists.",
+        "mutable_state_assumption": "Show the observed off-chain state can change before execution, then bind the expected state with transaction inputs or reject stale execution.",
+    }
+    validation_template = next((term for term in hypothesis.root_cause_terms if term in template_by_validation), None)
     lines = [
         f"# Validation Plan: {hypothesis.title}",
         "",
@@ -292,7 +433,7 @@ def _validation_plan_content(hypothesis: VulnerabilityHypothesis) -> str:
         *evidence_lines,
         "",
         "## Validation Objective",
-        template_notes.get(hypothesis.vulnerability_class, "Build a project-specific proof-of-concept or regression test from the cited local evidence."),
+        template_by_validation.get(validation_template, template_notes.get(hypothesis.vulnerability_class, "Build a project-specific proof-of-concept or regression test from the cited local evidence.")),
         "",
         "## Suggested Checks",
         *[f"- {step}" for step in recommended],
@@ -512,7 +653,7 @@ def compile_validation_artifacts(inp: ValidationCompileInput, state) -> DynamicG
         return early_output
     assert worktree is not None
     run_dir = Path(state.get("run_dir", "runs/tmp"))
-    result = run_command(["forge", "build"], cwd=str(worktree), timeout=120)
+    result = run_command(["forge", "build", "--offline"], cwd=str(worktree), timeout=120)
     manifest_path = run_dir / "artifacts" / "validation-compile-result.json"
     manifest = {
         "command": result.command,
@@ -547,7 +688,7 @@ def run_validation_artifacts(inp: ValidationCompileInput, state) -> DynamicGener
     assert worktree is not None
     run_dir = Path(state.get("run_dir", "runs/tmp"))
     test_names = [_test_contract_name(path) for path in copied_tests]
-    result = run_command(["forge", "test", "--match-contract", "Sentinel"], cwd=str(worktree), timeout=120)
+    result = run_command(["forge", "test", "--offline", "--match-contract", "Sentinel"], cwd=str(worktree), timeout=120)
     classification = _classify_validation_run(result.return_code, result.stdout, result.stderr, result.timed_out)
     manifest_path = run_dir / "artifacts" / "validation-run-result.json"
     manifest = {

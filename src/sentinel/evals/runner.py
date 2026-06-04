@@ -9,7 +9,7 @@ from sentinel.evals.scoring import score_run
 from sentinel.graphs.parent import run_audit
 
 
-FIXTURES = ["missing-access-control", "unchecked-transfer", "reentrancy-toy", "astra-vault", "safe-vault-negative"]
+FIXTURES = ["missing-access-control", "unchecked-transfer", "reentrancy-toy", "astra-vault", "safe-vault-negative", "orderbook-contest"]
 
 
 def fixture_dir(name: str) -> Path:
@@ -44,6 +44,9 @@ def write_eval_summary(scores: list) -> Path:
             f"finding_recall={score.finding_recall:.2f}, "
             f"production_evidence={score.production_evidence_coverage:.2f}, "
             f"cross_contract_evidence={score.cross_contract_evidence_coverage:.2f}, "
+            f"high_recall={score.high_severity_recall:.2f}, "
+            f"race_coverage={score.transaction_race_coverage:.2f}, "
+            f"gap_agent_rate={score.gap_agent_contribution_rate:.2f}, "
             f"proof_success={score.proof_success_rate:.2f}, "
             f"rag_useful={score.rag_useful_context_rate:.2f}, "
             f"validation_compile={score.validation_artifacts_compile}, "
