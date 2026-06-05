@@ -5,11 +5,13 @@ from collections import defaultdict
 from sentinel.schemas.invariants import InvariantCandidate
 from sentinel.schemas.protocol_ir import (
     AssetCompatibilityPath,
+    CallEdge,
     CheckpointLookupIR,
     DocumentationClaim,
     FeeFormulaIR,
     LoopIR,
     ProtocolIR,
+    SemanticCallEdge,
     StatementIR,
 )
 from sentinel.schemas.static import SourceEvidence
@@ -58,7 +60,7 @@ def query_signature_uniqueness_threshold(ir: ProtocolIR) -> list[InvariantCandid
                 0.86,
                 affected_state_variables=["threshold", "signers"],
                 required_proof="Show the same valid signer/signature can appear more than once and satisfy the threshold.",
-                proof_status="strong_local_path",
+                proof_status="static_proof_complete",
                 validation_questions=["Does the loop insert recovered/declared signers into a seen set before accepting the next signature?"],
             )
         )
@@ -88,7 +90,7 @@ def query_checkpoint_boundary_mismatch(ir: ProtocolIR) -> list[InvariantCandidat
                 "checkpoint_boundary_mismatch",
                 0.84,
                 required_proof="Show the same timestamp/index can be included by one path and excluded by the paired accounting path.",
-                proof_status="strong_local_path",
+                proof_status="missing_counterevidence",
                 validation_questions=["Do claim and batch/report paths use the same inclusive/exclusive timestamp boundary?"],
             )
         )
@@ -105,6 +107,7 @@ def query_multi_report_fee_accrual(ir: ProtocolIR) -> list[InvariantCandidate]:
     ]
     if not report_loops or not fee_functions:
         return candidates
+    report_to_fee_path = _multi_report_fee_path(ir)
     evidence = [loop.evidence[0] for loop in report_loops[:2]]
     evidence.extend(formula.evidence[0] for formula in fee_functions[:3])
     candidates.append(
@@ -114,8 +117,9 @@ def query_multi_report_fee_accrual(ir: ProtocolIR) -> list[InvariantCandidate]:
             evidence,
             ["report loop", "fee accrual", "handleReport", "performance fee", "protocol fee"],
             "multi_report_fee_accrual",
-            0.78,
+            0.82 if report_to_fee_path else 0.58,
             required_proof="Show repeated report processing can compound or duplicate fee accrual against the same accounting base.",
+            proof_status="strong_local_path" if report_to_fee_path else "setup_required",
             validation_questions=["Is fee state updated inside every report iteration instead of once for the aggregate report period?"],
         )
     )
@@ -184,7 +188,11 @@ def query_boolean_policy_inversion(ir: ProtocolIR) -> list[InvariantCandidate]:
         lower = text.lower()
         if "cantransfer" not in lower and "whitelist" not in lower and "allowed" not in lower:
             continue
-        if "||!" not in lower and "&&!" not in lower and "revert" not in lower:
+        if any(term in lower for term in ["alreadyallowed", "notallowed", "unsupportedasset"]):
+            continue
+        has_or_bypass = "||" in lower and ("!" in lower or "true" in lower or "false" in lower)
+        has_inverted_doc_guard = "revert" in lower and any(term in lower for term in ["cantransfer", "whitelist"])
+        if not has_or_bypass and not has_inverted_doc_guard:
             continue
         matching_doc = next((doc for doc in docs if doc.file_path == statement.file_path), None)
         evidence = [_ev_from_statement(statement, "boolean policy guard may be inverted or bypassable")]
@@ -199,7 +207,7 @@ def query_boolean_policy_inversion(ir: ProtocolIR) -> list[InvariantCandidate]:
                 "boolean_policy_inversion",
                 0.80 if matching_doc else 0.70,
                 required_proof="Compare the documented policy to the concrete revert/allow condition on both sender and receiver.",
-                proof_status="strong_local_path" if matching_doc else "setup_required",
+                proof_status="strong_local_path" if matching_doc and has_or_bypass else "setup_required",
                 validation_questions=["Does the guard revert when the account is allowed or allow when one side is disallowed?"],
             )
         )
@@ -224,6 +232,7 @@ def query_native_asset_receive_mismatch(ir: ProtocolIR) -> list[InvariantCandida
                 "native_asset_receive_mismatch",
                 0.72,
                 required_proof="Show the receiver can be sent native ETH on this path and lacks receive/fallback compatibility.",
+                proof_status="missing_counterevidence" if path.receiver_contract else "setup_required",
                 validation_questions=["Does this contract ever configure the native asset while the receiver rejects ETH?"],
             )
         )
@@ -292,6 +301,58 @@ def _loops_by_function(ir: ProtocolIR) -> dict[tuple[str, str | None, str | None
     for loop in ir.loops:
         grouped[(loop.file_path, loop.contract_name, loop.function_name)].append(loop)
     return grouped
+
+
+def _multi_report_fee_path(ir: ProtocolIR) -> bool:
+    edges = [_edge_view(edge) for edge in ir.call_edges]
+    edges.extend(_semantic_edge_view(edge) for edge in ir.semantic_calls)
+    submit_to_vault = any(
+        edge["from_function"] == "submitReports"
+        and edge["callee"] == "handleReport"
+        and _mentions_any(edge, {"vault", "report"})
+        for edge in edges
+    )
+    vault_to_share_module = any(
+        edge["from_function"] == "handleReport"
+        and edge["callee"] == "handleReport"
+        and _mentions_any(edge, {"sharemodule", "share_module", "share"})
+        for edge in edges
+    )
+    share_to_fee_manager = any(
+        edge["from_function"] == "handleReport"
+        and edge["callee"] == "calculateFee"
+        and _mentions_any(edge, {"feemanager", "fee_manager", "fee"})
+        for edge in edges
+    )
+    return submit_to_vault and vault_to_share_module and share_to_fee_manager
+
+
+def _edge_view(edge: CallEdge) -> dict[str, str | None]:
+    return {
+        "from_contract": edge.from_contract,
+        "from_function": edge.from_function,
+        "to_contract": edge.to_contract,
+        "callee": edge.to_function,
+        "receiver_symbol": edge.receiver_symbol,
+        "expression": edge.expression,
+    }
+
+
+def _semantic_edge_view(edge: SemanticCallEdge) -> dict[str, str | None]:
+    return {
+        "from_contract": edge.contract_name,
+        "from_function": edge.function_name,
+        "to_contract": None,
+        "callee": edge.callee,
+        "receiver_symbol": edge.receiver_symbol,
+        "expression": edge.expression,
+    }
+
+
+def _mentions_any(edge: dict[str, str | None], terms: set[str]) -> bool:
+    text = " ".join(str(value or "") for value in edge.values()).replace(".", "").replace("_", "").lower()
+    normalized_terms = {term.replace("_", "").lower() for term in terms}
+    return any(term in text for term in normalized_terms)
 
 
 def _ev_from_statement(statement: StatementIR, reason: str) -> SourceEvidence:

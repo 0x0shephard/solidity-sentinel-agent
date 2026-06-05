@@ -61,6 +61,7 @@ class ReportDocument(BaseModel):
     objective: str
     repo_path: str
     findings: list[Finding] = Field(default_factory=list)
+    leads: list[Finding] = Field(default_factory=list)
     needs_manual_review: list[Finding] = Field(default_factory=list)
     suspicious_hypotheses: list[Finding] = Field(default_factory=list)
     rejected_hypotheses: list[Finding] = Field(default_factory=list)

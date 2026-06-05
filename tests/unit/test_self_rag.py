@@ -124,6 +124,19 @@ def test_critique_rejects_irrelevant_and_accepts_shared_root_cause():
     assert output.critiques[1].safe_to_cite is False
 
 
+def test_critique_rejects_same_class_without_shared_root_cause_or_precondition():
+    hyp = _hypothesis()
+    generic = _match("generic", 0.6)
+    generic.finding.root_cause_terms = ["vault accounting"]
+    generic.finding.search_text = "vault accounting mismatch unrelated to user hooks"
+    generic.matched_terms = []
+
+    output = critique_historical_matches(CritiqueHistoricalMatchesInput(hypothesis=hyp, matches=[generic]), {})
+
+    assert output.critiques[0].safe_to_cite is False
+    assert "no explicit root-cause term overlap" in output.critiques[0].important_differences
+
+
 def test_rag_bundle_keeps_only_safe_matches():
     hyp = _hypothesis()
     critiques = critique_historical_matches(CritiqueHistoricalMatchesInput(hypothesis=hyp, matches=[_match("rel", 0.4)]), {}).critiques

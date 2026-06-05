@@ -193,6 +193,32 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
 
     research_by_hypothesis = {result.hypothesis_id: result for result in subgraph_results}
     for hypothesis in hypotheses:
+        if _is_profile_lead(hypothesis):
+            evidence = _evidence_from_hypothesis(hypothesis)
+            findings.append(
+                Finding(
+                    id=hypothesis.id.replace("hyp", "lead"),
+                    title=hypothesis.title,
+                    severity="info",
+                    confidence=min(hypothesis.confidence, 0.45),
+                    vulnerability_class=hypothesis.vulnerability_class,
+                    summary=hypothesis.evidence_summary,
+                    affected_files=hypothesis.affected_files,
+                    affected_functions=hypothesis.affected_functions,
+                    evidence=evidence,
+                    reproduction_steps=hypothesis.recommended_validation,
+                    recommendation="Treat this as a profile-derived lead until a non-profile detector, invariant proof, or validation artifact supplies local primary evidence.",
+                    limitations=["Repo-profile lead: not promoted to manual review or findings without non-profile local evidence."],
+                    historical_matches=[],
+                    graph_slice_ids=hypothesis.graph_slice_ids,
+                    proof_packet_id=hypothesis.proof_packet_id,
+                    proof_obligations=hypothesis.proof_obligations,
+                    counterevidence=hypothesis.counterevidence,
+                    proof_status=hypothesis.proof_status,
+                    status="lead",
+                )
+            )
+            continue
         research = research_by_hypothesis.get(hypothesis.id)
         evidence = _evidence_from_research(hypothesis, research) or _evidence_from_hypothesis(hypothesis)
         local_evidence = [item for item in evidence if item.file_path and item.line_start]
@@ -202,7 +228,13 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
         status = research.finding_status if research else hypothesis.status
         gated_status, gating_limitations = _status_with_evidence_gate(status, local_evidence)
         gated_status, counterevidence_limitations = _status_with_counterevidence_gate(gated_status, hypothesis, research)
-        limitations = [*(research.limitations if research else ["Generated before research subgraph refinement."]), *gating_limitations, *counterevidence_limitations]
+        limitations = [
+            *(research.limitations if research else ["Generated before research subgraph refinement."]),
+            *_proof_gate_limitations(hypothesis, research),
+            *_rag_quality_limitations(state, hypothesis.id),
+            *gating_limitations,
+            *counterevidence_limitations,
+        ]
         findings.append(
             Finding(
                 id=hypothesis.id.replace("hyp", "finding"),
@@ -229,6 +261,33 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
     return findings
 
 
+def _is_profile_lead(hypothesis) -> bool:
+    sources = [str(source).lower() for source in getattr(hypothesis, "source_detection_ids", [])]
+    has_profile = any(source.startswith("repo-profile:") for source in sources)
+    has_non_profile = any(not source.startswith("repo-profile:") for source in sources)
+    return has_profile and not has_non_profile
+
+
+def _proof_gate_limitations(hypothesis, research) -> list[str]:
+    if hypothesis.proof_status == "static_proof_complete":
+        return ["Proof gate: complete static proof is available from local source evidence."]
+    if research and research.finding_status == "confirmed":
+        return ["Proof gate: confirmed by research/validation evidence."]
+    if hypothesis.proof_status in {"setup_required", "missing_counterevidence"}:
+        return [f"Proof gate: {hypothesis.proof_status}; this cannot be confirmed without executable validation or complete static proof."]
+    return [f"Proof gate: {hypothesis.proof_status}."]
+
+
+def _rag_quality_limitations(state: AuditState, hypothesis_id: str) -> list[str]:
+    bundle = state.get("rag_context_bundles", {}).get(hypothesis_id)
+    if not bundle:
+        return []
+    quality = getattr(bundle, "quality_grade", None)
+    grade = getattr(quality, "grade", None)
+    safe_count = len(getattr(bundle, "safe_matches", []) or [])
+    return [f"RAG quality: grade={grade or 'unknown'}, safe_matches={safe_count}; historical context is not proof."]
+
+
 def build_report_document(state: AuditState) -> ReportDocument:
     contest = state.get("last_outputs", {}).get("analysis.contest_reasoning", {})
     return ReportDocument(
@@ -236,6 +295,7 @@ def build_report_document(state: AuditState) -> ReportDocument:
         objective=state["objective"],
         repo_path=state["repo_path"],
         findings=[finding for finding in state.get("findings", []) if finding.status in {"confirmed", "likely"}],
+        leads=[finding for finding in state.get("findings", []) if finding.status == "lead"],
         needs_manual_review=[finding for finding in state.get("findings", []) if finding.status == "needs_manual_review"],
         suspicious_hypotheses=[finding for finding in state.get("findings", []) if finding.status == "suspicious"],
         rejected_hypotheses=[finding for finding in state.get("findings", []) if finding.status == "rejected"],
@@ -243,11 +303,29 @@ def build_report_document(state: AuditState) -> ReportDocument:
         actor_model=contest.get("actor_model", []),
         transaction_race_edges=contest.get("race_edges", []),
         reasoning_packets=contest.get("reasoning_packets", [])[:20],
-        working_memory=contest.get("working_memory", {}),
+        working_memory=_filtered_report_memory(contest.get("working_memory", {}), contest),
         artifacts=state.get("artifacts", []),
         tool_call_count=state.get("tool_call_count", 0),
         subgraphs_spawned=len(state.get("subgraph_results", [])),
     )
+
+
+def _filtered_report_memory(memory: dict, contest: dict | None = None) -> dict:
+    if not isinstance(memory, dict):
+        return {}
+    filtered = dict(memory)
+    contest = contest or {}
+    has_market_context = bool(contest.get("race_edges")) or any(
+        actor.get("role") in {"seller", "buyer", "mev_searcher"} for actor in contest.get("actor_model", []) if isinstance(actor, dict)
+    )
+    lessons = []
+    for lesson in filtered.get("benchmark_lessons", [])[:5]:
+        lower = str(lesson).lower()
+        if not has_market_context and ("mutable order terms" in lower or "expired-but-active" in lower):
+            continue
+        lessons.append(lesson)
+    filtered["benchmark_lessons"] = lessons
+    return filtered
 
 
 def render_markdown_report(report: ReportDocument) -> str:
@@ -304,7 +382,7 @@ def render_markdown_report(report: ReportDocument) -> str:
             for lesson in lessons:
                 lines.append(f"- {lesson}")
             lines.append("")
-    if not report.findings and not report.needs_manual_review and not report.suspicious_hypotheses and not report.rejected_hypotheses:
+    if not report.findings and not report.leads and not report.needs_manual_review and not report.suspicious_hypotheses and not report.rejected_hypotheses:
         lines.append("No findings were generated.")
         return "\n".join(lines) + "\n"
 
@@ -370,6 +448,7 @@ def render_markdown_report(report: ReportDocument) -> str:
             lines.append("")
 
     render_finding_group("Findings", report.findings)
+    render_finding_group("Leads", report.leads)
     render_finding_group("Needs Manual Review", report.needs_manual_review)
     render_finding_group("Suspicious Hypotheses", report.suspicious_hypotheses)
     render_finding_group("Rejected Hypotheses", report.rejected_hypotheses)

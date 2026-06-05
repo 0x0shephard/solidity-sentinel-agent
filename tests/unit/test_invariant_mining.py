@@ -242,7 +242,7 @@ def test_semantic_invariant_miner_finds_signature_and_checkpoint_classes(tmp_pat
     assert "signature_threshold_uniqueness" in types
     assert "checkpoint_boundary_mismatch" in types
     signature = next(candidate for candidate in candidates if candidate.invariant_type == "signature_threshold_uniqueness")
-    assert signature.proof_status == "strong_local_path"
+    assert signature.proof_status == "static_proof_complete"
     assert signature.detector_ids == ["semantic.signature_threshold_uniqueness"]
 
 
@@ -278,6 +278,84 @@ def test_semantic_invariant_miner_finds_fee_formula_and_policy_inversion(tmp_pat
 
     assert "fee_formula_dimension_mismatch" in types
     assert "boolean_policy_inversion" in types
+
+
+def test_multi_report_fee_accrual_requires_real_call_path(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "Managers.sol").write_text(
+        "\n".join(
+            [
+                "pragma solidity ^0.8.20;",
+                "contract FeeManager {",
+                "    uint256 public performanceFeeD6;",
+                "    function calculateFee(uint256 priceD18, uint256 totalShares) external view returns (uint256) {",
+                "        return (priceD18 * performanceFeeD6 * totalShares) / 1e24;",
+                "    }",
+                "}",
+                "contract Oracle {",
+                "    function submitReports(uint256[] calldata reports) external {",
+                "        for (uint256 i = 0; i < reports.length; i++) {",
+                "            handleReport(reports[i]);",
+                "        }",
+                "    }",
+                "    function handleReport(uint256 report) internal {}",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ranges = map_function_ranges(RepoPathInput(repo_path=str(tmp_path)), {}).model_dump(mode="json")["ranges"]
+    ir = build_protocol_ir(str(tmp_path), {"function_ranges": ranges})
+
+    candidates = mine_invariant_candidates(str(tmp_path), {"function_ranges": ranges, "protocol_ir": ir.model_dump(mode="json")})
+    candidate = next(candidate for candidate in candidates if candidate.invariant_type == "multi_report_fee_accrual")
+
+    assert candidate.proof_status == "setup_required"
+    assert candidate.confidence < 0.7
+
+
+def test_multi_report_fee_accrual_strong_only_with_report_share_fee_path(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "Managers.sol").write_text(
+        "\n".join(
+            [
+                "pragma solidity ^0.8.20;",
+                "contract FeeManager {",
+                "    uint256 public performanceFeeD6;",
+                "    function calculateFee(uint256 priceD18, uint256 totalShares) external view returns (uint256) {",
+                "        return (priceD18 * performanceFeeD6 * totalShares) / 1e24;",
+                "    }",
+                "}",
+                "contract ShareModule {",
+                "    FeeManager public feeManager;",
+                "    function handleReport(uint256 report) external { feeManager.calculateFee(report, 1e18); }",
+                "}",
+                "contract Vault {",
+                "    ShareModule public shareModule;",
+                "    function handleReport(uint256 report) external { shareModule.handleReport(report); }",
+                "}",
+                "contract Oracle {",
+                "    Vault public vault;",
+                "    function submitReports(uint256[] calldata reports) external {",
+                "        for (uint256 i = 0; i < reports.length; i++) {",
+                "            vault.handleReport(reports[i]);",
+                "        }",
+                "    }",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ranges = map_function_ranges(RepoPathInput(repo_path=str(tmp_path)), {}).model_dump(mode="json")["ranges"]
+    ir = build_protocol_ir(str(tmp_path), {"function_ranges": ranges})
+
+    candidates = mine_invariant_candidates(str(tmp_path), {"function_ranges": ranges, "protocol_ir": ir.model_dump(mode="json")})
+    candidate = next(candidate for candidate in candidates if candidate.invariant_type == "multi_report_fee_accrual")
+
+    assert candidate.proof_status == "strong_local_path"
+    assert candidate.confidence >= 0.8
 
 
 def test_rank_hypotheses_prioritizes_semantic_candidates_over_detector_only():

@@ -76,7 +76,7 @@ class OllamaPlanner(BasePlanner):
                     content=(
                         "You are Solidity Sentinel's planner. Return only JSON. "
                         "Use exactly this schema: "
-                        '{"decisions":[{"tool_name":"repo.list_files","tool_input":{"repo_path":"..."},"rationale":"why"}]}. '
+                        '{"decisions":[{"tool_name":"repo.list_files","tool_input":{"repo_path":"..."},"rationale":"why"}],"stop":false}. '
                         "Choose only from the provided tool catalog. Respect side effects, schemas, and chaining hints."
                     )
                 ),

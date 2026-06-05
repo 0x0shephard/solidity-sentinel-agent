@@ -944,17 +944,21 @@ def merge_rag_results(inp: MergeRAGResultsInput, state) -> MergeRAGResultsOutput
 
 
 def _root_overlap(hypothesis: VulnerabilityHypothesis, match: HistoricalFindingMatch) -> set[str]:
-    hyp_terms = {term.lower() for term in hypothesis.root_cause_terms + [hypothesis.vulnerability_class] if term}
-    finding_terms = {term.lower() for term in match.finding.root_cause_terms + [match.finding.vulnerability_class] if term}
+    hyp_terms = {term.lower() for term in hypothesis.root_cause_terms if term}
+    finding_terms = {term.lower() for term in match.finding.root_cause_terms if term}
     matched_terms = {term.lower() for term in match.matched_terms if term}
     return hyp_terms.intersection(finding_terms.union(matched_terms))
+
+
+def _same_vulnerability_class(hypothesis: VulnerabilityHypothesis, match: HistoricalFindingMatch) -> bool:
+    return bool(match.finding.vulnerability_class and match.finding.vulnerability_class == hypothesis.vulnerability_class)
 
 
 def grade_retrieval_quality(inp: RetrievalGradeInput, state) -> RetrievalGradeOutput:
     if not inp.matches:
         grade = RetrievalQualityGrade(grade="bad", score=0.0, reason="No historical matches returned.", repair_hint="Use root-cause and source-code terms.")
         return RetrievalGradeOutput(status=ToolStatus.OK, grade=grade)
-    strong = [match for match in inp.matches if match.final_score >= 0.30 and _root_overlap(inp.hypothesis, match)]
+    strong = [match for match in inp.matches if match.final_score >= 0.30 and _same_vulnerability_class(inp.hypothesis, match) and _root_overlap(inp.hypothesis, match)]
     weak = [match for match in inp.matches if match.final_score >= 0.18]
     if len(strong) >= 2:
         score = min(1.0, sum(match.final_score for match in strong[:3]) / 3)
@@ -1001,13 +1005,17 @@ def critique_historical_matches(inp: CritiqueHistoricalMatchesInput, state) -> C
         overlap = _root_overlap(inp.hypothesis, match)
         haystack = f"{match.finding.title} {match.finding.summary or ''} {match.finding.search_text[:2000]}".lower()
         shared_preconditions = bool(preconditions and any(term in haystack for term in preconditions))
-        same_class = match.finding.vulnerability_class == inp.hypothesis.vulnerability_class
-        safe = bool(overlap or shared_preconditions or (same_class and match.final_score >= 0.30))
+        same_class = _same_vulnerability_class(inp.hypothesis, match)
+        safe = bool(same_class and match.final_score >= 0.25 and (overlap or shared_preconditions))
         differences = []
         if not same_class:
             differences.append(f"class differs: {match.finding.vulnerability_class}")
         if not overlap:
             differences.append("no explicit root-cause term overlap")
+        if not shared_preconditions:
+            differences.append("no shared exploit precondition")
+        if match.final_score < 0.25:
+            differences.append("retrieval score below citation threshold")
         critiques.append(
             HistoricalMatchCritique(
                 match=match,

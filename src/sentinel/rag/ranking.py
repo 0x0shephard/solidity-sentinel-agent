@@ -8,7 +8,16 @@ from sentinel.schemas.rag import HistoricalFinding, HistoricalFindingMatch, Hist
 
 
 def _terms(text: str) -> set[str]:
-    return {term.lower() for term in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", text)}
+    terms = {term.lower() for term in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", text)}
+    if terms.intersection({"lowerlookup", "lower", "lookup"}):
+        terms.add("lowerlookup")
+    if terms.intersection({"upperlookup", "upperlookuprecent", "upper", "latest"}):
+        terms.add("upperlookup")
+    if terms.intersection({"handlereport", "reports", "report"}):
+        terms.add("handlereport")
+    if terms.intersection({"cantransfer", "whitelist", "allow", "allowed"}):
+        terms.add("cantransfer")
+    return terms
 
 
 def keyword_score(query_terms: set[str], finding: HistoricalFinding) -> tuple[float, list[str]]:
@@ -36,12 +45,13 @@ def pattern_intent_score(query_terms: set[str], finding: HistoricalFinding) -> f
     pattern_groups = [
         {"signature", "threshold", "signer", "duplicate", "uniqueness"},
         {"checkpoint", "lowerlookup", "upperlookup", "batch", "claim", "eligibility"},
+        {"checkpoint", "boundary", "latest", "eligible", "index", "batch"},
         {"fee", "formula", "dimension", "shares", "assets", "d6", "d18"},
         {"report", "accrual", "handlereport", "performance", "protocol"},
         {"native", "receive", "fallback", "transfer"},
         {"whitelist", "cantransfer", "boolean", "inversion"},
         {"lockup", "transfer", "bypass", "shares"},
-        {"index", "lookup", "tree", "off", "one"},
+        {"index", "lookup", "tree", "off", "one", "fenwick", "cancel"},
     ]
     finding_terms = _terms(f"{finding.title} {finding.summary or ''} {' '.join(finding.root_cause_terms)} {finding.search_text[:6000]}")
     best = 0.0

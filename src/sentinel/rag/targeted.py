@@ -400,7 +400,56 @@ def _select_from_global(settings: Settings, profile: RepoRAGProfile, limit: int 
             selected[match.finding.id] = match.finding
             if len(selected) >= limit:
                 return list(selected.values())
+        for finding in _lexical_candidates(global_findings, query, limit=20):
+            selected[finding.id] = finding
+            if len(selected) >= limit:
+                return list(selected.values())
     return list(selected.values())
+
+
+def _lexical_candidates(findings: list[HistoricalFinding], query: HistoricalFindingQuery, limit: int = 20) -> list[HistoricalFinding]:
+    query_terms = _lexical_terms(" ".join([query.query, query.vulnerability_class or "", " ".join(query.tags), " ".join(query.protocol_hints)]))
+    if not query_terms:
+        return []
+    scored: list[tuple[float, HistoricalFinding]] = []
+    for finding in findings:
+        text = " ".join(
+            [
+                finding.title,
+                finding.summary or "",
+                " ".join(finding.tags),
+                " ".join(finding.root_cause_terms),
+                " ".join(finding.protocol_categories),
+                finding.search_text[:6000],
+            ]
+        )
+        finding_terms = _lexical_terms(text)
+        exact_hits = query_terms.intersection(finding_terms)
+        if not exact_hits:
+            continue
+        score = len(exact_hits) / max(5, len(query_terms))
+        if any(term in exact_hits for term in {"checkpoint", "lowerlookup", "upperlookup", "fee", "native", "fallback", "fenwick", "lockup"}):
+            score += 0.15
+        if query.vulnerability_class and query.vulnerability_class == finding.vulnerability_class:
+            score += 0.10
+        if score >= 0.12:
+            scored.append((score, finding))
+    return [finding for _score, finding in sorted(scored, key=lambda item: item[0], reverse=True)[:limit]]
+
+
+def _lexical_terms(text: str) -> set[str]:
+    terms = {term.lower() for term in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text)}
+    aliases = {
+        "lowerlookup": {"lowerlookup", "lower", "lookup"},
+        "upperlookup": {"upperlookup", "upperlookuprecent", "upper", "latest"},
+        "handlereport": {"handlereport", "report", "reports"},
+        "cantransfer": {"cantransfer", "transfer", "whitelist", "allow"},
+    }
+    expanded = set(terms)
+    for key, values in aliases.items():
+        if terms.intersection(values):
+            expanded.add(key)
+    return expanded
 
 
 def build_targeted_rag(repo_path: str, static_facts: dict[str, Any], settings: Settings | None = None) -> TargetedRAGState:

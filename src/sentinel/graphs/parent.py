@@ -61,8 +61,9 @@ def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: Vulnerabili
                 "local_facts": proof_packet.local_facts,
             }
         )
+    function_snippets = _function_body_snippets_for_hypothesis(state, hypothesis)
     if hypothesis.evidence_lines:
-        return (proof_snippets + [
+        return (proof_snippets + function_snippets + [
             {
                 "kind": "source_evidence",
                 "file_path": item.file_path,
@@ -74,7 +75,7 @@ def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: Vulnerabili
                 "message": item.reason,
             }
             for item in hypothesis.evidence_lines
-        ])[:10]
+        ])[:12]
     affected_files = set(hypothesis.affected_files)
     affected_functions = set(hypothesis.affected_functions)
     grouped_snippets: dict[str, list[dict]] = {}
@@ -130,7 +131,70 @@ def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: Vulnerabili
                 "text": hypothesis.evidence_summary,
             }
         )
-    return (proof_snippets + snippets)[:10]
+    return (proof_snippets + function_snippets + snippets)[:12]
+
+
+def _function_body_snippets_for_hypothesis(state: AuditState, hypothesis: VulnerabilityHypothesis) -> list[dict]:
+    repo_path = Path(state.get("repo_path", ""))
+    ranges = state.get("static_facts", {}).get("function_ranges", [])
+    if not repo_path or not ranges:
+        return []
+
+    desired_files = {item.file_path for item in hypothesis.evidence_lines if item.file_path}
+    desired_files.update(hypothesis.affected_files)
+    desired_functions = {item.function_name for item in hypothesis.evidence_lines if item.function_name}
+    desired_functions.update(hypothesis.affected_functions)
+    desired_contracts = {item.contract_name for item in hypothesis.evidence_lines if item.contract_name}
+    if hypothesis.affected_contract:
+        desired_contracts.add(hypothesis.affected_contract)
+
+    snippets: list[dict] = []
+    seen: set[tuple[str, str | None, int | None]] = set()
+    used_chars = 0
+    for raw_range in ranges:
+        if not isinstance(raw_range, dict):
+            continue
+        file_path = str(raw_range.get("file_path") or "")
+        function_name = raw_range.get("function_name")
+        contract_name = raw_range.get("contract_name")
+        if desired_files and file_path not in desired_files:
+            continue
+        if desired_functions and function_name not in desired_functions:
+            continue
+        if desired_contracts and contract_name not in desired_contracts:
+            continue
+        start_line = raw_range.get("start_line")
+        end_line = raw_range.get("end_line")
+        if not file_path or not isinstance(start_line, int) or not isinstance(end_line, int):
+            continue
+        key = (file_path, function_name, start_line)
+        if key in seen:
+            continue
+        source_path = repo_path / file_path
+        if not source_path.exists():
+            continue
+        lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        body = "\n".join(lines[max(0, start_line - 1):end_line])
+        if not body.strip():
+            continue
+        body = body[:4000]
+        if used_chars + len(body) > 12000:
+            break
+        used_chars += len(body)
+        seen.add(key)
+        snippets.append(
+            {
+                "kind": "function_body",
+                "file_path": file_path,
+                "line_start": start_line,
+                "line_end": end_line,
+                "function": function_name,
+                "contract": contract_name,
+                "text": body,
+                "message": "Full containing function body for research context.",
+            }
+        )
+    return snippets[:4]
 
 
 def _tool_prompt(state: AuditState) -> str:
@@ -155,11 +219,14 @@ def _tool_prompt(state: AuditState) -> str:
         f"Protocol IR summary: {protocol_summary}\n"
         f"Protocol graph summary: {graph_summary}\n"
         f"RAG checklist items: {checklist_items}\n"
+        f"Audit milestones: {_planner_milestones(state)}\n"
+        f"Available output keys: {sorted(state.get('last_outputs', {}).keys())[:40]}\n"
         f"Available RAG context: {rag_context}\n\n"
         "Return strict JSON for the next safe audit tools to run. "
         "Reason like a protocol auditor over call graph slices, asset flows, state writes, auth constraints, lifecycle transitions, "
         "historical checklist items, and known analysis gaps. Prefer hypotheses that can be proven from local source evidence. "
-        "Include repo_path in inputs when needed and use output_references when one tool output should feed another input."
+        "Include repo_path in inputs when needed and use output_references when one tool output should feed another input. "
+        "Use stop=true only when all required milestones are complete or the remaining budget is too low to run useful tools."
     )
 
 
@@ -191,6 +258,47 @@ def _model_or_mapping_json(value) -> dict:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _planner_milestones(state: AuditState) -> dict[str, bool]:
+    return {
+        "repo_inspected": bool(state.get("repo_facts")),
+        "framework_detected": bool(state.get("build_facts")),
+        "static_facts_extracted": bool(state.get("static_facts")),
+        "protocol_ir_built": bool(state.get("protocol_ir")),
+        "contest_reasoning_done": bool(state.get("last_outputs", {}).get("analysis.contest_reasoning")),
+        "protocol_model_built": bool(state.get("protocol_model")),
+        "targeted_rag_built": bool(state.get("targeted_rag")),
+        "invariants_mined": bool(state.get("invariant_candidates")),
+        "hypotheses_ranked": bool(state.get("hypotheses")),
+        "rag_context_bundled": bool(state.get("rag_context_bundles")),
+        "research_completed": bool(state.get("subgraph_results")),
+    }
+
+
+def _next_missing_graph_node(state: AuditState) -> str:
+    milestones = _planner_milestones(state)
+    ordered = [
+        ("repo_inspected", "inspect_repo"),
+        ("framework_detected", "detect_framework"),
+        ("static_facts_extracted", "run_static_analysis"),
+        ("protocol_ir_built", "build_protocol_ir"),
+        ("contest_reasoning_done", "contest_reasoning"),
+        ("protocol_model_built", "build_protocol_model"),
+        ("targeted_rag_built", "build_targeted_rag_context"),
+        ("invariants_mined", "mine_invariant_candidates"),
+        ("hypotheses_ranked", "rank_hypotheses"),
+        ("rag_context_bundled", "rag_retrieve_context"),
+        ("research_completed", "research_subgraph"),
+    ]
+    for milestone, node in ordered:
+        if not milestones.get(milestone):
+            return node
+    return "summarize_context"
+
+
+def _route_after_planner(state: AuditState) -> str:
+    return state.get("current_focus") or _next_missing_graph_node(state)
 
 
 def _persist_long_term_memory(state: AuditState) -> ArtifactRef | None:
@@ -249,24 +357,65 @@ def plan_with_llm(state: AuditState) -> AuditState:
             return state
     valid_names = {tool.full_name for tool in registry.list()}
     executed = []
+    skipped = []
+    planner_rounds = []
     executor = ToolExecutor(registry)
-    for decision in plan.decisions[:8]:
-        if decision.tool_name not in valid_names:
-            state.setdefault("errors", []).append(f"LLM selected unknown tool: {decision.tool_name}")
-            continue
-        tool = registry.get(decision.tool_name)
-        tool_input = _resolve_output_references(state, dict(decision.tool_input), decision.output_references)
-        if "repo_path" in tool.input_model.model_fields and "repo_path" not in tool_input:
-            tool_input["repo_path"] = state["repo_path"]
-        required = {name for name, field in tool.input_model.model_fields.items() if field.is_required()}
-        if not required.issubset(tool_input):
-            state.setdefault("errors", []).append(f"LLM omitted required input for {decision.tool_name}")
-            continue
-        output = executor.execute(decision.tool_name, tool_input, state)
-        _record_step(state, decision.tool_name, f"{decision.tool_name} selected by LLM: {decision.rationale}")
-        executed.append({"tool_name": decision.tool_name, "status": getattr(output, "status", "ok")})
-    state["last_outputs"]["llm.plan_with_llm"] = {"executed": executed, "planner_source": planner_source}
-    state["current_focus"] = "inspect_repo"
+    stop_reason = "planner_completed"
+    for round_index in range(1, 5):
+        remaining_budget = get_settings().max_tool_calls - state.get("tool_call_count", 0)
+        if remaining_budget <= 2:
+            stop_reason = "budget_low"
+            break
+        if round_index > 1:
+            try:
+                plan = planner.plan(_tool_prompt(state), tool_catalog)
+            except Exception as exc:
+                state.setdefault("warnings", []).append(f"LLM planner stopped after round {round_index - 1}: {type(exc).__name__}: {exc}")
+                stop_reason = "planner_error_after_partial_execution"
+                break
+        round_record = {"round": round_index, "decisions": [], "stop": plan.stop}
+        for decision in plan.decisions[: min(8, max(1, remaining_budget - 2))]:
+            if decision.tool_name not in valid_names:
+                message = f"LLM selected unknown tool: {decision.tool_name}"
+                state.setdefault("errors", []).append(message)
+                skipped.append({"tool_name": decision.tool_name, "reason": "unknown_tool"})
+                continue
+            tool = registry.get(decision.tool_name)
+            tool_input = _resolve_output_references(state, dict(decision.tool_input), decision.output_references)
+            if "repo_path" in tool.input_model.model_fields and "repo_path" not in tool_input:
+                tool_input["repo_path"] = state["repo_path"]
+            required = {name for name, field in tool.input_model.model_fields.items() if field.is_required()}
+            if not required.issubset(tool_input):
+                missing = sorted(required.difference(tool_input))
+                state.setdefault("errors", []).append(f"LLM omitted required input for {decision.tool_name}")
+                state.setdefault("errors", []).append(f"LLM omitted required input for {decision.tool_name}: {missing}")
+                skipped.append({"tool_name": decision.tool_name, "reason": "missing_required_input", "missing": missing})
+                continue
+            output = executor.execute(decision.tool_name, tool_input, state)
+            status = getattr(output, "status", "ok")
+            _record_step(state, decision.tool_name, f"{decision.tool_name} selected by LLM: {decision.rationale}")
+            record = {"tool_name": decision.tool_name, "status": str(status)}
+            executed.append(record)
+            round_record["decisions"].append(record)
+        planner_rounds.append(round_record)
+        if all(_planner_milestones(state).values()):
+            stop_reason = "milestones_complete"
+            break
+        if plan.stop:
+            stop_reason = "planner_requested_stop"
+            break
+        if not plan.decisions:
+            stop_reason = "planner_returned_no_decisions"
+            break
+    state["last_outputs"]["llm.plan_with_llm"] = {
+        "executed": executed,
+        "skipped": skipped,
+        "planner_rounds": planner_rounds,
+        "planner_source": planner_source,
+        "stop_reason": stop_reason,
+        "milestones": _planner_milestones(state),
+    }
+    state["current_focus"] = _next_missing_graph_node(state)
     return state
 
 
@@ -414,7 +563,7 @@ def contest_reasoning(state: AuditState) -> AuditState:
         return state
     reasoning_packets = build_reasoning_packets(ir)
     gap_candidates = run_gap_hunters(state["repo_path"], ir, reasoning_packets)
-    working_memory = build_working_memory(reasoning_packets, gap_candidates)
+    working_memory = build_working_memory(reasoning_packets, gap_candidates, ir)
     state["reasoning_packets"] = reasoning_packets
     state["gap_candidates"] = gap_candidates
     state["working_memory"] = working_memory
@@ -537,12 +686,59 @@ def rank_hypotheses(state: AuditState) -> AuditState:
     return state
 
 
+def _select_hypotheses_for_deepening(hypotheses: list[VulnerabilityHypothesis], max_items: int = 10) -> list[VulnerabilityHypothesis]:
+    """Choose a diversified evidence-backed set for expensive RAG/research/validation work."""
+    selected: list[VulnerabilityHypothesis] = []
+    selected_ids: set[str] = set()
+
+    def score(hypothesis: VulnerabilityHypothesis) -> tuple[float, float]:
+        sources = [source.lower() for source in hypothesis.source_detection_ids]
+        is_profile_lead = any(source.startswith("repo-profile:") for source in sources) and not any(not source.startswith("repo-profile:") for source in sources)
+        proof_bonus = {
+            "static_proof_complete": 0.35,
+            "strong_local_path": 0.25,
+            "missing_counterevidence": 0.15,
+            "setup_required": 0.0,
+        }.get(hypothesis.proof_status, -0.1)
+        evidence_bonus = min(0.25, 0.05 * len(hypothesis.evidence_lines))
+        graph_bonus = 0.12 if hypothesis.graph_slice_ids or hypothesis.proof_packet_id else 0.0
+        profile_penalty = -0.35 if is_profile_lead else 0.0
+        return hypothesis.confidence + proof_bonus + evidence_bonus + graph_bonus + profile_penalty, hypothesis.confidence
+
+    def add(hypothesis: VulnerabilityHypothesis) -> None:
+        if len(selected) >= max_items or hypothesis.id in selected_ids:
+            return
+        selected.append(hypothesis)
+        selected_ids.add(hypothesis.id)
+
+    strong = [
+        hypothesis
+        for hypothesis in hypotheses
+        if hypothesis.evidence_lines and hypothesis.proof_status in {"static_proof_complete", "strong_local_path", "missing_counterevidence"}
+    ]
+    for hypothesis in sorted(strong, key=score, reverse=True):
+        add(hypothesis)
+
+    by_class: dict[str, VulnerabilityHypothesis] = {}
+    for hypothesis in sorted(hypotheses, key=score, reverse=True):
+        if not hypothesis.evidence_lines:
+            continue
+        by_class.setdefault(hypothesis.vulnerability_class, hypothesis)
+    for hypothesis in by_class.values():
+        add(hypothesis)
+
+    for hypothesis in sorted(hypotheses, key=score, reverse=True):
+        if hypothesis.evidence_lines:
+            add(hypothesis)
+    return selected
+
+
 def rag_retrieve_context(state: AuditState) -> AuditState:
     hypotheses = state.get("hypotheses", [])
     if not hypotheses:
         return state
     state.setdefault("rag_context_bundles", {})
-    for hypothesis in hypotheses[:5]:
+    for hypothesis in _select_hypotheses_for_deepening(hypotheses):
         bundle = run_rag_subgraph(
             initial_rag_state(
                 subgraph_run_id=f"{state['run_id']}-rag-{hypothesis.id}",
@@ -566,7 +762,7 @@ def research_subgraph(state: AuditState) -> AuditState:
         state["current_focus"] = "summarize_context"
         return state
 
-    for index, hypothesis in enumerate(hypotheses[:5], start=1):
+    for index, hypothesis in enumerate(_select_hypotheses_for_deepening(hypotheses), start=1):
         selected_snippets = _evidence_snippets_for_hypothesis(state, hypothesis)
         subgraph_state = initial_research_state(
             subgraph_run_id=f"{state['run_id']}-research-{index}",
@@ -607,7 +803,17 @@ def finish(state: AuditState) -> AuditState:
     _run_tool(state, "static.extract_functions", {"repo_path": repo_path})
     hypotheses = state.get("hypotheses", [])
     if hypotheses:
-        for hypothesis in hypotheses[:5]:
+        for hypothesis in _select_hypotheses_for_deepening(hypotheses):
+            semantic_validation = _run_tool(
+                state,
+                "dynamic.run_semantic_validation",
+                {"repo_path": repo_path, "hypothesis": hypothesis.model_dump(mode="json")},
+            )
+            validation_data = getattr(semantic_validation, "data", {}) if semantic_validation else {}
+            if validation_data.get("validated"):
+                hypothesis.proof_status = validation_data.get("proof_status", "static_proof_complete")
+                if validation_data.get("counterevidence"):
+                    hypothesis.counterevidence.extend(validation_data["counterevidence"])
             _run_tool(
                 state,
                 "dynamic.generate_validation_artifacts",
@@ -694,7 +900,24 @@ def build_parent_graph(use_llm_planner: bool = False):
     graph.add_edge(START, "initialize_run")
     graph.add_edge("initialize_run", "maybe_sync_solodit_rag")
     graph.add_edge("maybe_sync_solodit_rag", "plan_with_llm" if use_llm_planner else "inspect_repo")
-    graph.add_edge("plan_with_llm", "inspect_repo")
+    graph.add_conditional_edges(
+        "plan_with_llm",
+        _route_after_planner,
+        {
+            "inspect_repo": "inspect_repo",
+            "detect_framework": "detect_framework",
+            "run_static_analysis": "run_static_analysis",
+            "build_protocol_ir": "build_protocol_ir",
+            "contest_reasoning": "contest_reasoning",
+            "build_protocol_model": "build_protocol_model",
+            "build_targeted_rag_context": "build_targeted_rag_context",
+            "mine_invariant_candidates": "mine_invariant_candidates",
+            "rank_hypotheses": "rank_hypotheses",
+            "rag_retrieve_context": "rag_retrieve_context",
+            "research_subgraph": "research_subgraph",
+            "summarize_context": "summarize_context",
+        },
+    )
     graph.add_edge("inspect_repo", "detect_framework")
     graph.add_edge("detect_framework", "run_static_analysis")
     graph.add_edge("run_static_analysis", "build_protocol_ir")

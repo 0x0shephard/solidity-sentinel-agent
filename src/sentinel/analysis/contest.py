@@ -145,7 +145,11 @@ def run_gap_hunters(repo_path: str, ir: ProtocolIR, reasoning_packets: list[Reas
     return _dedupe_gap_candidates(candidates)[:20]
 
 
-def build_working_memory(reasoning_packets: list[ReasoningDisciplinePacket], gap_candidates: list[GapFindingCandidate]) -> AuditWorkingMemory:
+def build_working_memory(
+    reasoning_packets: list[ReasoningDisciplinePacket],
+    gap_candidates: list[GapFindingCandidate],
+    ir: ProtocolIR | None = None,
+) -> AuditWorkingMemory:
     rejected = [
         f"{candidate.id}: {', '.join(candidate.counterevidence)}"
         for candidate in gap_candidates
@@ -156,38 +160,104 @@ def build_working_memory(reasoning_packets: list[ReasoningDisciplinePacket], gap
         actor_assumptions=[question for packet in reasoning_packets for question in packet.adversarial_questions],
         open_proof_obligations=[item for candidate in gap_candidates for item in candidate.proof_obligations],
         rejected_hypotheses=rejected,
-        benchmark_lessons=[
-            "Mutable order terms require slippage or min/max bound reasoning.",
-            "CEI-safe SafeERC20 reentrancy candidates need a concrete secondary target before promotion.",
-            "Expired-but-active lifecycle state requires liveness and cleanup checks.",
-        ],
+        benchmark_lessons=_filtered_benchmark_lessons(ir, gap_candidates),
     )
 
 
+def _filtered_benchmark_lessons(ir: ProtocolIR | None, gap_candidates: list[GapFindingCandidate]) -> list[str]:
+    lessons = [
+        (
+            {"market", "order", "price", "seller", "buyer", "mempool", "deadline"},
+            "Mutable order terms require slippage or min/max bound reasoning.",
+        ),
+        (
+            {"token", "safeerc20", "callback", "reentrancy", "external", "cei"},
+            "CEI-safe SafeERC20 reentrancy candidates need a concrete secondary target before promotion.",
+        ),
+        (
+            {"deadline", "expiry", "expired", "active", "cleanup", "lifecycle"},
+            "Expired-but-active lifecycle state requires liveness and cleanup checks.",
+        ),
+    ]
+    profile_terms = _memory_profile_terms(ir, gap_candidates)
+    return [lesson for required, lesson in lessons if len(required.intersection(profile_terms)) >= 2]
+
+
+def _memory_profile_terms(ir: ProtocolIR | None, gap_candidates: list[GapFindingCandidate]) -> set[str]:
+    text_parts: list[str] = []
+    if ir:
+        text_parts.extend(contract.name for contract in ir.contracts)
+        text_parts.extend(function.name for contract in ir.contracts for function in contract.functions)
+        text_parts.extend(flow.expression for flow in ir.asset_flows)
+        text_parts.extend(statement.source_text for statement in ir.statements[:300])
+    text_parts.extend(candidate.title for candidate in gap_candidates)
+    text_parts.extend(" ".join(candidate.affected_state_variables) for candidate in gap_candidates)
+    return {term.lower() for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", " ".join(text_parts))}
+
+
 def _actors_from_ir(ir: ProtocolIR) -> list[ActorModel]:
-    roles = {
-        "seller": ["create/amend/cancel owned orders"],
-        "buyer": ["fill active orders"],
-        "owner": ["configure tokens and withdraw protocol fees"],
-        "mev_searcher": ["observe public mempool and reorder public calls"],
-        "inactive_user": ["fails to clean up expired positions"],
+    roles: dict[str, list[str]] = {
+        "owner": ["configure protocol parameters and privileged modules"],
         "external_token": ["executes token transfer logic"],
     }
     evidence_by_role: dict[str, list[SourceEvidence]] = defaultdict(list)
+    has_market_surface = False
+    has_vault_surface = False
     for contract in ir.contracts:
         for function in contract.functions:
             ev = _evidence(function.file_path, function.start_line, function.contract_name, function.name, function.signature, "actor capability inferred from public function")
-            lower = function.name.lower() + " " + function.signature.lower()
-            if "seller" in lower or any(term in lower for term in ("sell", "amend", "cancel")):
+            lower = f"{contract.name} {function.name} {function.signature}".lower()
+            market_context = _has_market_context(lower)
+            if market_context and ("seller" in lower or any(term in lower for term in ("sell", "amend", "cancel"))):
+                has_market_surface = True
                 evidence_by_role["seller"].append(ev)
-            if any(term in lower for term in ("buy", "fill", "match")):
+            if market_context and any(term in lower for term in ("buyer", "buy", "fill", "match")):
+                has_market_surface = True
                 evidence_by_role["buyer"].append(ev)
             if "onlyowner" in lower or "owner" in lower:
                 evidence_by_role["owner"].append(ev)
+            if any(term in lower for term in ("deposit", "redeem", "withdraw", "claim")):
+                has_vault_surface = True
+                evidence_by_role["unknown"].append(ev)
+            if any(term in lower for term in ("report", "oracle", "price")):
+                evidence_by_role["keeper"].append(ev)
+    if has_market_surface:
+        roles.update(
+            {
+                "seller": ["create/amend/cancel owned orders"],
+                "buyer": ["fill active orders"],
+                "mev_searcher": ["observe public mempool and reorder public calls"],
+                "inactive_user": ["fails to clean up expired positions"],
+            }
+        )
+    if has_vault_surface:
+        roles.update(
+            {
+                "unknown": ["deposit, redeem, withdraw, or claim protocol assets"],
+                "keeper": ["submit reports, prices, or maintenance actions"],
+            }
+        )
     return [
         ActorModel(actor_id=f"actor-{role}", role=role, capabilities=caps, evidence=evidence_by_role.get(role, [])[:4])
         for role, caps in roles.items()
+        if role in {"owner", "external_token"} or evidence_by_role.get(role)
     ]
+
+
+def _has_market_context(text: str) -> bool:
+    terms = {
+        "order",
+        "market",
+        "seller",
+        "buyer",
+        "price",
+        "fill",
+        "bid",
+        "ask",
+        "auction",
+        "trade",
+    }
+    return len({term for term in terms if term in text}) >= 2 or ("sell" in text and "price" in text)
 
 
 def _actions_from_ir(repo_path: str, ir: ProtocolIR) -> list[TransactionAction]:

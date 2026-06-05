@@ -116,6 +116,18 @@ def _can_generate_executable_validation(repo_path: str, hypothesis: Vulnerabilit
     target_file, target_contract, _target_function = _target_details(hypothesis)
     if _is_library_or_interface(repo_path, target_file, target_contract):
         return False, f"{target_contract} is a library/interface target; emitting a proof plan instead of generating an invalid executable test."
+    semantic_static_templates = {
+        "signature_threshold_uniqueness",
+        "checkpoint_boundary_mismatch",
+        "fee_formula_dimension_mismatch",
+        "multi_report_fee_accrual",
+        "boolean_policy_inversion",
+        "native_asset_receive_mismatch",
+        "indexed_structure_key_mismatch",
+        "lockup_transfer_bypass",
+    }
+    if hypothesis.root_cause_terms and semantic_static_templates.intersection(set(hypothesis.root_cause_terms)):
+        return False, "Semantic invariant hypothesis detected; emitting a static-proof validation plan unless project-specific constructor setup is inferred elsewhere."
     if _is_orderbook_like_hypothesis(hypothesis):
         args = _constructor_args(repo_path, target_file, target_contract)
         if args is not None and len(args) == 2 and all("IERC20" in arg or "ERC20" in arg for arg in args):
@@ -422,6 +434,14 @@ def _validation_plan_content(hypothesis: VulnerabilityHypothesis) -> str:
         "denial_of_service": "Exercise the largest realistic dynamic collection and assert gas/runtime remains bounded.",
         "external_call_before_accounting": "Use a callback receiver and assert state is updated before observable external interaction.",
         "transaction_ordering": "Model two actors submitting transactions against shared mutable state; assert the victim's expected terms are bound by explicit min/max parameters or the transaction reverts.",
+        "signature_threshold_uniqueness": "Submit duplicate signatures from the same signer and assert threshold counting rejects non-unique signers.",
+        "checkpoint_boundary_mismatch": "Create paired checkpoint/batch states around the same timestamp and assert all claim/report paths use the same inclusive/exclusive boundary.",
+        "fee_formula_dimension_mismatch": "Compute expected fee units independently and compare against the formula for representative D6/D18/share values.",
+        "multi_report_fee_accrual": "Process multiple reports that share the same fee period/base and assert fee accrual occurs exactly once for the intended aggregate.",
+        "boolean_policy_inversion": "Exercise both allowed and disallowed accounts and assert the guard matches documented transfer/whitelist semantics.",
+        "native_asset_receive_mismatch": "Configure the native asset path and assert the receiving contract can accept ETH, or that the path rejects unsupported native configuration.",
+        "indexed_structure_key_mismatch": "Insert, lookup, cancel, and claim around adjacent indexes and assert the same key basis is used throughout.",
+        "lockup_transfer_bypass": "Mint or transfer locked shares through every transfer path and assert the lockup constraint follows the shares.",
     }
     template_by_validation = {
         "mempool_order_race": "Construct a seller action that amends/cancels mutable order terms immediately before a buyer fill; assert the buyer cannot receive worse price/amount than their signed or parameterized intent.",
@@ -443,7 +463,10 @@ def _validation_plan_content(hypothesis: VulnerabilityHypothesis) -> str:
         *evidence_lines,
         "",
         "## Validation Objective",
-        template_by_validation.get(validation_template, template_notes.get(hypothesis.vulnerability_class, "Build a project-specific proof-of-concept or regression test from the cited local evidence.")),
+        template_by_validation.get(
+            validation_template,
+            template_notes.get(validation_template, template_notes.get(hypothesis.vulnerability_class, "Build a project-specific proof-of-concept or regression test from the cited local evidence.")),
+        ),
         "",
         "## Suggested Checks",
         *[f"- {step}" for step in recommended],
@@ -605,6 +628,83 @@ def spawn_poc_subagent(inp: PocInput, state) -> DynamicGenericOutput:
     return DynamicGenericOutput(status=ToolStatus.OK, data={"subagent_kind": "poc_planner", "plan": plan})
 
 
+def run_semantic_validation(inp: PocInput, state) -> DynamicGenericOutput:
+    hypothesis = inp.hypothesis or (state.get("hypotheses") or [None])[0]
+    if hypothesis is None:
+        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="No hypothesis available for semantic validation.")
+    supported_terms = {
+        "signature_threshold_uniqueness",
+        "checkpoint_boundary_mismatch",
+        "fee_formula_dimension_mismatch",
+    }
+    matched_terms = sorted(supported_terms.intersection({term.lower() for term in hypothesis.root_cause_terms}))
+    if not matched_terms:
+        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="Hypothesis does not use a supported semantic validation class.")
+
+    result = _semantic_validation_result(hypothesis, matched_terms)
+    run_dir = Path(state.get("run_dir", "runs/tmp"))
+    artifact_dir = run_dir / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", hypothesis.id)
+    artifact_path = artifact_dir / f"semantic-validation-{safe_id}.json"
+    artifact_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    state.setdefault("artifacts", []).append(
+        ArtifactRef(
+            kind="semantic_validation_result",
+            path=str(artifact_path),
+            description=f"Deterministic semantic validation result for {hypothesis.id}.",
+        )
+    )
+    return DynamicGenericOutput(status=ToolStatus.OK, data=result)
+
+
+def _semantic_validation_result(hypothesis: VulnerabilityHypothesis, matched_terms: list[str]) -> dict:
+    evidence_text = "\n".join(item.source_text for item in hypothesis.evidence_lines).lower()
+    counterevidence: list[str] = []
+    local_facts = [
+        {
+            "file_path": item.file_path,
+            "line_start": item.line_start,
+            "line_end": item.line_end,
+            "function_name": item.function_name,
+            "reason": item.reason,
+            "source_text": item.source_text,
+        }
+        for item in hypothesis.evidence_lines[:8]
+    ]
+    validated = False
+    reason = "No supported semantic proof matched the local evidence."
+
+    if "signature_threshold_uniqueness" in matched_terms:
+        has_threshold_length = "threshold" in evidence_text and ".length" in evidence_text
+        has_uniqueness_counterevidence = any(term in evidence_text for term in ("usedsigner", "seensigner", "duplicate", "unique"))
+        validated = has_threshold_length and not has_uniqueness_counterevidence
+        if has_uniqueness_counterevidence:
+            counterevidence.append("Local evidence mentions signer uniqueness or duplicate-signature checks.")
+        reason = "Signature threshold uses signature array length without local uniqueness evidence." if validated else "Signature uniqueness proof was not complete."
+    elif "checkpoint_boundary_mismatch" in matched_terms:
+        has_checkpoint = any(term in evidence_text for term in ("checkpoint", "latest", "upper", "lower", "timestamp"))
+        has_boundary_mix = any(term in evidence_text for term in ("upper", "lower", "latest")) and any(op in evidence_text for op in ("<", "<=", ">", ">="))
+        validated = has_checkpoint and has_boundary_mix
+        reason = "Checkpoint evidence contains mixed boundary/latest semantics." if validated else "Checkpoint boundary proof was not complete."
+    elif "fee_formula_dimension_mismatch" in matched_terms:
+        has_fee = "fee" in evidence_text
+        has_mixed_units = sum(1 for term in ("d6", "1e6", "d18", "1e18", "share", "price") if term in evidence_text) >= 3
+        has_dimension_denominator = any(term in evidence_text for term in ("1e24", "1e18", "1e6"))
+        validated = has_fee and has_mixed_units and has_dimension_denominator
+        reason = "Fee formula mixes fee/price/share dimensions with a suspicious denominator." if validated else "Fee formula dimension proof was not complete."
+
+    return {
+        "hypothesis_id": hypothesis.id,
+        "matched_terms": matched_terms,
+        "validated": validated,
+        "proof_status": "static_proof_complete" if validated else "setup_required",
+        "counterevidence": counterevidence,
+        "local_facts": local_facts,
+        "reason": reason,
+    }
+
+
 def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
     hypothesis = inp.hypothesis or (state.get("hypotheses") or [None])[0]
     if hypothesis is None:
@@ -615,6 +715,10 @@ def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     test_name = _artifact_test_name(hypothesis)
     test_path = artifact_dir / test_name
+    if test_path.exists():
+        hyp_id = re.sub(r"[^A-Za-z0-9_]", "_", hypothesis.id)
+        test_name = f"{test_path.stem}{hyp_id[:24]}.t.sol"
+        test_path = artifact_dir / test_name
     plan_path = artifact_dir / f"{test_path.stem}.plan.md"
     plan_content = _validation_plan_content(hypothesis)
     plan_path.write_text(plan_content, encoding="utf-8")
@@ -734,6 +838,7 @@ def register(registry) -> None:
         ("extract_revert_reason", "Extract revert reasons from test output.", DynamicGenericOutput, extract_revert_reason),
         ("classify_test_result", "Classify test result.", DynamicGenericOutput, classify_test_result),
         ("spawn_poc_subagent", "Spawn a PoC planning subagent.", PocInput, spawn_poc_subagent),
+        ("run_semantic_validation", "Run deterministic semantic validation for supported invariant classes.", PocInput, run_semantic_validation),
         ("generate_validation_artifacts", "Generate reviewable Foundry validation test artifacts under the run directory.", PocInput, generate_validation_artifacts),
         ("compile_validation_artifacts", "Compile generated validation tests in a non-mutating temporary worktree.", ValidationCompileInput, compile_validation_artifacts),
         ("run_validation_artifacts", "Run generated validation tests in a non-mutating temporary worktree and classify the result.", ValidationCompileInput, run_validation_artifacts),
@@ -741,7 +846,7 @@ def register(registry) -> None:
     for name, description, input_model, fn in specs:
         if name in {"compile_validation_artifacts", "run_validation_artifacts"}:
             side_effects = [SideEffect.WRITE_FILES, SideEffect.EXECUTE_LOCAL]
-        elif name in {"patch_poc_test", "generate_validation_artifacts"}:
+        elif name in {"patch_poc_test", "generate_validation_artifacts", "run_semantic_validation"}:
             side_effects = [SideEffect.WRITE_FILES]
         elif name.startswith("run_"):
             side_effects = [SideEffect.EXECUTE_LOCAL]

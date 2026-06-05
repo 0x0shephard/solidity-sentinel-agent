@@ -45,7 +45,7 @@ class HuggingFacePlanner(BasePlanner):
                 SystemMessage(
                     content=(
                         "You are Solidity Sentinel's planner. Return only JSON with key decisions. "
-                        "Each decision must include tool_name, tool_input, and rationale. "
+                        "Each decision must include tool_name, tool_input, and rationale; set stop=true only when no useful tool remains. "
                         "Choose only from the provided tool catalog and respect schemas, risks, side effects, and chaining hints."
                     )
                 ),

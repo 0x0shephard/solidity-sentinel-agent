@@ -231,17 +231,7 @@ def create_result(state: ResearchState) -> ResearchState:
     limitation_text = " ".join(limitations).lower()
     has_local_evidence = bool(state.get("evidence_records"))
     has_function = bool(functions or hypothesis.affected_function)
-    has_cross_function_or_static_proof = (
-        hypothesis.proof_status == "static_proof_complete"
-        or len(set(functions)) >= 2
-        or len(hypothesis.evidence_lines) >= 2
-        or bool(hypothesis.graph_slice_ids)
-        or (
-            hypothesis.status == "likely"
-            and any("_gap_agent" in source for source in hypothesis.source_detection_ids)
-            and bool(hypothesis.exploit_precondition_terms)
-        )
-    )
+    has_cross_function_or_static_proof = _has_cross_function_or_static_proof(hypothesis, functions)
     blocking_limitation = any(
         phrase in limitation_text
         for phrase in [
@@ -263,14 +253,12 @@ def create_result(state: ResearchState) -> ResearchState:
         finding_status = "needs_manual_review"
     elif blocking_limitation:
         finding_status = "needs_manual_review"
-    elif hypothesis.proof_status == "static_proof_complete" and has_local_evidence:
+    elif _has_complete_static_proof(hypothesis) and has_local_evidence:
         finding_status = "confirmed"
     elif hypothesis.proof_status == "strong_local_path" and has_cross_function_or_static_proof:
         finding_status = "likely"
     elif hypothesis.status == "needs_manual_review" and not state.get("llm_refinement"):
         finding_status = "needs_manual_review"
-    elif has_local_evidence and confidence >= 0.85 and has_cross_function_or_static_proof:
-        finding_status = "confirmed"
     elif has_local_evidence and has_cross_function_or_static_proof:
         finding_status = "likely"
     else:
@@ -298,6 +286,27 @@ def create_result(state: ResearchState) -> ResearchState:
     )
     state["result"] = result
     return state
+
+
+def _has_complete_static_proof(hypothesis: VulnerabilityHypothesis) -> bool:
+    return hypothesis.proof_status == "static_proof_complete"
+
+
+def _has_cross_function_or_static_proof(hypothesis: VulnerabilityHypothesis, functions: list[str]) -> bool:
+    if _has_complete_static_proof(hypothesis):
+        return True
+    if hypothesis.proof_status not in {"strong_local_path", "missing_counterevidence"}:
+        return False
+    return (
+        len(set(functions)) >= 2
+        or len(hypothesis.evidence_lines) >= 2
+        or bool(hypothesis.graph_slice_ids)
+        or (
+            hypothesis.status == "likely"
+            and any("_gap_agent" in source for source in hypothesis.source_detection_ids)
+            and bool(hypothesis.exploit_precondition_terms)
+        )
+    )
 
 
 def build_research_graph():

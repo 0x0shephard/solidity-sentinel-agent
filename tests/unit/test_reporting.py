@@ -171,6 +171,43 @@ def test_report_requires_local_evidence_and_separates_historical_context():
     assert "Delegatecall to user-controlled target" in markdown
 
 
+def test_repo_profile_hypothesis_renders_as_lead_not_manual_review():
+    state = initial_audit_state("run-1", "./repo", "Find bugs", "runs/run-1")
+    state["hypotheses"] = [
+        VulnerabilityHypothesis(
+            id="hyp-profile",
+            title="Profile-guided accounting lead",
+            vulnerability_class="accounting_invariant",
+            affected_files=["src/Vault.sol"],
+            affected_functions=["deposit"],
+            evidence_summary="Repo profile suggests vault accounting should be inspected.",
+            confidence=0.8,
+            evidence_lines=[
+                SourceEvidence(
+                    file_path="src/Vault.sol",
+                    line_start=12,
+                    line_end=12,
+                    contract_name="Vault",
+                    function_name="deposit",
+                    source_text="shares[msg.sender] += amount;",
+                    reason="Source term overlaps repo-profile intent",
+                )
+            ],
+            source_detection_ids=["repo-profile:intent-vault-accounting"],
+            status="needs_manual_review",
+        )
+    ]
+
+    state["findings"] = create_findings_from_state(state)
+    report = build_report_document(state)
+    markdown = render_markdown_report(report)
+
+    assert not report.needs_manual_review
+    assert len(report.leads) == 1
+    assert "## Leads" in markdown
+    assert "## Needs Manual Review" not in markdown
+
+
 def test_report_renders_actor_model_and_demotes_blocking_counterevidence():
     state = initial_audit_state("run-1", "./repo", "Find bugs", "runs/run-1")
     state["last_outputs"]["analysis.contest_reasoning"] = {

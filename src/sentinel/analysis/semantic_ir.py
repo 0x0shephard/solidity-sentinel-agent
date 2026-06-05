@@ -5,6 +5,7 @@ from pathlib import Path
 
 from sentinel.evidence import classify_source_path
 from sentinel.schemas.protocol_ir import (
+    AssetFlow,
     AssetCompatibilityPath,
     CheckpointLookupIR,
     DataFlowEdge,
@@ -61,11 +62,10 @@ def enrich_semantic_ir(repo_path: str, ir: ProtocolIR, ranges: list[FunctionRang
             ir.statements.append(_statement(rel, line_no, contract_name, function_name, code))
             ir.data_flows.extend(_data_flows(rel, line_no, contract_name, function_name, code))
             ir.semantic_calls.extend(_semantic_calls(rel, line_no, contract_name, function_name, code))
+            ir.asset_flows.extend(_helper_asset_flows(rel, line_no, contract_name, function_name, code))
             ir.checkpoint_lookups.extend(_checkpoint_lookups(rel, line_no, contract_name, function_name, code))
             ir.fee_formulas.extend(_fee_formulas(rel, line_no, contract_name, function_name, code, state_names.get((rel, contract_name), set())))
-            ir.asset_compatibility_paths.extend(
-                _asset_paths(rel, line_no, contract_name, function_name, code, contract_capabilities)
-            )
+            ir.asset_compatibility_paths.extend(_asset_paths(rel, line_no, contract_name, function_name, code, contract_capabilities))
         ir.loops.extend(_loops_for_file(rel, lines, ranges))
     if not ir.statements:
         ir.completeness_gaps.append("Semantic IR extraction found no statements; downstream invariant queries may be shallow.")
@@ -196,7 +196,7 @@ def _semantic_calls(file_path: str, line_no: int, contract: str | None, function
             kind = "checkpoint"
         elif any(term.lower() in lower or term.lower() in code.lower() for term in SIGNATURE_TERMS):
             kind = "signature"
-        elif callee in {"transfer", "transferFrom", "safeTransfer", "safeTransferFrom", "mint", "burn"}:
+        elif callee in {"transfer", "transferFrom", "safeTransfer", "safeTransferFrom", "mint", "burn", "sendAssets", "receiveAssets"}:
             kind = "token"
         elif any(term in code for term in NATIVE_TRANSFER_TERMS):
             kind = "native_transfer"
@@ -301,9 +301,10 @@ def _asset_paths(
     capabilities: dict[str, dict[str, bool]],
 ) -> list[AssetCompatibilityPath]:
     lower = code.lower()
-    native = any(term in lower.replace(" ", "") for term in [".call{value:", ".send(", ".transfer("]) and not any(
-        token in lower for token in ["safetransfer", "transferfrom"]
-    )
+    compact = lower.replace(" ", "")
+    helper_native = any(term in compact for term in ["sendassets(", "receiveassets("]) and "native" in lower
+    native_call = any(term in compact for term in [".call{value:", ".send(", ".transfer("])
+    native = (helper_native or native_call) and not any(token in lower for token in ["safetransfer", "transferfrom"])
     if not native:
         return []
     receiver = _native_receiver(code)
@@ -324,6 +325,32 @@ def _asset_paths(
             evidence=[_evidence(file_path, line_no, contract, function, code, "native asset transfer path")],
         )
     ]
+
+
+def _helper_asset_flows(file_path: str, line_no: int, contract: str | None, function: str | None, code: str) -> list[AssetFlow]:
+    lower = code.lower()
+    flows: list[AssetFlow] = []
+    if not any(term in lower for term in ["sendassets", "receiveassets", "safetransfer", "transferfrom", ".transfer("]):
+        return flows
+    args = _split_args(_first_call_arg_span(code, "sendAssets") or _first_call_arg_span(code, "receiveAssets") or _first_call_arg_span(code, "safeTransferFrom") or _first_call_arg_span(code, "safeTransfer") or _first_call_arg_span(code, "transferFrom") or _first_call_arg_span(code, "transfer"))
+    asset_kind = "native" if "native" in lower or "msg.value" in lower else "erc721" if "erc721" in lower or "nft" in lower else "erc20"
+    from_expr = args[0] if len(args) >= 3 else None
+    to_expr = args[1] if len(args) >= 3 else args[0] if args else None
+    amount_expr = args[2] if len(args) >= 3 else args[1] if len(args) >= 2 else None
+    flows.append(
+        AssetFlow(
+            contract_name=contract,
+            function_name=function,
+            asset_kind=asset_kind,
+            from_expr=from_expr,
+            to_expr=to_expr,
+            amount_expr=amount_expr,
+            file_path=file_path,
+            line=line_no,
+            expression=code,
+        )
+    )
+    return flows
 
 
 def _loops_for_file(file_path: str, lines: list[str], ranges: list[FunctionRange]) -> list[LoopIR]:
