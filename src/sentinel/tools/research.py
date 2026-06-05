@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import re
 
 from pydantic import BaseModel, Field
@@ -40,6 +41,23 @@ class RankHypothesesInput(BaseModel):
 class RankHypothesesOutput(BaseModel):
     status: ToolStatus
     hypotheses: list[VulnerabilityHypothesis]
+
+
+class ProposeHypothesesInput(BaseModel):
+    repo_path: str
+    objective: str = ""
+    max_hypotheses: int = Field(default=6, ge=1, le=20)
+
+
+class ProposeHypothesesOutput(BaseModel):
+    status: ToolStatus
+    hypotheses: list[VulnerabilityHypothesis] = Field(default_factory=list)
+    proposed_count: int = 0
+    grounded_count: int = 0
+    dropped_count: int = 0
+    notes: list[str] = Field(default_factory=list)
+    raw_preview: str | None = None
+    dropped_proposals: list[dict] = Field(default_factory=list)
 
 
 class ResearchNoteInput(BaseModel):
@@ -1081,6 +1099,238 @@ def spawn_research_subgraph_tool(inp: ResearchGenericInput, state) -> ResearchGe
     return ResearchGenericOutput(status=ToolStatus.OK, message="Parent graph owns real research subgraph spawning; this tool exposes the capability in registry metadata.")
 
 
+# --- Model-driven, evidence-grounded hypothesis proposal (Phase 2.1) ---
+
+
+def _file_basename(path: str) -> str:
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _file_match(range_file: str, proposed_file: str) -> bool:
+    rf = range_file.replace("\\", "/")
+    pf = proposed_file.replace("\\", "/").strip()
+    if not pf:
+        return False
+    return rf == pf or rf.endswith("/" + pf) or pf.endswith("/" + rf) or _file_basename(rf) == _file_basename(pf)
+
+
+def _read_source_block(repo_path: str, file_path: str, start_line: int, end_line: int, max_chars: int = 2400) -> str:
+    source = Path(repo_path) / file_path
+    if not source.exists():
+        return ""
+    lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(lines[max(0, start_line - 1) : end_line])[:max_chars]
+
+
+def _function_range_index(static_facts: dict) -> list[dict]:
+    """Function ranges restricted to the target protocol source.
+
+    Dependency (lib/), test, script, and mock files are excluded so the proposer
+    reasons about — and can only ground hypotheses to — the code actually under
+    audit, not forge-std mocks or third-party libraries.
+    """
+
+    ranges = static_facts.get("function_ranges", [])
+    return [
+        r
+        for r in ranges
+        if isinstance(r, dict)
+        and r.get("function_name")
+        and r.get("file_path")
+        and _is_target_source_path(str(r.get("file_path")))
+    ]
+
+
+def _priority_function_names(state) -> set[str]:
+    names: set[str] = set()
+    graph = state.get("protocol_graph")
+    if graph is not None:
+        for sl in getattr(graph, "slices", [])[:20]:
+            if getattr(sl, "entry_function", None):
+                names.add(sl.entry_function)
+            names.update(getattr(sl, "reachable_functions", [])[:8])
+    for det in state.get("static_facts", {}).get("detections", []):
+        if isinstance(det, dict):
+            names.update(det.get("affected_functions", []))
+    return {n for n in names if n}
+
+
+def _proposer_code_context(state, repo_path: str) -> str:
+    ranges = _function_range_index(state.get("static_facts", {}))
+    priority = _priority_function_names(state)
+    prioritized = sorted(ranges, key=lambda r: (r.get("function_name") not in priority, str(r.get("file_path"))))
+    blocks: list[str] = []
+    used = 0
+    seen: set[tuple] = set()
+    for r in prioritized:
+        fn, fp = r.get("function_name"), r.get("file_path")
+        s, e = r.get("start_line"), r.get("end_line")
+        if not isinstance(s, int) or not isinstance(e, int) or (fp, fn) in seen:
+            continue
+        body = _read_source_block(repo_path, fp, s, e)
+        if not body.strip():
+            continue
+        seen.add((fp, fn))
+        block = f"// file: {fp} | contract: {r.get('contract_name')} | function: {fn} | lines {s}-{e}\n{body}"
+        if used + len(block) > 12000:
+            break
+        used += len(block)
+        blocks.append(block)
+        if len(blocks) >= 12:
+            break
+    return "\n\n".join(blocks)
+
+
+def _build_proposer_prompt(state, objective: str) -> str:
+    import json as _json
+
+    graph = state.get("protocol_graph")
+    attack_paths = [
+        {"id": p.attack_path_id, "invariant_family": p.invariant_family, "summary": p.summary}
+        for p in (getattr(graph, "attack_paths", [])[:8] if graph is not None else [])
+    ]
+    targeted = state.get("targeted_rag")
+    raw_targeted = targeted.model_dump(mode="json") if hasattr(targeted, "model_dump") else (targeted or {})
+    checklist = [
+        {
+            "vulnerability_class": it.get("vulnerability_class"),
+            "root_cause_terms": it.get("root_cause_terms", [])[:6],
+            "code_indicators": it.get("code_indicators", [])[:6],
+        }
+        for it in (raw_targeted or {}).get("checklist_items", [])[:8]
+    ]
+    contracts = [
+        {"name": c.get("contract") or c.get("name"), "file": c.get("file_path")}
+        for c in state.get("static_facts", {}).get("contracts", [])[:30]
+        if isinstance(c, dict)
+    ]
+    header = _json.dumps(
+        {
+            "objective": objective,
+            "contracts": contracts,
+            "attack_path_candidates": attack_paths,
+            "historical_checklist": checklist,
+            "instruction": (
+                "Reason like a protocol auditor over the SOURCE CODE below. Propose concrete, code-specific "
+                "vulnerability hypotheses. Set affected_file and affected_function to names that appear in the "
+                "source headers below. Explain the exploit precondition. Do not invent files or functions."
+            ),
+        },
+        indent=2,
+    )
+    return f"{header}\n\n=== SOURCE CODE ===\n{_proposer_code_context(state, state.get('repo_path', ''))}"
+
+
+def _ground_proposal(index: int, proposal, ranges: list[dict], repo_path: str) -> VulnerabilityHypothesis | None:
+    """Attach real source to a proposal; return None if it cites code that does not exist."""
+
+    def _candidates(case_insensitive: bool) -> list[dict]:
+        return [
+            r
+            for r in ranges
+            if _file_match(str(r.get("file_path")), proposal.affected_file)
+            and (
+                str(r.get("function_name")) == proposal.affected_function
+                if not case_insensitive
+                else str(r.get("function_name")).lower() == proposal.affected_function.lower()
+            )
+        ]
+
+    matches = _candidates(False) or _candidates(True)
+    if not matches:
+        return None
+    r = matches[0]
+    fp = str(r.get("file_path"))
+    s, e = int(r.get("start_line")), int(r.get("end_line"))
+    body = _read_source_block(repo_path, fp, s, e)
+    if not body.strip():
+        return None
+    function_name = str(r.get("function_name"))
+    evidence = SourceEvidence(
+        file_path=fp,
+        line_start=s,
+        line_end=e,
+        contract_name=r.get("contract_name") or proposal.affected_contract,
+        function_name=function_name,
+        source_text=body[:1800],
+        reason=(proposal.reasoning or proposal.title)[:300],
+    )
+    return VulnerabilityHypothesis(
+        id=f"llm-hyp-{index}",
+        title=proposal.title,
+        vulnerability_class=proposal.vulnerability_class or "manual_review",
+        affected_files=[fp],
+        affected_functions=[function_name],
+        affected_contract=r.get("contract_name") or proposal.affected_contract,
+        affected_function=function_name,
+        evidence_summary=(proposal.reasoning or proposal.title)[:500],
+        confidence=min(0.6, max(0.1, proposal.confidence)),
+        evidence_lines=[evidence],
+        exploit_precondition_terms=proposal.exploit_preconditions,
+        recommended_validation=[f"Validate exploitability of {function_name} against the stated precondition."],
+        source_detection_ids=["llm_proposer"],
+        proof_status="strong_local_path",
+        status="needs_manual_review",
+    )
+
+
+def propose_hypotheses(inp: ProposeHypothesesInput, state) -> ProposeHypothesesOutput:
+    from sentinel.llm import provider as llm_provider
+
+    ranges = _function_range_index(state.get("static_facts", {}))
+    if not ranges:
+        return ProposeHypothesesOutput(status=ToolStatus.OK, notes=["No function ranges available; proposer skipped."])
+    if not state.get("use_llm_refiner", False):
+        return ProposeHypothesesOutput(status=ToolStatus.OK, notes=["LLM disabled; proposer skipped."])
+
+    prompt = _build_proposer_prompt(state, inp.objective or state.get("objective", ""))
+    notes: list[str] = []
+    raw_preview: str | None = None
+    proposer = llm_provider.get_hypothesis_proposer(mock=False)
+    try:
+        batch = proposer.propose(prompt)
+    except Exception as exc:
+        notes.append(f"Primary proposer unavailable; trying Ollama fallback: {type(exc).__name__}: {exc}")
+        try:
+            proposer = llm_provider.get_ollama_fallback_proposer()
+            batch = proposer.propose(prompt)
+            notes.append("Ollama fallback proposer applied.")
+        except Exception as fallback_exc:
+            return ProposeHypothesesOutput(
+                status=ToolStatus.OK,
+                notes=[*notes, f"Proposer unavailable: {type(fallback_exc).__name__}: {fallback_exc}"],
+                raw_preview=str(getattr(proposer, "last_raw", "") or "")[:1200] or None,
+            )
+
+    raw_preview = str(getattr(proposer, "last_raw", "") or "")[:1200] or None
+    proposed = batch.hypotheses[: inp.max_hypotheses]
+    grounded: list[VulnerabilityHypothesis] = []
+    dropped_proposals: list[dict] = []
+    for i, proposal in enumerate(proposed, start=1):
+        hypothesis = _ground_proposal(i, proposal, ranges, inp.repo_path)
+        if hypothesis is not None:
+            grounded.append(hypothesis)
+        else:
+            dropped_proposals.append(
+                {"affected_file": proposal.affected_file, "affected_function": proposal.affected_function, "title": proposal.title}
+            )
+    dropped = len(proposed) - len(grounded)
+    if dropped:
+        notes.append(f"Dropped {dropped} ungrounded proposal(s) citing non-existent file/function.")
+    if not proposed:
+        notes.append("Model returned no parseable hypotheses (see raw_preview).")
+    return ProposeHypothesesOutput(
+        status=ToolStatus.OK,
+        hypotheses=grounded,
+        proposed_count=len(proposed),
+        grounded_count=len(grounded),
+        dropped_count=dropped,
+        notes=notes,
+        raw_preview=raw_preview,
+        dropped_proposals=dropped_proposals[:10],
+    )
+
+
 def register(registry) -> None:
     for tool in [
         RegisteredTool(namespace="research", name="search_local_vuln_db", description="Search local vulnerability class memory.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=search_local_vuln_db, side_effects=[SideEffect.NONE]),
@@ -1101,6 +1351,7 @@ def register(registry) -> None:
         RegisteredTool(namespace="research", name="challenge_finding", description="Challenge whether historical matches are supported by local target evidence.", input_model=HistoricalFindingQuery, output_model=ResearchGenericOutput, fn=challenge_finding, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="map_to_vulnerability_class", description="Map evidence to vulnerability class.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=map_to_vulnerability_class, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="rank_hypotheses", description="Rank candidate vulnerability hypotheses.", input_model=RankHypothesesInput, output_model=RankHypothesesOutput, fn=rank_hypotheses, side_effects=[SideEffect.NONE]),
+        RegisteredTool(namespace="research", name="propose_hypotheses", description="Use the LLM to propose novel, code-specific vulnerability hypotheses grounded in real source; ungrounded proposals are dropped.", input_model=ProposeHypothesesInput, output_model=ProposeHypothesesOutput, fn=propose_hypotheses, side_effects=[SideEffect.EXTERNAL_NETWORK], requires_network=True, execution_kind="llm"),
         RegisteredTool(namespace="research", name="summarize_known_pattern", description="Summarize a known vulnerability pattern.", input_model=ResearchNoteInput, output_model=ResearchNoteOutput, fn=summarize_known_pattern, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="summarize_prior_case", description="Summarize a prior vulnerability case.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=summarize_prior_case, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="spawn_research_subgraph", description="Expose research subgraph spawning capability.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=spawn_research_subgraph_tool, side_effects=[SideEffect.NONE]),

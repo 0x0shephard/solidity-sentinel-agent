@@ -5,9 +5,22 @@ import json
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 
-from sentinel.llm.base import BasePlanner, BaseResearchRefiner, ToolPlan
-from sentinel.llm.ollama import extract_json_object, parse_research_refinement
-from sentinel.schemas.research import ResearchRefinement
+from sentinel.llm.base import (
+    BaseAdversarialReviewer,
+    BaseHypothesisProposer,
+    BasePlanner,
+    BaseResearchRefiner,
+    ToolPlan,
+)
+from sentinel.llm.ollama import (
+    _PROPOSER_SYSTEM,
+    _REVIEWER_SYSTEM,
+    extract_json_object,
+    parse_adversarial_verdict,
+    parse_proposed_hypotheses,
+    parse_research_refinement,
+)
+from sentinel.schemas.research import AdversarialVerdict, ProposedHypothesisBatch, ResearchRefinement
 
 
 DEFAULT_HF_ROUTER_URL = "https://router.huggingface.co/v1"
@@ -81,3 +94,41 @@ class HuggingFaceResearchRefiner(BaseResearchRefiner):
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
         return parse_research_refinement(content)
+
+
+class HuggingFaceHypothesisProposer(BaseHypothesisProposer):
+    def __init__(self, model: str, token: str, base_url: str | None = None, llm: ChatHuggingFace | None = None) -> None:
+        endpoint = HuggingFaceEndpoint(
+            **_endpoint_kwargs(model, base_url),
+            huggingfacehub_api_token=token,
+            temperature=0.0,
+            max_new_tokens=1500,
+        )
+        self.llm = llm or ChatHuggingFace(llm=endpoint, model_id=model, temperature=0.0)
+
+    def propose(self, prompt: str) -> ProposedHypothesisBatch:
+        self.last_raw = ""
+        response = self.llm.invoke(
+            [SystemMessage(content=_PROPOSER_SYSTEM), HumanMessage(content=prompt)]
+        )
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        self.last_raw = content
+        return parse_proposed_hypotheses(content)
+
+
+class HuggingFaceAdversarialReviewer(BaseAdversarialReviewer):
+    def __init__(self, model: str, token: str, base_url: str | None = None, llm: ChatHuggingFace | None = None) -> None:
+        endpoint = HuggingFaceEndpoint(
+            **_endpoint_kwargs(model, base_url),
+            huggingfacehub_api_token=token,
+            temperature=0.0,
+            max_new_tokens=1024,
+        )
+        self.llm = llm or ChatHuggingFace(llm=endpoint, model_id=model, temperature=0.0)
+
+    def review(self, prompt: str) -> AdversarialVerdict:
+        response = self.llm.invoke(
+            [SystemMessage(content=_REVIEWER_SYSTEM), HumanMessage(content=prompt)]
+        )
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        return parse_adversarial_verdict(content)

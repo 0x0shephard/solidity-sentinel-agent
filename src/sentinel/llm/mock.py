@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-from sentinel.llm.base import BasePlanner, BaseResearchRefiner, ToolPlan
-from sentinel.schemas.research import ResearchRefinement
+from sentinel.llm.base import (
+    BaseAdversarialReviewer,
+    BaseHypothesisProposer,
+    BasePlanner,
+    BaseResearchRefiner,
+    ToolPlan,
+)
+from sentinel.schemas.research import AdversarialVerdict, ProposedHypothesisBatch, ResearchRefinement
 
 
 class MockPlanner(BasePlanner):
@@ -12,3 +18,13 @@ class MockPlanner(BasePlanner):
 class MockResearchRefiner(BaseResearchRefiner):
     def refine(self, prompt: str) -> ResearchRefinement:
         return ResearchRefinement()
+
+
+class MockHypothesisProposer(BaseHypothesisProposer):
+    def propose(self, prompt: str) -> ProposedHypothesisBatch:
+        return ProposedHypothesisBatch()
+
+
+class MockAdversarialReviewer(BaseAdversarialReviewer):
+    def review(self, prompt: str) -> AdversarialVerdict:
+        return AdversarialVerdict()

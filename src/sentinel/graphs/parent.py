@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import functools
 import json
 from pathlib import Path
+import re
 import uuid
 
 from langgraph.graph import END, START, StateGraph
@@ -18,11 +19,12 @@ from sentinel.graphs.research import DEFAULT_RESEARCH_TOOLS, run_research_subgra
 from sentinel.graphs.rag_subgraph import initial_rag_state, run_rag_subgraph
 from sentinel.llm.provider import get_ollama_fallback_planner, get_planner
 from sentinel.observability.logging import log_event
-from sentinel.observability.tracing import trace_span
+from sentinel.observability.tracing import configure_tracing, trace_span
 from sentinel.rag.sync import sync_solodit
 from sentinel.reporting import build_report_document, create_findings_from_state, render_markdown_report
 from sentinel.schemas.common import ArtifactRef, CompletedStep, PlanStep
 from sentinel.schemas.research import VulnerabilityHypothesis
+from sentinel.schemas.static import SourceEvidence
 from sentinel.state import AuditState, initial_audit_state, initial_research_state
 from sentinel.tools import build_default_registry
 from sentinel.tools.executor import ToolExecutor, _json_hash
@@ -197,6 +199,164 @@ def _function_body_snippets_for_hypothesis(state: AuditState, hypothesis: Vulner
             }
         )
     return snippets[:4]
+
+
+def _caller_context_snippets(state: AuditState, hypothesis: VulnerabilityHypothesis) -> list[dict]:
+    """Cross-contract callers of the hypothesis's affected function(s).
+
+    Adversarial deepening needs to see who calls the affected function to decide
+    whether a precondition is satisfied atomically (mitigation) or reachable by
+    an attacker (confirmation) — e.g. a factory/configurator that initializes and
+    wires a manager in the same transaction.
+    """
+
+    from sentinel.evidence import classify_source_path
+
+    repo_path = Path(state.get("repo_path", ""))
+    ranges = state.get("static_facts", {}).get("function_ranges", [])
+    targets = {name for name in [*hypothesis.affected_functions, hypothesis.affected_function] if name}
+    if not str(repo_path) or not ranges or not targets:
+        return []
+
+    file_lines: dict[str, list[str]] = {}
+
+    def _lines(rel_path: str) -> list[str]:
+        if rel_path not in file_lines:
+            source = repo_path / rel_path
+            file_lines[rel_path] = source.read_text(encoding="utf-8", errors="replace").splitlines() if source.exists() else []
+        return file_lines[rel_path]
+
+    snippets: list[dict] = []
+    seen: set[tuple] = set()
+    used = 0
+    for raw_range in ranges:
+        if not isinstance(raw_range, dict):
+            continue
+        file_path = str(raw_range.get("file_path") or "")
+        function_name = raw_range.get("function_name")
+        if function_name in targets:
+            continue  # the definition itself, not a caller
+        if classify_source_path(file_path) not in {"production", "unknown"}:
+            continue  # only target protocol callers, not lib/test/script
+        start_line, end_line = raw_range.get("start_line"), raw_range.get("end_line")
+        if not isinstance(start_line, int) or not isinstance(end_line, int):
+            continue
+        body = "\n".join(_lines(file_path)[max(0, start_line - 1):end_line])
+        # Whole-word match so indirect call sites are captured too, e.g.
+        # `abi.encodeCall(IFactoryEntity.initialize, (params))` for proxy-based
+        # atomic initialization — not just direct `name(` calls.
+        if not any(re.search(rf"(?<![A-Za-z0-9_]){re.escape(target)}(?![A-Za-z0-9_])", body) for target in targets):
+            continue
+        key = (file_path, function_name, start_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        block = body[:2200]
+        if used + len(block) > 8000:
+            break
+        used += len(block)
+        snippets.append(
+            {
+                "kind": "caller_context",
+                "file_path": file_path,
+                "line_start": start_line,
+                "line_end": end_line,
+                "function": function_name,
+                "contract": raw_range.get("contract_name"),
+                "text": block,
+                "message": f"Cross-contract caller of {sorted(targets)} — use to judge atomic mitigation vs. attacker reachability.",
+            }
+        )
+        if len(snippets) >= 4:
+            break
+    return snippets
+
+
+def _cross_contract_neighbor_evidence(state: AuditState, hypothesis: VulnerabilityHypothesis, existing_files: set[str]) -> SourceEvidence | None:
+    """A callee/caller of the affected function in a different target file, from the call graph."""
+
+    from sentinel.evidence import classify_source_path
+
+    ir = state.get("protocol_ir")
+    ranges = state.get("static_facts", {}).get("function_ranges", [])
+    repo_path = Path(state.get("repo_path", ""))
+    targets = {name for name in [*hypothesis.affected_functions, hypothesis.affected_function] if name}
+    if ir is None or not ranges or not targets:
+        return None
+    neighbors: set[str] = set()
+    for edge in getattr(ir, "call_edges", []):
+        if edge.to_function in targets and edge.from_function:
+            neighbors.add(edge.from_function)
+        if edge.from_function in targets and edge.to_function:
+            neighbors.add(edge.to_function)
+    neighbors -= targets
+    if not neighbors:
+        return None
+    for raw_range in ranges:
+        if not isinstance(raw_range, dict):
+            continue
+        name = raw_range.get("function_name")
+        file_path = str(raw_range.get("file_path") or "")
+        if name not in neighbors or file_path in existing_files:
+            continue
+        if classify_source_path(file_path) not in {"production", "unknown"}:
+            continue
+        start, end = raw_range.get("start_line"), raw_range.get("end_line")
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+        source = repo_path / file_path
+        if not source.exists():
+            continue
+        body = "\n".join(source.read_text(encoding="utf-8", errors="replace").splitlines()[max(0, start - 1):end])
+        if not body.strip():
+            continue
+        return SourceEvidence(
+            file_path=file_path,
+            line_start=start,
+            line_end=end,
+            contract_name=raw_range.get("contract_name"),
+            function_name=name,
+            source_text=body[:1200],
+            reason=f"Cross-contract call path: {name} in {file_path} is on the call graph of the affected function.",
+        )
+    return None
+
+
+def _attach_cross_contract_evidence(state: AuditState) -> None:
+    """Phase 2.3: broaden each hypothesis's evidence to span >=2 contracts.
+
+    Findings should cite the cross-contract call path, not just the single
+    affected function. We attach one real, target-scoped caller or callee from a
+    different file (via the call graph) so reports and the cross-contract metric
+    reflect the protocol structure that already exists in the IR.
+    """
+
+    for hypothesis in state.get("hypotheses", []):
+        existing_files = {item.file_path for item in hypothesis.evidence_lines if item.file_path}
+        if not existing_files:
+            continue
+        added = False
+        for snippet in _caller_context_snippets(state, hypothesis):
+            file_path = snippet.get("file_path")
+            if not file_path or file_path in existing_files:
+                continue
+            hypothesis.evidence_lines.append(
+                SourceEvidence(
+                    file_path=file_path,
+                    line_start=snippet.get("line_start") or 1,
+                    line_end=snippet.get("line_end") or (snippet.get("line_start") or 1),
+                    contract_name=snippet.get("contract"),
+                    function_name=snippet.get("function"),
+                    source_text=str(snippet.get("text", ""))[:1200],
+                    reason=f"Cross-contract call path: {snippet.get('function')} in {file_path} reaches the affected function.",
+                )
+            )
+            added = True
+            break
+        if not added:
+            neighbor = _cross_contract_neighbor_evidence(state, hypothesis, existing_files)
+            if neighbor is not None:
+                hypothesis.evidence_lines.append(neighbor)
 
 
 def _tool_prompt(state: AuditState) -> str:
@@ -812,8 +972,49 @@ def rank_hypotheses(state: AuditState) -> AuditState:
         VulnerabilityHypothesis.model_validate(hypothesis)
         for hypothesis in state["last_outputs"].get("research.rank_hypotheses", {}).get("hypotheses", [])
     ]
+    _merge_model_proposed_hypotheses(state)
+    _attach_cross_contract_evidence(state)
     state["current_focus"] = "research_subgraph"
     return state
+
+
+def _merge_model_proposed_hypotheses(state: AuditState) -> None:
+    """Ask the LLM for novel, code-grounded hypotheses and merge the survivors.
+
+    Only runs in real-LLM mode. Proposals that do not ground to existing source
+    are dropped inside the tool, so this never injects hallucinated findings.
+    """
+    if not state.get("use_llm_refiner", False):
+        return
+    proposed = _run_tool(
+        state,
+        "research.propose_hypotheses",
+        {"repo_path": state["repo_path"], "objective": state["objective"], "max_hypotheses": 6},
+    )
+    model_hypotheses = list(getattr(proposed, "hypotheses", []) or [])
+    if not model_hypotheses:
+        return
+    existing = {
+        (h.vulnerability_class, tuple(sorted(h.affected_files)), tuple(sorted(h.affected_functions)))
+        for h in state["hypotheses"]
+    }
+    added = 0
+    for hypothesis in model_hypotheses:
+        signature = (
+            hypothesis.vulnerability_class,
+            tuple(sorted(hypothesis.affected_files)),
+            tuple(sorted(hypothesis.affected_functions)),
+        )
+        if signature in existing:
+            continue
+        existing.add(signature)
+        state["hypotheses"].append(hypothesis)
+        added += 1
+    _record_step(
+        state,
+        "research.propose_hypotheses",
+        f"Merged {added} model-proposed hypotheses (grounded={getattr(proposed, 'grounded_count', 0)}, dropped={getattr(proposed, 'dropped_count', 0)})",
+    )
 
 
 def _select_hypotheses_for_deepening(hypotheses: list[VulnerabilityHypothesis], max_items: int = 10) -> list[VulnerabilityHypothesis]:
@@ -895,7 +1096,7 @@ def research_subgraph(state: AuditState) -> AuditState:
         return state
 
     for index, hypothesis in enumerate(_select_hypotheses_for_deepening(hypotheses), start=1):
-        selected_snippets = _evidence_snippets_for_hypothesis(state, hypothesis)
+        selected_snippets = _evidence_snippets_for_hypothesis(state, hypothesis) + _caller_context_snippets(state, hypothesis)
         subgraph_state = initial_research_state(
             subgraph_run_id=f"{state['run_id']}-research-{index}",
             parent_run_id=state["run_id"],
@@ -1071,6 +1272,14 @@ def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bo
     run_dir = str(Path("runs") / actual_run_id)
     state = initial_audit_state(run_id=actual_run_id, repo=repo, objective=objective, run_dir=run_dir)
     state["use_llm_refiner"] = not mock_llm
+    # Never let an unreachable LangSmith endpoint stall LLM calls: reconcile
+    # auto-tracing with settings before the graph (and its LLM calls) run.
+    tracing_requested = get_settings().langsmith_tracing
+    remote_tracing = configure_tracing()
+    if tracing_requested and not remote_tracing:
+        state.setdefault("warnings", []).append(
+            "LangSmith tracing requested but endpoint is unreachable; disabled remote tracing and using local spans."
+        )
     ensure_run_dir(run_dir)
     with trace_span("audit.run", run_dir, run_id=actual_run_id, repo=repo, mock_llm=mock_llm):
         result = build_parent_graph(use_llm_planner=not mock_llm).invoke(state)

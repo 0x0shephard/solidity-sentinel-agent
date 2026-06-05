@@ -72,3 +72,41 @@ class ResearchRefinement(BaseModel):
     recommended_tests: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     confidence_delta: float = Field(default=0.0, ge=-0.2, le=0.2)
+
+
+class ProposedHypothesis(BaseModel):
+    """A model-proposed, code-specific vulnerability lead.
+
+    The model only *names* the file and function it is reasoning about; the
+    proposer tool attaches the real source from the repository's function ranges
+    and drops any proposal that does not ground to existing code. This keeps
+    proposals evidence-grounded rather than hallucinated.
+    """
+
+    title: str
+    vulnerability_class: str
+    affected_file: str
+    affected_function: str
+    affected_contract: str | None = None
+    reasoning: str = ""
+    exploit_preconditions: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class ProposedHypothesisBatch(BaseModel):
+    hypotheses: list[ProposedHypothesis] = Field(default_factory=list)
+
+
+class AdversarialVerdict(BaseModel):
+    """Result of adversarially deepening a hypothesis against its callers.
+
+    The reviewer is shown the affected function plus its cross-contract callers
+    and must either construct a concrete attack trace (confirm) or cite the
+    mitigation it found (reject), e.g. an atomic initialize+wire in a factory.
+    """
+
+    verdict: Literal["confirmed", "likely", "rejected", "needs_manual_review"] = "needs_manual_review"
+    attack_trace: list[str] = Field(default_factory=list)
+    counterevidence: list[str] = Field(default_factory=list)
+    reasoning: str = ""
+    confidence_delta: float = Field(default=0.0, ge=-0.5, le=0.5)

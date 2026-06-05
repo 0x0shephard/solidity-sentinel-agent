@@ -6,7 +6,7 @@ from langgraph.graph import END, START, StateGraph
 
 from sentinel.llm import provider as llm_provider
 from sentinel.schemas.common import ToolStatus
-from sentinel.schemas.research import ResearchRefinement, ResearchSubgraphResult
+from sentinel.schemas.research import AdversarialVerdict, ResearchRefinement, ResearchSubgraphResult, VulnerabilityHypothesis
 from sentinel.state import ResearchState
 from sentinel.tools import build_default_registry
 from sentinel.tools.executor import ToolExecutor
@@ -148,7 +148,9 @@ def analyze_hypothesis(state: ResearchState) -> ResearchState:
     snippets = state.get("selected_snippets", [])
     if snippets:
         state.setdefault("notes", []).append(f"Reviewed {len(snippets)} selected snippet(s) for {hypothesis.id}.")
-        state["evidence_records"] = _evidence_records(snippets)
+        # Caller context informs adversarial review but is not itself bug evidence.
+        evidence_snippets = [s for s in snippets if s.get("kind") != "caller_context"]
+        state["evidence_records"] = _evidence_records(evidence_snippets)
     else:
         state.setdefault("notes", []).append(f"No snippets were provided for {hypothesis.id}; confidence remains conservative.")
         state["evidence_records"] = []
@@ -215,6 +217,71 @@ def refine_with_llm(state: ResearchState) -> ResearchState:
     return state
 
 
+def _adversarial_prompt(state: ResearchState, function_bodies: list[dict], callers: list[dict]) -> str:
+    hypothesis = state["hypothesis"]
+    payload = {
+        "objective": state["objective"],
+        "hypothesis": {
+            "title": hypothesis.title,
+            "vulnerability_class": hypothesis.vulnerability_class,
+            "affected_file": hypothesis.affected_files[0] if hypothesis.affected_files else None,
+            "affected_function": hypothesis.affected_function or (hypothesis.affected_functions[0] if hypothesis.affected_functions else None),
+            "claimed_preconditions": hypothesis.exploit_precondition_terms,
+            "reasoning": hypothesis.evidence_summary,
+        },
+        "affected_function_source": [
+            {"file": s.get("file_path"), "function": s.get("function"), "code": s.get("text")}
+            for s in function_bodies[:4]
+        ],
+        "cross_contract_callers": [
+            {"file": s.get("file_path"), "function": s.get("function"), "code": s.get("text")}
+            for s in callers[:4]
+        ],
+        "instruction": (
+            "Decide whether the hypothesis is exploitable using ONLY the supplied code. If a caller satisfies "
+            "the dangerous precondition atomically at deployment, reject with that caller as counterevidence. "
+            "If an attacker can reach the function independently or first, confirm with a concrete attack_trace."
+        ),
+    }
+    return json.dumps(payload, indent=2)
+
+
+def adversarial_review(state: ResearchState) -> ResearchState:
+    if not state.get("use_llm_refiner", False):
+        state.setdefault("notes", []).append("Adversarial review disabled; relying on static proof status.")
+        return state
+    snippets = state.get("selected_snippets", [])
+    function_bodies = [s for s in snippets if s.get("kind") in {"function_body", "source_evidence"}]
+    callers = [s for s in snippets if s.get("kind") == "caller_context"]
+    if not function_bodies and not callers:
+        state.setdefault("notes", []).append("Adversarial review skipped; no source context available.")
+        return state
+    prompt = _adversarial_prompt(state, function_bodies, callers)
+    try:
+        verdict = llm_provider.get_adversarial_reviewer(mock=False).review(prompt)
+    except Exception as exc:
+        state.setdefault("notes", []).append(f"Primary adversarial reviewer unavailable; trying Ollama fallback: {type(exc).__name__}: {exc}")
+        try:
+            verdict = llm_provider.get_ollama_fallback_reviewer().review(prompt)
+            state.setdefault("notes", []).append("Ollama fallback adversarial reviewer applied.")
+        except Exception as fallback_exc:
+            state.setdefault("notes", []).append(f"Adversarial review unavailable: {type(fallback_exc).__name__}: {fallback_exc}")
+            return state
+    state["adversarial_verdict"] = verdict
+    state.setdefault("notes", []).append(
+        f"Adversarial verdict: {verdict.verdict} (callers reviewed: {len(callers)})."
+    )
+    return state
+
+
+_ADVERSARIAL_STATUS = {
+    "confirmed": "confirmed",
+    "likely": "likely",
+    "rejected": "rejected",
+    "needs_manual_review": "needs_manual_review",
+}
+
+
 def create_result(state: ResearchState) -> ResearchState:
     hypothesis = state["hypothesis"]
     functions = hypothesis.affected_functions
@@ -263,6 +330,27 @@ def create_result(state: ResearchState) -> ResearchState:
         finding_status = "likely"
     else:
         finding_status = "needs_manual_review"
+
+    # Adversarial verdict (Phase 2.2) is the deepest signal: it reviewed the
+    # affected function against its cross-contract callers. A decisive verdict
+    # overrides the static heuristic and supplies the attack trace or the
+    # mitigation counterevidence.
+    reasoning_summary = likely_impact
+    verdict = state.get("adversarial_verdict")
+    if verdict is not None and verdict.verdict in {"confirmed", "likely", "rejected"}:
+        finding_status = _ADVERSARIAL_STATUS[verdict.verdict]
+        confidence = min(0.95, max(0.0, confidence + verdict.confidence_delta))
+        if verdict.reasoning:
+            reasoning_summary = verdict.reasoning
+        if verdict.attack_trace:
+            exploit_preconditions = verdict.attack_trace
+        if verdict.counterevidence:
+            limitations = [*limitations, *(f"Counterevidence: {item}" for item in verdict.counterevidence)]
+            hypothesis.counterevidence = [*hypothesis.counterevidence, *verdict.counterevidence]
+        if finding_status == "rejected":
+            hypothesis.status = "rejected"
+            hypothesis.proof_status = "rejected_by_counterevidence"
+
     result = ResearchSubgraphResult(
         status=ToolStatus.OK,
         subgraph_run_id=state["subgraph_run_id"],
@@ -280,7 +368,7 @@ def create_result(state: ResearchState) -> ResearchState:
         historical_findings=state.get("historical_findings", []),
         subagent_tool_ledger=[record.model_dump(mode="json") if hasattr(record, "model_dump") else record for record in state.get("subagent_tool_ledger", [])],
         finding_status=finding_status,
-        reasoning_summary=likely_impact,
+        reasoning_summary=reasoning_summary,
         historical_context_used=bool(state.get("historical_findings")),
         rag_context_bundle=state.get("rag_context_bundle"),
     )
@@ -315,13 +403,15 @@ def build_research_graph():
     graph.add_node("analyze_hypothesis", analyze_hypothesis)
     graph.add_node("retrieve_historical_context", retrieve_historical_context)
     graph.add_node("refine_with_llm", refine_with_llm)
+    graph.add_node("adversarial_review", adversarial_review)
     graph.add_node("create_result", create_result)
 
     graph.add_edge(START, "validate_scope")
     graph.add_edge("validate_scope", "analyze_hypothesis")
     graph.add_edge("analyze_hypothesis", "retrieve_historical_context")
     graph.add_edge("retrieve_historical_context", "refine_with_llm")
-    graph.add_edge("refine_with_llm", "create_result")
+    graph.add_edge("refine_with_llm", "adversarial_review")
+    graph.add_edge("adversarial_review", "create_result")
     graph.add_edge("create_result", END)
     return graph.compile()
 

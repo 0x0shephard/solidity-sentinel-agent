@@ -1,8 +1,20 @@
 from pathlib import Path
 
+import pytest
+
 from sentinel.llm.base import ToolDecision, ToolPlan
+from sentinel.llm.mock import MockHypothesisProposer
 from sentinel.graphs.parent import run_audit
 from sentinel.schemas.research import ResearchRefinement
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_hypothesis_proposer(monkeypatch):
+    """Keep real-LLM-mode audits hermetic: never call a live proposer endpoint."""
+    monkeypatch.setattr(
+        "sentinel.llm.provider.get_hypothesis_proposer",
+        lambda mock=False: MockHypothesisProposer(),
+    )
 
 
 class FakePlanner:

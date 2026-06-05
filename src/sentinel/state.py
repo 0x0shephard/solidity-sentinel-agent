@@ -7,7 +7,7 @@ from sentinel.schemas.invariants import AuditWorkingMemory, GapFindingCandidate,
 from sentinel.schemas.protocol_ir import ProtocolGraph, ProtocolIR
 from sentinel.schemas.rag import RAGContextBundle, RepoRAGProfile, TargetedRAGState
 from sentinel.schemas.report import Finding
-from sentinel.schemas.research import ResearchRefinement, ResearchSubgraphResult, VulnerabilityHypothesis
+from sentinel.schemas.research import AdversarialVerdict, ResearchRefinement, ResearchSubgraphResult, VulnerabilityHypothesis
 
 
 class AuditState(TypedDict, total=False):
@@ -73,6 +73,7 @@ class ResearchState(TypedDict, total=False):
     rag_context_bundle: RAGContextBundle | None
     subagent_tool_ledger: list[ToolCallRecord]
     llm_refinement: ResearchRefinement
+    adversarial_verdict: AdversarialVerdict | None
     result: ResearchSubgraphResult
 
 
@@ -148,4 +149,5 @@ def initial_research_state(
         "historical_findings": [],
         "rag_context_bundle": None,
         "subagent_tool_ledger": [],
+        "adversarial_verdict": None,
     }

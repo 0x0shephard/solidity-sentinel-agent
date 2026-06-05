@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from sentinel.schemas.research import ResearchRefinement
+from sentinel.schemas.research import AdversarialVerdict, ProposedHypothesisBatch, ResearchRefinement
 
 
 class ToolDecision(BaseModel):
@@ -24,4 +24,14 @@ class BasePlanner:
 
 class BaseResearchRefiner:
     def refine(self, prompt: str) -> ResearchRefinement:
+        raise NotImplementedError
+
+
+class BaseHypothesisProposer:
+    def propose(self, prompt: str) -> ProposedHypothesisBatch:
+        raise NotImplementedError
+
+
+class BaseAdversarialReviewer:
+    def review(self, prompt: str) -> AdversarialVerdict:
         raise NotImplementedError

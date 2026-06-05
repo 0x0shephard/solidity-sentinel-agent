@@ -5,9 +5,36 @@ from datetime import UTC, datetime
 from functools import lru_cache
 import contextlib
 import io
+import os
 import uuid
 
 from sentinel.config import get_settings
+
+
+_REMOTE_TRACING_ENV = ("LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING", "LANGSMITH_TRACING")
+
+
+def configure_tracing() -> bool:
+    """Reconcile LangChain/LangSmith auto-tracing with Sentinel settings.
+
+    LangChain auto-traces every LLM call when any of the LANGSMITH/LANGCHAIN
+    tracing env vars are truthy. If the configured LangSmith endpoint is
+    unreachable, each span blocks on a 10s connect timeout and stalls the whole
+    audit. This reconciles the env with our settings: remote tracing stays on
+    only when it is enabled *and* the endpoint is actually writable; otherwise
+    every auto-tracing env var is forced off so runs degrade to local spans.
+
+    Returns True when remote tracing is active.
+    """
+
+    settings = get_settings()
+    active = False
+    if settings.langsmith_tracing and settings.langsmith_api_key:
+        active = _langsmith_trace_writable(settings.langsmith_api_key, settings.langsmith_project)
+    if not active:
+        for var in _REMOTE_TRACING_ENV:
+            os.environ[var] = "false"
+    return active
 
 
 @lru_cache(maxsize=8)
