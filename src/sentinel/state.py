@@ -27,6 +27,7 @@ class AuditState(TypedDict, total=False):
     completed_steps: list[CompletedStep]
     open_questions: list[str]
     current_focus: str
+    completed_stages: list[str]
     tool_call_count: int
     tool_ledger: list[ToolCallRecord]
     compressed_context: str
@@ -88,6 +89,7 @@ def initial_audit_state(run_id: str, repo: str, objective: str, run_dir: str) ->
         "completed_steps": [],
         "open_questions": [],
         "current_focus": "initialize",
+        "completed_stages": [],
         "tool_call_count": 0,
         "tool_ledger": [],
         "compressed_context": "",

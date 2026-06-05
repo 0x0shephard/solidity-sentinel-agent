@@ -30,6 +30,45 @@ def _write_fixture_repo(path: Path) -> None:
     )
 
 
+class CompositeDrivingPlanner:
+    """Plans a single composite tool, then stops — the model drives the whole audit."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def plan(self, prompt, tools):
+        self.calls += 1
+        if self.calls == 1:
+            return ToolPlan(
+                decisions=[ToolDecision(tool_name="audit.research_hypotheses", tool_input={}, rationale="drive full pipeline")],
+                stop=False,
+            )
+        return ToolPlan(decisions=[], stop=True)
+
+
+def test_planner_drives_full_pipeline_via_composite_tool(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    _write_fixture_repo(repo)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sentinel.graphs.parent.get_planner", lambda mock=False: CompositeDrivingPlanner())
+    monkeypatch.setattr("sentinel.graphs.research.llm_provider.get_research_refiner", lambda mock=False: FakeRefiner())
+
+    state = run_audit(str(repo), "Find bugs", run_id="composite-run", mock_llm=False)
+
+    assert state["current_focus"] == "done"
+    # The model's single composite call completed every milestone during planning.
+    plan_record = state["last_outputs"]["llm.plan_with_llm"]
+    assert any(d["tool_name"] == "audit.research_hypotheses" for d in plan_record["executed"])
+    assert plan_record["stop_reason"] == "milestones_complete"
+    assert all(plan_record["milestones"].values())
+    # Every pipeline stage was completed during planning (model-driven), so the
+    # deterministic chain had nothing left to do.
+    assert state["completed_stages"][-1] == "research_completed"
+    assert len(state["completed_stages"]) == 11
+    assert state.get("protocol_ir") is not None
+    assert Path("runs/composite-run/report.md").exists()
+
+
 def test_real_mode_graph_uses_planner_and_keeps_guardrails(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     _write_fixture_repo(repo)

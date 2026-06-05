@@ -38,9 +38,9 @@ class ToolRegistry:
 
 
 def build_default_registry() -> ToolRegistry:
-    from sentinel.tools import build, dynamic, memory, repo, report, research, static
+    from sentinel.tools import build, composite, dynamic, memory, repo, report, research, static
 
     registry = ToolRegistry()
-    for module in [repo, build, static, research, dynamic, report, memory]:
+    for module in [repo, build, static, research, dynamic, report, memory, composite]:
         module.register(registry)
     return registry

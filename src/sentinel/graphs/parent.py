@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import UTC, datetime
+import functools
 import json
 from pathlib import Path
 import uuid
@@ -231,6 +232,7 @@ def _tool_prompt(state: AuditState) -> str:
         f"RAG checklist items: {checklist_items}\n"
         f"Audit milestones: {milestones}\n"
         f"Next required milestone to complete: {next_milestone}\n"
+        f"How to advance it: {_next_milestone_tool_hint(next_milestone)}\n"
         f"Tools already executed this session (tool -> count): {dict(executed_counts)}\n"
         f"Tools already repeated (avoid these unless inputs genuinely differ): {repeated_tools}\n"
         f"Most recent tool results: {recent_results}\n"
@@ -276,19 +278,103 @@ def _model_or_mapping_json(value) -> dict:
     return {}
 
 
+# Ordered audit pipeline. Each milestone maps to the graph node that completes
+# it and the composite ``audit.*`` tool the planner can call to drive it.
+_PIPELINE: list[tuple[str, str, str]] = [
+    ("repo_inspected", "inspect_repo", "audit.inspect_repo"),
+    ("framework_detected", "detect_framework", "audit.detect_framework"),
+    ("static_facts_extracted", "run_static_analysis", "audit.run_static_analysis"),
+    ("protocol_ir_built", "build_protocol_ir", "audit.build_protocol_ir"),
+    ("contest_reasoning_done", "contest_reasoning", "audit.contest_reasoning"),
+    ("protocol_model_built", "build_protocol_model", "audit.build_protocol_model"),
+    ("targeted_rag_built", "build_targeted_rag_context", "audit.build_targeted_rag_context"),
+    ("invariants_mined", "mine_invariant_candidates", "audit.mine_invariants"),
+    ("hypotheses_ranked", "rank_hypotheses", "audit.rank_hypotheses"),
+    ("rag_context_bundled", "rag_retrieve_context", "audit.retrieve_rag_context"),
+    ("research_completed", "research_subgraph", "audit.research_hypotheses"),
+]
+_PIPELINE_MILESTONES = [milestone for milestone, _node, _tool in _PIPELINE]
+_MILESTONE_TO_NODE = {milestone: node for milestone, node, _tool in _PIPELINE}
+_MILESTONE_TOOL_HINTS = {milestone: [tool] for milestone, _node, tool in _PIPELINE}
+
+
+def _stage(milestone: str, next_focus: str):
+    """Make a graph node idempotent and milestone-tracked.
+
+    The node is skipped if its milestone is already complete (so model-selected
+    composite tools and the deterministic chain never redo the same stage), and
+    completion is recorded in ``state['completed_stages']`` on success. This is
+    what turns the deterministic chain into a guarded gap-filler behind the
+    model-driven planner.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(state: AuditState) -> AuditState:
+            if milestone in state.get("completed_stages", []):
+                state["current_focus"] = next_focus
+                return state
+            result = fn(state)
+            result.setdefault("completed_stages", [])
+            if milestone not in result["completed_stages"]:
+                result["completed_stages"].append(milestone)
+            return result
+
+        wrapper.__sentinel_milestone__ = milestone
+        return wrapper
+
+    return decorator
+
+
+def _next_milestone_tool_hint(next_milestone: str | None) -> str:
+    """Tell the planner which composite tool advances the next milestone."""
+
+    if not next_milestone:
+        return "All milestones complete; set stop=true."
+    tools = _MILESTONE_TOOL_HINTS.get(next_milestone)
+    if tools:
+        return (
+            f"Call {tools[0]} next. It runs (or resumes) the audit pipeline through this stage and "
+            "records the milestone. Composite audit.* tools are self-healing: they run any missing "
+            "prerequisite stages in order, so prefer them to advance milestones."
+        )
+    return "Set stop=true; remaining milestones are finalized by the graph."
+
+
 def _planner_milestones(state: AuditState) -> dict[str, bool]:
+    done = set(state.get("completed_stages", []))
+    return {milestone: (milestone in done) for milestone in _PIPELINE_MILESTONES}
+
+
+def _ensure_pipeline_through(state: AuditState, target_milestone: str) -> AuditState:
+    """Run audit stages in dependency order up to ``target_milestone``.
+
+    Each stage node is idempotent (see ``_stage``), so already-completed stages
+    are skipped. This lets a single composite tool call resume the pipeline from
+    wherever the model left it, guaranteeing prerequisites without redoing work.
+    """
+
+    node_fns = _pipeline_node_fns()
+    for milestone, _node_name, _tool in _PIPELINE:
+        node_fns[milestone](state)
+        if milestone == target_milestone:
+            break
+    return state
+
+
+def _pipeline_node_fns() -> dict[str, "Callable[[AuditState], AuditState]"]:
     return {
-        "repo_inspected": bool(state.get("repo_facts")),
-        "framework_detected": bool(state.get("build_facts")),
-        "static_facts_extracted": bool(state.get("static_facts")),
-        "protocol_ir_built": bool(state.get("protocol_ir")),
-        "contest_reasoning_done": bool(state.get("last_outputs", {}).get("analysis.contest_reasoning")),
-        "protocol_model_built": bool(state.get("protocol_model")),
-        "targeted_rag_built": bool(state.get("targeted_rag")),
-        "invariants_mined": bool(state.get("invariant_candidates")),
-        "hypotheses_ranked": bool(state.get("hypotheses")),
-        "rag_context_bundled": bool(state.get("rag_context_bundles")),
-        "research_completed": bool(state.get("subgraph_results")),
+        "repo_inspected": inspect_repo,
+        "framework_detected": detect_framework,
+        "static_facts_extracted": run_static_analysis,
+        "protocol_ir_built": build_protocol_ir,
+        "contest_reasoning_done": contest_reasoning,
+        "protocol_model_built": build_protocol_model,
+        "targeted_rag_built": build_targeted_rag_context,
+        "invariants_mined": mine_invariants,
+        "hypotheses_ranked": rank_hypotheses,
+        "rag_context_bundled": rag_retrieve_context,
+        "research_completed": research_subgraph,
     }
 
 
@@ -378,7 +464,8 @@ def plan_with_llm(state: AuditState) -> AuditState:
     executor = ToolExecutor(registry)
     stop_reason = "planner_completed"
     executed_signatures: set[tuple[str, str]] = set()
-    for round_index in range(1, 5):
+    max_rounds = get_settings().planner_max_rounds
+    for round_index in range(1, max_rounds + 1):
         remaining_budget = get_settings().max_tool_calls - state.get("tool_call_count", 0)
         if remaining_budget <= 2:
             stop_reason = "budget_low"
@@ -415,7 +502,13 @@ def plan_with_llm(state: AuditState) -> AuditState:
                 round_record["decisions"].append({"tool_name": decision.tool_name, "status": "skipped_duplicate"})
                 continue
             executed_signatures.add(signature)
-            output = executor.execute(decision.tool_name, tool_input, state)
+            try:
+                output = executor.execute(decision.tool_name, tool_input, state)
+            except Exception as exc:
+                state.setdefault("errors", []).append(f"Tool {decision.tool_name} failed during planning: {type(exc).__name__}: {exc}")
+                skipped.append({"tool_name": decision.tool_name, "reason": "execution_error", "error_type": type(exc).__name__})
+                round_record["decisions"].append({"tool_name": decision.tool_name, "status": "execution_error"})
+                continue
             status = getattr(output, "status", "ok")
             _record_step(state, decision.tool_name, f"{decision.tool_name} selected by LLM: {decision.rationale}")
             record = {"tool_name": decision.tool_name, "status": str(status)}
@@ -474,6 +567,7 @@ def maybe_sync_solodit_rag(state: AuditState) -> AuditState:
     return state
 
 
+@_stage("repo_inspected", "detect_framework")
 def inspect_repo(state: AuditState) -> AuditState:
     repo_path = state["repo_path"]
     _run_tool(state, "repo.list_files", {"repo_path": repo_path})
@@ -488,6 +582,7 @@ def inspect_repo(state: AuditState) -> AuditState:
     return state
 
 
+@_stage("framework_detected", "run_static_analysis")
 def detect_framework(state: AuditState) -> AuditState:
     repo_path = state["repo_path"]
     _run_tool(state, "build.detect_framework", {"repo_path": repo_path})
@@ -507,6 +602,7 @@ def detect_framework(state: AuditState) -> AuditState:
     return state
 
 
+@_stage("static_facts_extracted", "build_protocol_ir")
 def run_static_analysis(state: AuditState) -> AuditState:
     repo_path = state["repo_path"]
     _run_tool(state, "static.extract_contracts", {"repo_path": repo_path})
@@ -558,6 +654,7 @@ def run_static_analysis(state: AuditState) -> AuditState:
     return state
 
 
+@_stage("protocol_ir_built", "contest_reasoning")
 def build_protocol_ir(state: AuditState) -> AuditState:
     ir = build_protocol_ir_from_facts(state["repo_path"], state.get("static_facts", {}))
     graph = build_protocol_graph(ir)
@@ -583,6 +680,7 @@ def build_protocol_ir(state: AuditState) -> AuditState:
     return state
 
 
+@_stage("contest_reasoning_done", "build_protocol_model")
 def contest_reasoning(state: AuditState) -> AuditState:
     ir = state.get("protocol_ir")
     if not ir:
@@ -615,6 +713,7 @@ def contest_reasoning(state: AuditState) -> AuditState:
     return state
 
 
+@_stage("protocol_model_built", "build_targeted_rag_context")
 def build_protocol_model(state: AuditState) -> AuditState:
     if state.get("protocol_ir"):
         state.setdefault("static_facts", {})["protocol_ir"] = state["protocol_ir"].model_dump(mode="json")
@@ -626,6 +725,7 @@ def build_protocol_model(state: AuditState) -> AuditState:
     return state
 
 
+@_stage("invariants_mined", "rank_hypotheses")
 def mine_invariants(state: AuditState) -> AuditState:
     candidates = mine_invariant_candidates(state["repo_path"], state.get("static_facts", {}))
     proof_packets = build_invariant_proof_packets(candidates, state.get("static_facts", {}))
@@ -642,6 +742,7 @@ def mine_invariants(state: AuditState) -> AuditState:
     return state
 
 
+@_stage("targeted_rag_built", "mine_invariant_candidates")
 def build_targeted_rag_context(state: AuditState) -> AuditState:
     repo_path = state["repo_path"]
     profile = _run_tool(
@@ -675,6 +776,7 @@ def build_targeted_rag_context(state: AuditState) -> AuditState:
     return state
 
 
+@_stage("hypotheses_ranked", "rag_retrieve_context")
 def rank_hypotheses(state: AuditState) -> AuditState:
     _run_tool(
         state,
@@ -761,6 +863,7 @@ def _select_hypotheses_for_deepening(hypotheses: list[VulnerabilityHypothesis], 
     return selected
 
 
+@_stage("rag_context_bundled", "research_subgraph")
 def rag_retrieve_context(state: AuditState) -> AuditState:
     hypotheses = state.get("hypotheses", [])
     if not hypotheses:
@@ -783,6 +886,7 @@ def rag_retrieve_context(state: AuditState) -> AuditState:
     return state
 
 
+@_stage("research_completed", "summarize_context")
 def research_subgraph(state: AuditState) -> AuditState:
     hypotheses = state.get("hypotheses", [])
     if not hypotheses:
