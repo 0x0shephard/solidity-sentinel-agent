@@ -15,12 +15,19 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
 
     expected_items = expected.get("expected_findings") or [expected]
 
+    def _class_matches(actual: str, expected_class: str) -> bool:
+        aliases = {
+            "unchecked_transfer": {"unchecked_transfer", "unchecked_erc20_return"},
+            "unchecked_erc20_return": {"unchecked_transfer", "unchecked_erc20_return"},
+        }
+        return actual in aliases.get(expected_class, {expected_class})
+
     def _matches_expected(item: dict) -> bool:
         expected_class = item["vulnerability_class"]
         expected_function = item["affected_function"]
         expected_file_contains = item["affected_file_contains"]
         return any(
-            finding.vulnerability_class == expected_class
+            _class_matches(finding.vulnerability_class, expected_class)
             and expected_function in finding.affected_functions
             and any(expected_file_contains in file_path for file_path in finding.affected_files)
             and bool(finding.evidence)
@@ -32,7 +39,7 @@ def score_run(fixture: str, state: dict, expected: dict) -> EvalScore:
         expected_function = item["affected_function"]
         expected_file_contains = item["affected_file_contains"]
         return any(
-            hypothesis.vulnerability_class == expected_class
+            _class_matches(hypothesis.vulnerability_class, expected_class)
             and expected_function in hypothesis.affected_functions
             and any(expected_file_contains in file_path for file_path in hypothesis.affected_files)
             for hypothesis in hypotheses

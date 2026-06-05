@@ -124,6 +124,110 @@ class TrustBoundary(BaseModel):
     source: SourceKind = "derived"
 
 
+class StatementIR(BaseModel):
+    statement_id: str
+    contract_name: str | None = None
+    function_name: str | None = None
+    file_path: str
+    line_start: int
+    line_end: int
+    statement_kind: Literal["require", "if", "for", "assignment", "call", "return", "emit", "other"] = "other"
+    source_text: str
+    normalized_terms: list[str] = Field(default_factory=list)
+    source: SourceKind = "derived"
+
+
+class DataFlowEdge(BaseModel):
+    from_expr: str
+    to_expr: str
+    contract_name: str | None = None
+    function_name: str | None = None
+    file_path: str
+    line: int | None = None
+    expression: str
+    flow_kind: Literal["assignment", "argument", "return", "storage_alias", "derived"] = "derived"
+    source: SourceKind = "derived"
+
+
+class SemanticCallEdge(BaseModel):
+    contract_name: str | None = None
+    function_name: str | None = None
+    callee: str
+    receiver_symbol: str | None = None
+    file_path: str
+    line: int | None = None
+    expression: str
+    call_kind: Literal["internal", "external", "library", "token", "checkpoint", "signature", "native_transfer", "unknown"] = "unknown"
+    value_flow: str | None = None
+    source: SourceKind = "derived"
+
+
+class LoopIR(BaseModel):
+    loop_id: str
+    contract_name: str | None = None
+    function_name: str | None = None
+    file_path: str
+    start_line: int
+    end_line: int
+    iterator: str | None = None
+    collection: str | None = None
+    body_terms: list[str] = Field(default_factory=list)
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+
+
+class CheckpointLookupIR(BaseModel):
+    lookup_id: str
+    contract_name: str | None = None
+    function_name: str | None = None
+    file_path: str
+    line: int
+    expression: str
+    lookup_kind: str
+    boundary_direction: Literal["lower", "upper", "latest", "unknown"] = "unknown"
+    timestamp_expr: str | None = None
+    index_adjustment: Literal["increment", "decrement", "none", "unknown"] = "none"
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+
+
+class FeeFormulaIR(BaseModel):
+    formula_id: str
+    contract_name: str | None = None
+    function_name: str | None = None
+    file_path: str
+    line: int
+    expression: str
+    numerator_terms: list[str] = Field(default_factory=list)
+    denominator: str | None = None
+    unit_terms: list[str] = Field(default_factory=list)
+    state_dependencies: list[str] = Field(default_factory=list)
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+
+
+class AssetCompatibilityPath(BaseModel):
+    path_id: str
+    contract_name: str | None = None
+    function_name: str | None = None
+    file_path: str
+    line: int
+    asset_kind: Literal["erc20", "erc721", "erc1155", "native", "unknown"] = "unknown"
+    transfer_expression: str
+    receiver_contract: str | None = None
+    receiver_has_receive: bool | None = None
+    receiver_has_fallback: bool | None = None
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+
+
+class DocumentationClaim(BaseModel):
+    claim_id: str
+    contract_name: str | None = None
+    function_name: str | None = None
+    file_path: str
+    line: int
+    claim_text: str
+    claim_terms: list[str] = Field(default_factory=list)
+    evidence: list[SourceEvidence] = Field(default_factory=list)
+
+
 class ActorModel(BaseModel):
     actor_id: str
     role: Literal["seller", "buyer", "owner", "admin", "keeper", "external_token", "mev_searcher", "inactive_user", "unknown"]
@@ -189,6 +293,14 @@ class ProtocolIR(BaseModel):
     auth_constraints: list[AuthConstraint] = Field(default_factory=list)
     lifecycle_transitions: list[LifecycleTransition] = Field(default_factory=list)
     trust_boundaries: list[TrustBoundary] = Field(default_factory=list)
+    statements: list[StatementIR] = Field(default_factory=list)
+    data_flows: list[DataFlowEdge] = Field(default_factory=list)
+    semantic_calls: list[SemanticCallEdge] = Field(default_factory=list)
+    loops: list[LoopIR] = Field(default_factory=list)
+    checkpoint_lookups: list[CheckpointLookupIR] = Field(default_factory=list)
+    fee_formulas: list[FeeFormulaIR] = Field(default_factory=list)
+    asset_compatibility_paths: list[AssetCompatibilityPath] = Field(default_factory=list)
+    documentation_claims: list[DocumentationClaim] = Field(default_factory=list)
     transaction_race_graph: TransactionRaceGraph = Field(default_factory=TransactionRaceGraph)
     completeness_gaps: list[str] = Field(default_factory=list)
     source: SourceKind = "derived"

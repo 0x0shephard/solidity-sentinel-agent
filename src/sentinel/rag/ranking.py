@@ -32,6 +32,27 @@ def class_protocol_score(query: HistoricalFindingQuery, finding: HistoricalFindi
     return min(1.0, score)
 
 
+def pattern_intent_score(query_terms: set[str], finding: HistoricalFinding) -> float:
+    pattern_groups = [
+        {"signature", "threshold", "signer", "duplicate", "uniqueness"},
+        {"checkpoint", "lowerlookup", "upperlookup", "batch", "claim", "eligibility"},
+        {"fee", "formula", "dimension", "shares", "assets", "d6", "d18"},
+        {"report", "accrual", "handlereport", "performance", "protocol"},
+        {"native", "receive", "fallback", "transfer"},
+        {"whitelist", "cantransfer", "boolean", "inversion"},
+        {"lockup", "transfer", "bypass", "shares"},
+        {"index", "lookup", "tree", "off", "one"},
+    ]
+    finding_terms = _terms(f"{finding.title} {finding.summary or ''} {' '.join(finding.root_cause_terms)} {finding.search_text[:6000]}")
+    best = 0.0
+    for group in pattern_groups:
+        if not query_terms.intersection(group):
+            continue
+        overlap = len(group.intersection(finding_terms))
+        best = max(best, overlap / len(group))
+    return min(1.0, best)
+
+
 def quality_recency_score(finding: HistoricalFinding) -> float:
     quality = min(1.0, max(finding.quality_score, finding.general_score) / 5.0)
     impact_bonus = {"HIGH": 0.15, "MEDIUM": 0.08, "LOW": 0.03}.get(str(finding.impact or "").upper(), 0.0)
@@ -52,9 +73,10 @@ def rank_matches(query: HistoricalFindingQuery, candidates: list[tuple[Historica
     for finding, semantic in candidates:
         kw_score, hits = keyword_score(query_terms, finding)
         cp_score = class_protocol_score(query, finding)
+        pi_score = pattern_intent_score(query_terms, finding)
         qr_score = quality_recency_score(finding)
-        final = (0.40 * semantic) + (0.30 * kw_score) + (0.20 * cp_score) + (0.10 * qr_score)
-        reason = f"semantic={semantic:.2f}, keyword={kw_score:.2f}, class_protocol={cp_score:.2f}, quality_recency={qr_score:.2f}"
+        final = (0.30 * semantic) + (0.25 * kw_score) + (0.25 * pi_score) + (0.10 * cp_score) + (0.10 * qr_score)
+        reason = f"semantic={semantic:.2f}, keyword={kw_score:.2f}, pattern_intent={pi_score:.2f}, class_protocol={cp_score:.2f}, quality_recency={qr_score:.2f}"
         matches.append(
             HistoricalFindingMatch(
                 finding=finding,

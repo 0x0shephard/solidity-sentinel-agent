@@ -92,6 +92,14 @@ def _constructor_args(repo_path: str, target_file: str, target_contract: str) ->
     return [part.strip() for part in args.split(",") if part.strip()]
 
 
+def _is_library_or_interface(repo_path: str, target_file: str, target_contract: str) -> bool:
+    source_path = Path(repo_path) / target_file
+    if not source_path.exists():
+        return False
+    text = source_path.read_text(encoding="utf-8", errors="replace")
+    return bool(re.search(rf"\b(?:library|interface)\s+{re.escape(target_contract)}\b", text))
+
+
 def _is_orderbook_like_hypothesis(hypothesis: VulnerabilityHypothesis) -> bool:
     functions = {name.lower() for name in hypothesis.affected_functions}
     terms = {term.lower() for term in hypothesis.root_cause_terms}
@@ -106,6 +114,8 @@ def _is_orderbook_like_hypothesis(hypothesis: VulnerabilityHypothesis) -> bool:
 
 def _can_generate_executable_validation(repo_path: str, hypothesis: VulnerabilityHypothesis) -> tuple[bool, str]:
     target_file, target_contract, _target_function = _target_details(hypothesis)
+    if _is_library_or_interface(repo_path, target_file, target_contract):
+        return False, f"{target_contract} is a library/interface target; emitting a proof plan instead of generating an invalid executable test."
     if _is_orderbook_like_hypothesis(hypothesis):
         args = _constructor_args(repo_path, target_file, target_contract)
         if args is not None and len(args) == 2 and all("IERC20" in arg or "ERC20" in arg for arg in args):

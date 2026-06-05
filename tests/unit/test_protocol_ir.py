@@ -232,3 +232,78 @@ def test_protocol_ir_tracks_storage_aliases_for_transaction_races(tmp_path: Path
     assert any(candidate.agent_id == "market_gap_agent" and candidate.vulnerability_class == "transaction_ordering" for candidate in gaps)
     assert any(candidate.agent_id == "numerical_gap_agent" for candidate in gaps)
     assert any(candidate.agent_id == "lifecycle_gap_agent" for candidate in gaps)
+
+
+def test_protocol_ir_extracts_semantic_signature_and_checkpoint_facts(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "Queues.sol").write_text(
+        "\n".join(
+            [
+                "pragma solidity ^0.8.20;",
+                "library Checkpoints { struct Trace224 {} function lowerLookup(Trace224 storage, uint32) internal returns (uint256) {} function upperLookupRecent(Trace224 storage, uint32) internal returns (uint256) {} function latestCheckpoint(Trace224 storage) internal returns (bool,uint32,uint224) {} }",
+                "contract Consensus {",
+                "    uint256 public threshold;",
+                "    mapping(address => uint256) public signers;",
+                "    struct Signature { address signer; bytes signature; }",
+                "    function checkSignatures(bytes32 orderHash, Signature[] calldata signatures) external view returns (bool) {",
+                "        if (signatures.length == 0 || signatures.length < threshold) return false;",
+                "        for (uint256 i = 0; i < signatures.length; i++) {",
+                "            address signer = signatures[i].signer;",
+                "            if (signers[signer] == 0) return false;",
+                "        }",
+                "        return true;",
+                "    }",
+                "}",
+                "contract RedeemQueue {",
+                "    using Checkpoints for Checkpoints.Trace224;",
+                "    Checkpoints.Trace224 private prices;",
+                "    function claim(uint32 timestamp) external { uint256 index = prices.lowerLookup(timestamp); }",
+                "    function handle(uint32 timestamp) external { (, uint32 latestTimestamp, uint224 latestIndex) = prices.latestCheckpoint(); uint256 i = prices.upperLookupRecent(timestamp); i--; }",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ranges = map_function_ranges(RepoPathInput(repo_path=str(tmp_path)), {}).model_dump(mode="json")["ranges"]
+
+    ir = build_protocol_ir(str(tmp_path), {"function_ranges": ranges})
+    summary = protocol_ir_summary(ir)
+
+    assert any(loop.collection == "signatures" for loop in ir.loops)
+    assert any(call.call_kind == "signature" for call in ir.semantic_calls)
+    assert any(lookup.boundary_direction == "lower" for lookup in ir.checkpoint_lookups)
+    assert any(lookup.boundary_direction == "upper" for lookup in ir.checkpoint_lookups)
+    assert summary["loops"] >= 1
+    assert summary["checkpoint_lookups"] >= 2
+
+
+def test_protocol_ir_extracts_fee_formula_and_native_asset_compatibility(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "Fees.sol").write_text(
+        "\n".join(
+            [
+                "pragma solidity ^0.8.20;",
+                "library Math { function mulDiv(uint256, uint256, uint256) internal pure returns (uint256) {} }",
+                "contract Receiver { function ping() external {} }",
+                "contract FeeManager {",
+                "    uint256 public performanceFeeD6;",
+                "    function calculateFee(uint256 minPriceD18_, uint256 priceD18, uint256 totalShares) external view returns (uint256 shares) {",
+                "        shares = Math.mulDiv(minPriceD18_ - priceD18, performanceFeeD6 * totalShares, 1e24);",
+                "    }",
+                "    function sendNative(address receiver, uint256 amount) external {",
+                "        payable(receiver).transfer(amount);",
+                "    }",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ranges = map_function_ranges(RepoPathInput(repo_path=str(tmp_path)), {}).model_dump(mode="json")["ranges"]
+
+    ir = build_protocol_ir(str(tmp_path), {"function_ranges": ranges})
+
+    assert any("1e24" == formula.denominator for formula in ir.fee_formulas)
+    assert any("performanceFeeD6" in formula.expression for formula in ir.fee_formulas)
+    assert any(path.asset_kind == "native" and path.function_name == "sendNative" for path in ir.asset_compatibility_paths)

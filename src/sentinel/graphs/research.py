@@ -228,17 +228,50 @@ def create_result(state: ResearchState) -> ResearchState:
     exploit_preconditions = refinement.exploit_preconditions or (["Attacker can reach the affected function"] if functions else [])
     limitations = refinement.limitations or deterministic_limitations
     confidence = min(0.95, max(0.0, hypothesis.confidence + 0.1 + refinement.confidence_delta))
+    limitation_text = " ".join(limitations).lower()
+    has_local_evidence = bool(state.get("evidence_records"))
+    has_function = bool(functions or hypothesis.affected_function)
+    has_cross_function_or_static_proof = (
+        hypothesis.proof_status == "static_proof_complete"
+        or len(set(functions)) >= 2
+        or len(hypothesis.evidence_lines) >= 2
+        or bool(hypothesis.graph_slice_ids)
+        or (
+            hypothesis.status == "likely"
+            and any("_gap_agent" in source for source in hypothesis.source_detection_ids)
+            and bool(hypothesis.exploit_precondition_terms)
+        )
+    )
+    blocking_limitation = any(
+        phrase in limitation_text
+        for phrase in [
+            "only proves",
+            "specific function",
+            "not provided",
+            "unknown if",
+            "compile failed",
+            "validation artifact compile failed",
+            "setup inference",
+            "missing trigger",
+            "missing affected function",
+            "low to none",
+        ]
+    )
     if hypothesis.status == "rejected" or hypothesis.proof_status == "rejected_by_counterevidence":
         finding_status = "rejected"
-    elif hypothesis.proof_status == "static_proof_complete" and state.get("evidence_records"):
+    elif not has_local_evidence or not has_function:
+        finding_status = "needs_manual_review"
+    elif blocking_limitation:
+        finding_status = "needs_manual_review"
+    elif hypothesis.proof_status == "static_proof_complete" and has_local_evidence:
         finding_status = "confirmed"
-    elif hypothesis.proof_status == "strong_local_path" and state.get("evidence_records"):
+    elif hypothesis.proof_status == "strong_local_path" and has_cross_function_or_static_proof:
         finding_status = "likely"
     elif hypothesis.status == "needs_manual_review" and not state.get("llm_refinement"):
         finding_status = "needs_manual_review"
-    elif state.get("evidence_records") and confidence >= 0.85:
+    elif has_local_evidence and confidence >= 0.85 and has_cross_function_or_static_proof:
         finding_status = "confirmed"
-    elif state.get("evidence_records"):
+    elif has_local_evidence and has_cross_function_or_static_proof:
         finding_status = "likely"
     else:
         finding_status = "needs_manual_review"

@@ -5,6 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from sentinel.evidence import classify_source_path
+from sentinel.analysis.invariant_queries import semantic_invariant_candidates
 from sentinel.schemas.invariants import InvariantCandidate, InvariantProofPacket, ProofObligation, ProtocolModel
 from sentinel.schemas.protocol_ir import GraphSlice, ProtocolGraph, ProtocolIR
 from sentinel.schemas.static import FunctionRange, SourceEvidence
@@ -71,6 +72,8 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
     protocol_graph = _protocol_graph_from_static_facts(static_facts)
     ranges = [FunctionRange.model_validate(item) for item in static_facts.get("function_ranges", [])]
     candidates: list[InvariantCandidate] = []
+    if protocol_ir:
+        candidates.extend(semantic_invariant_candidates(repo_path, protocol_ir))
     if protocol_graph:
         candidates.extend(_graph_slice_invariant_candidates(repo_path, protocol_graph, ranges))
     if protocol_ir:
@@ -116,11 +119,12 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
                         [evidence],
                         ["percentage", "loop", "total payout", "precision"],
                         "percentage_distribution_math",
-                        0.70,
+                        0.48,
                         invariant_family="accounting conservation",
                         required_proof="Show total distributed value across recipients cannot exceed available funds and does not omit a required divisor.",
                         proof_status="strong_local_path",
                         validation_questions=["Does the per-recipient payout need to be divided by the number of recipients?"],
+                        is_detector_only=True,
                     )
                 )
             if _looks_like_upgrade_authorizer(code) and not _file_contains(lines, ("upgradeTo(", "upgradeToAndCall(")):
@@ -131,11 +135,12 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
                         [evidence],
                         ["upgrade authorization", "implementation lifecycle"],
                         "upgrade_authorization_without_upgrade",
-                        0.66,
+                        0.45,
                         invariant_family="upgrade flow correctness",
                         required_proof="Show whether the upgrade authorization hook is reachable only through the intended proxy upgrade path.",
                         proof_status="setup_required",
                         validation_questions=["Does the code call `_authorizeUpgrade` directly instead of `upgradeTo`/`upgradeToAndCall`?"],
+                        is_detector_only=True,
                     )
                 )
             if _looks_like_unbounded_loop(code):
@@ -146,10 +151,11 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
                         [evidence],
                         ["unbounded loop", "dynamic array", "gas griefing"],
                         "unbounded_loop_dos",
-                        0.62,
+                        0.44,
                         invariant_family="gas-bounded lifecycle/accounting",
                         required_proof="Show attacker or normal protocol growth can make the loop exceed practical gas limits.",
                         validation_questions=["Is the collection length externally growable or unbounded?"],
+                        is_detector_only=True,
                     )
                 )
             if _looks_like_external_balance_trust(code):
@@ -160,10 +166,11 @@ def mine_invariant_candidates(repo_path: str, static_facts: dict) -> list[Invari
                         [evidence],
                         ["external state", "accounting trust", "reconciliation"],
                         "external_state_accounting_trust",
-                        0.64,
+                        0.45,
                         invariant_family="external-state accounting trust",
                         required_proof="Show external reported state can influence local accounting without reconciliation.",
                         validation_questions=["Is the external value reconciled against token balance deltas or trusted blindly?"],
+                        is_detector_only=True,
                     )
                 )
 
@@ -554,6 +561,7 @@ def _candidate(
     detector_ids: list[str] | None = None,
     rag_checklist_refs: list[str] | None = None,
     local_facts: list[str] | None = None,
+    is_detector_only: bool = False,
 ) -> InvariantCandidate:
     candidate_id = f"inv-{invariant_type}-{evidence[0].file_path.replace('/', '-')}-{evidence[0].line_start}"
     return InvariantCandidate(
@@ -575,6 +583,7 @@ def _candidate(
         validation_questions=validation_questions or [],
         detector_ids=detector_ids or [],
         rag_checklist_refs=rag_checklist_refs or [],
+        is_detector_only=is_detector_only,
         recommended_validation_template=template,
         confidence=confidence,
     )
@@ -656,11 +665,12 @@ def _configured_but_not_enforced(
                 writes[:2],
                 [name, "configured but not enforced", "missing guard"],
                 "configured_but_not_enforced",
-                0.72,
+                0.42,
                 invariant_family="configuration-used-as-enforcement consistency",
                 required_proof="Show the configured value is never used in an enforcement guard on the affected lifecycle path.",
                 proof_status="strong_local_path",
                 validation_questions=[f"Can the protected action succeed even when `{name}` should block it?"],
+                is_detector_only=True,
             )
         )
     return candidates
@@ -684,11 +694,12 @@ def _checked_but_not_updated(
                 reads[:2],
                 [name, "checked but not updated", "stale guard"],
                 "checked_but_never_updated",
-                0.68,
+                0.45,
                 invariant_family="state update completeness",
                 required_proof="Show the checked counter/nonce/round value is not updated after the guarded action.",
                 proof_status="strong_local_path",
                 validation_questions=[f"Can repeated calls bypass the intended limit because `{name}` never changes?"],
+                is_detector_only=True,
             )
         )
     return candidates
@@ -721,10 +732,11 @@ def _storage_layout_candidates(
                     evidence[:2],
                     ["storage layout", "upgrade compatibility", left, right],
                     "storage_layout_mismatch",
-                    0.60,
+                    0.44,
                     invariant_family="storage layout compatibility",
                     required_proof="Compare storage slots across related upgrade implementations.",
                     validation_questions=["Can an upgrade reinterpret existing proxy storage incorrectly?"],
+                    is_detector_only=True,
                 )
             )
     return candidates

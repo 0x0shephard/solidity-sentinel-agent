@@ -34,6 +34,19 @@ ASSET_TERMS = ("usdc", "token", "erc20", "bursary", "fee", "balance", "payment",
 UPGRADE_TERMS = ("uups", "upgrade", "authorizeupgrade", "implementation", "initializer", "reinitializer", "proxy")
 LIFECYCLE_TERMS = ("initialize", "start", "end", "session", "graduate", "enroll", "expel", "review", "claim", "withdraw")
 INVARIANT_TERMS = ("cutoff", "score", "bursary", "wage", "precision", "sessionend", "reviewcount", "totalsupply", "balance")
+SEMANTIC_PATTERN_TERMS = (
+    "duplicate signer",
+    "signature threshold",
+    "checkpoint boundary",
+    "lowerLookup upperLookup",
+    "batch claim eligibility",
+    "fee formula dimension",
+    "multi report fee accrual",
+    "native receive fallback",
+    "boolean whitelist inversion",
+    "indexed structure key mismatch",
+    "lockup transfer bypass",
+)
 
 
 def repo_profile_root(settings: Settings, repo_id: str) -> Path:
@@ -119,6 +132,8 @@ def build_repo_rag_profile(repo_path: str, static_facts: dict[str, Any]) -> Repo
         invariant_candidates.append("upgrade path should execute the actual proxy upgrade and preserve storage layout")
     if lifecycle_terms:
         invariant_candidates.append(f"{', '.join(lifecycle_terms[:5])} lifecycle checks should gate state transitions")
+    if protocol_ir:
+        invariant_candidates.extend(_semantic_invariant_candidates(protocol_ir))
 
     intents = [
         _intent(
@@ -147,6 +162,8 @@ def build_repo_rag_profile(repo_path: str, static_facts: dict[str, Any]) -> Repo
         intents.append(
             _intent("role-conflicts", f"Solidity role conflict authorization {' '.join(role_terms)}", "Find role/permission model findings.", "access_control", list(role_terms))
         )
+    if protocol_ir:
+        intents.extend(_semantic_search_intents(protocol_ir))
 
     seen = set()
     unique_intents = []
@@ -224,8 +241,59 @@ def _source_terms_from_ir(ir: ProtocolIR) -> list[str]:
         *[flow.expression for flow in ir.asset_flows],
         *[auth.expression for auth in ir.auth_constraints],
         *[transition.expression for transition in ir.lifecycle_transitions],
+        *[statement.source_text for statement in ir.statements[:200]],
+        *[lookup.expression for lookup in ir.checkpoint_lookups],
+        *[formula.expression for formula in ir.fee_formulas],
+        *[path.transfer_expression for path in ir.asset_compatibility_paths],
+        *[claim.claim_text for claim in ir.documentation_claims],
     ]
-    return re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", " ".join(texts).lower())[:80]
+    terms = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", " ".join(texts).lower())
+    pattern_terms = [term for pattern in _semantic_patterns_from_ir(ir) for term in pattern.split()]
+    return [*terms[:80], *pattern_terms[:80]]
+
+
+def _semantic_invariant_candidates(ir: ProtocolIR) -> list[str]:
+    return [f"{pattern} should be validated against local semantic evidence" for pattern in _semantic_patterns_from_ir(ir)][:12]
+
+
+def _semantic_search_intents(ir: ProtocolIR) -> list[RepoRAGSearchIntent]:
+    intents: list[RepoRAGSearchIntent] = []
+    for index, pattern in enumerate(_semantic_patterns_from_ir(ir)[:8], start=1):
+        vulnerability_class = "accounting" if any(term in pattern for term in ["checkpoint", "fee", "batch", "index"]) else "access_control" if "signature" in pattern else "business_logic"
+        intents.append(
+            _intent(
+                f"semantic-{index}",
+                f"Solidity {pattern} historical audit finding root cause exploit preconditions",
+                f"Find historical findings for semantic protocol pattern: {pattern}.",
+                vulnerability_class,
+                pattern.split(),
+            )
+        )
+    return intents
+
+
+def _semantic_patterns_from_ir(ir: ProtocolIR) -> list[str]:
+    patterns: list[str] = []
+    statement_text = " ".join(statement.source_text for statement in ir.statements).lower()
+    if "signature" in statement_text and "threshold" in statement_text:
+        patterns.append("signature threshold duplicate signer uniqueness")
+    if any(lookup.boundary_direction == "lower" for lookup in ir.checkpoint_lookups) and any(
+        lookup.boundary_direction in {"upper", "latest"} for lookup in ir.checkpoint_lookups
+    ):
+        patterns.append("checkpoint boundary lowerLookup upperLookup batch claim eligibility")
+    if ir.fee_formulas:
+        patterns.append("fee formula dimension D6 D18 shares assets")
+    if any(loop for loop in ir.loops if any(term.lower().startswith("report") for term in loop.body_terms)):
+        patterns.append("multi report fee accrual repeated handleReport")
+    if ir.asset_compatibility_paths:
+        patterns.append("native asset receive fallback transfer compatibility")
+    if any("cantransfer" in statement.source_text.lower() or "whitelist" in statement.source_text.lower() for statement in ir.statements):
+        patterns.append("boolean whitelist canTransfer policy inversion")
+    if any("fenwick" in statement.source_text.lower() or "lookup" in statement.source_text.lower() for statement in ir.statements):
+        patterns.append("indexed structure key mismatch lookup off by one")
+    if any("lockup" in statement.source_text.lower() or "locked" in statement.source_text.lower() for statement in ir.statements):
+        patterns.append("lockup transfer bypass minted shares")
+    return list(dict.fromkeys(patterns))
 
 
 def _class_from_finding_terms(finding: HistoricalFinding) -> str:

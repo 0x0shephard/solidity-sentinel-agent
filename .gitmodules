@@ -1,0 +1,3 @@
+[submodule "Test/2025-05-hawk-high"]
+	path = Test/2025-05-hawk-high
+	url = https://github.com/CodeHawks-Contests/2025-05-hawk-high.git

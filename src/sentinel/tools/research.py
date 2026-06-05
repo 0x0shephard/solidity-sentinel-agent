@@ -301,17 +301,35 @@ def _hypothesis_from_detection(index: int, detection: StaticDetection) -> Vulner
 
 def _dedupe_hypotheses(hypotheses: list[VulnerabilityHypothesis]) -> list[VulnerabilityHypothesis]:
     deduped: list[VulnerabilityHypothesis] = []
-    seen: set[tuple[str, str, str]] = set()
-    for item in sorted(hypotheses, key=lambda hyp: hyp.confidence, reverse=True):
+    seen: set[tuple[str, str, str, str]] = set()
+    for item in sorted(hypotheses, key=_hypothesis_rank_key, reverse=True):
         file_key = item.affected_files[0] if item.affected_files else ""
         function_key = item.affected_functions[0] if item.affected_functions else item.affected_function or ""
-        key = (item.vulnerability_class, file_key, function_key)
+        source_key = item.source_detection_ids[0] if item.source_detection_ids else item.proof_packet_id or ""
+        invariant_key = source_key.split(":", 1)[-1].split("-", 3)[0] if source_key else item.vulnerability_class
+        key = (item.vulnerability_class, invariant_key, file_key, function_key)
         if key in seen:
             continue
         seen.add(key)
         item.id = f"hyp-{len(deduped) + 1}"
         deduped.append(item)
-    return deduped[:10]
+    return deduped[:15]
+
+
+def _hypothesis_rank_key(hypothesis: VulnerabilityHypothesis) -> tuple[float, float, float, float, float]:
+    source_text = " ".join(hypothesis.source_detection_ids).lower()
+    semantic_bonus = 1.0 if "semantic." in source_text or any(source.startswith("semantic-") for source in hypothesis.source_detection_ids) else 0.0
+    detector_only_penalty = -1.0 if "configured_but_not_enforced" in source_text and not hypothesis.affected_functions else 0.0
+    proof_score = {
+        "static_proof_complete": 1.0,
+        "strong_local_path": 0.85,
+        "missing_counterevidence": 0.55,
+        "setup_required": 0.35,
+        "rejected_by_counterevidence": 0.0,
+    }.get(hypothesis.proof_status, 0.35)
+    evidence_score = min(len(hypothesis.evidence_lines), 6) / 6
+    cross_function_score = min(len(set(hypothesis.affected_functions)), 3) / 3
+    return (semantic_bonus + detector_only_penalty, proof_score, evidence_score, cross_function_score, hypothesis.confidence)
 
 
 def _evidence_from_fact(fact: dict, reason: str) -> SourceEvidence | None:
@@ -393,6 +411,15 @@ def _class_from_invariant_type(invariant_type: str) -> str:
         "authorization_to_state_write_consistency": "missing_access_control",
         "lifecycle_transition_gating": "business_logic",
         "randomness_unpredictability": "weak_randomness",
+        "signature_threshold_uniqueness": "access_control",
+        "checkpoint_boundary_mismatch": "accounting_invariant",
+        "multi_report_fee_accrual": "accounting_invariant",
+        "fee_formula_dimension_mismatch": "accounting_invariant",
+        "pending_redeem_fee_base_exclusion": "accounting_invariant",
+        "boolean_policy_inversion": "business_logic",
+        "native_asset_receive_mismatch": "asset_flow",
+        "indexed_structure_key_mismatch": "accounting_invariant",
+        "lockup_transfer_bypass": "business_logic",
         "configured_but_not_enforced": "business_logic",
         "checked_but_never_updated": "business_logic",
         "percentage_distribution_math": "accounting_invariant",
@@ -476,7 +503,7 @@ def _hypotheses_from_invariant_candidates(static_facts: list[dict]) -> list[Vuln
                 suggested_rag_queries=[
                     f"{vulnerability_class} {candidate.invariant_type} {candidate.invariant_family or ''} {' '.join(candidate.suspicious_terms)}"
                 ],
-                status="needs_manual_review",
+                status="needs_manual_review" if candidate.is_detector_only else "likely" if candidate.proof_status == "strong_local_path" else "needs_manual_review",
             )
         )
     return hypotheses
@@ -575,6 +602,14 @@ def _detect_reentrancy(functions: list[dict], external_calls: list[dict], storag
         function_fact = _sensitive_function_for_file(functions, str(call_file))
         if later_storage_write and function_fact:
             function_name = function_fact.get("function", "unknown")
+            evidence = [
+                item
+                for item in [
+                    _evidence_from_fact(call, "external call transfers control before accounting is finalized"),
+                    _evidence_from_fact(later_storage_write, "state/accounting write occurs after external control transfer"),
+                ]
+                if item
+            ]
             return VulnerabilityHypothesis(
                 id="hyp-1",
                 title=f"Reentrancy candidate in {function_name}",
@@ -586,6 +621,9 @@ def _detect_reentrancy(functions: list[dict], external_calls: list[dict], storag
                     f"on line {later_storage_write.get('line')}."
                 ),
                 confidence=0.78,
+                evidence_lines=evidence,
+                source_detection_ids=["deterministic.reentrancy"],
+                proof_status="strong_local_path",
             )
     return None
 
@@ -600,6 +638,7 @@ def _detect_unchecked_transfer(functions: list[dict], token_transfers: list[dict
         file_path = str(transfer.get("file_path", "unknown"))
         function_fact = _sensitive_function_for_file(functions, file_path)
         function_name = str(transfer.get("function") or (function_fact.get("function") if function_fact else None) or "unknown")
+        evidence = [_evidence_from_fact(transfer, "token transfer return value is not checked")]
         return VulnerabilityHypothesis(
             id="hyp-1",
             title=f"Unchecked token transfer candidate in {function_name}",
@@ -608,6 +647,9 @@ def _detect_unchecked_transfer(functions: list[dict], token_transfers: list[dict
             affected_functions=[function_name],
             evidence_summary=f"{transfer.get('text')} is not wrapped in require/assert or SafeERC20 handling.",
             confidence=0.73,
+            evidence_lines=[item for item in evidence if item],
+            source_detection_ids=["deterministic.unchecked_transfer"],
+            proof_status="strong_local_path",
         )
     return None
 
@@ -624,8 +666,20 @@ def _detect_missing_access_control(
         return None
     for function_fact in functions:
         function_name = str(function_fact.get("function", ""))
-        suspicious_name = any(term in function_name.lower() for term in ["emergency", "withdraw", "sweep", "drain"])
+        suspicious_name = any(term in function_name.lower() for term in ["emergency", "sweep", "drain"])
         if suspicious_name:
+            evidence = [
+                item
+                for item in [
+                    _evidence_from_fact(function_fact, "sensitive public/external function name suggests privileged asset movement"),
+                    *[
+                        _evidence_from_fact(call, "native asset transfer reachable from sensitive function")
+                        for call in external_calls
+                        if str(call.get("file_path")) == str(function_fact.get("file_path"))
+                    ][:2],
+                ]
+                if item
+            ]
             return VulnerabilityHypothesis(
                 id="hyp-1",
                 title=f"Missing access control candidate in {function_name}",
@@ -634,6 +688,9 @@ def _detect_missing_access_control(
                 affected_functions=[function_name],
                 evidence_summary=f"{function_name} appears sensitive and the collected facts did not show an authorization guard.",
                 confidence=0.72,
+                evidence_lines=evidence,
+                source_detection_ids=["deterministic.missing_access_control"],
+                proof_status="strong_local_path",
             )
     return None
 

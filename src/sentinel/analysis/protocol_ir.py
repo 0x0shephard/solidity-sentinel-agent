@@ -3,8 +3,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from sentinel.evidence import classify_source_path
 from sentinel.analysis.contest import build_transaction_race_graph
+from sentinel.analysis.semantic_ir import enrich_semantic_ir
+from sentinel.evidence import classify_source_path
 from sentinel.schemas.protocol_ir import (
     AttackPathCandidate,
     AssetFlow,
@@ -127,6 +128,7 @@ def build_protocol_ir(repo_path: str, static_facts: dict) -> ProtocolIR:
         ir.completeness_gaps.append("Slither/AST-enriched call/dataflow was unavailable; Protocol IR was built from source/range/static facts.")
     if not ir.contracts:
         ir.completeness_gaps.append("No production contract declarations were extracted.")
+    ir = enrich_semantic_ir(repo_path, ir, ranges)
     ir.transaction_race_graph = build_transaction_race_graph(repo_path, ir)
     return ir
 
@@ -198,6 +200,14 @@ def protocol_ir_summary(ir: ProtocolIR) -> dict:
         "auth_constraints": len(ir.auth_constraints),
         "lifecycle_transitions": len(ir.lifecycle_transitions),
         "trust_boundaries": len(ir.trust_boundaries),
+        "statements": len(ir.statements),
+        "data_flows": len(ir.data_flows),
+        "semantic_calls": len(ir.semantic_calls),
+        "loops": len(ir.loops),
+        "checkpoint_lookups": len(ir.checkpoint_lookups),
+        "fee_formulas": len(ir.fee_formulas),
+        "asset_compatibility_paths": len(ir.asset_compatibility_paths),
+        "documentation_claims": len(ir.documentation_claims),
         "transaction_actions": len(ir.transaction_race_graph.actions),
         "transaction_race_edges": len(ir.transaction_race_graph.race_edges),
         "completeness_gaps": ir.completeness_gaps,
