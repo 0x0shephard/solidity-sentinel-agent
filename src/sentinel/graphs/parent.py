@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -23,7 +24,7 @@ from sentinel.schemas.common import ArtifactRef, CompletedStep, PlanStep
 from sentinel.schemas.research import VulnerabilityHypothesis
 from sentinel.state import AuditState, initial_audit_state, initial_research_state
 from sentinel.tools import build_default_registry
-from sentinel.tools.executor import ToolExecutor
+from sentinel.tools.executor import ToolExecutor, _json_hash
 
 
 def make_run_id() -> str:
@@ -210,6 +211,15 @@ def _tool_prompt(state: AuditState) -> str:
     } if protocol_graph else {}
     targeted = _model_or_mapping_json(state.get("targeted_rag"))
     checklist_items = targeted.get("checklist_items", [])[:8] if targeted else []
+    milestones = _planner_milestones(state)
+    next_milestone = next((name for name, done in milestones.items() if not done), None)
+    ledger = state.get("tool_ledger", [])
+    executed_counts = Counter(getattr(record, "tool_name", "") for record in ledger)
+    repeated_tools = {name: count for name, count in executed_counts.items() if count > 1}
+    recent_results = [
+        {"tool": getattr(record, "tool_name", ""), "status": str(getattr(record, "status", ""))}
+        for record in ledger[-6:]
+    ]
     return (
         f"Objective: {state['objective']}\n"
         f"Repository path: {state['repo_path']}\n"
@@ -219,12 +229,18 @@ def _tool_prompt(state: AuditState) -> str:
         f"Protocol IR summary: {protocol_summary}\n"
         f"Protocol graph summary: {graph_summary}\n"
         f"RAG checklist items: {checklist_items}\n"
-        f"Audit milestones: {_planner_milestones(state)}\n"
+        f"Audit milestones: {milestones}\n"
+        f"Next required milestone to complete: {next_milestone}\n"
+        f"Tools already executed this session (tool -> count): {dict(executed_counts)}\n"
+        f"Tools already repeated (avoid these unless inputs genuinely differ): {repeated_tools}\n"
+        f"Most recent tool results: {recent_results}\n"
         f"Available output keys: {sorted(state.get('last_outputs', {}).keys())[:40]}\n"
         f"Available RAG context: {rag_context}\n\n"
         "Return strict JSON for the next safe audit tools to run. "
         "Reason like a protocol auditor over call graph slices, asset flows, state writes, auth constraints, lifecycle transitions, "
         "historical checklist items, and known analysis gaps. Prefer hypotheses that can be proven from local source evidence. "
+        "Each decision MUST make progress toward the next required milestone; do NOT call a tool with inputs identical to a "
+        "previous call this session, and do not repeat a tool that already succeeded unless you are passing genuinely new inputs. "
         "Include repo_path in inputs when needed and use output_references when one tool output should feed another input. "
         "Use stop=true only when all required milestones are complete or the remaining budget is too low to run useful tools."
     )
@@ -361,6 +377,7 @@ def plan_with_llm(state: AuditState) -> AuditState:
     planner_rounds = []
     executor = ToolExecutor(registry)
     stop_reason = "planner_completed"
+    executed_signatures: set[tuple[str, str]] = set()
     for round_index in range(1, 5):
         remaining_budget = get_settings().max_tool_calls - state.get("tool_call_count", 0)
         if remaining_budget <= 2:
@@ -374,6 +391,7 @@ def plan_with_llm(state: AuditState) -> AuditState:
                 stop_reason = "planner_error_after_partial_execution"
                 break
         round_record = {"round": round_index, "decisions": [], "stop": plan.stop}
+        round_executed = 0
         for decision in plan.decisions[: min(8, max(1, remaining_budget - 2))]:
             if decision.tool_name not in valid_names:
                 message = f"LLM selected unknown tool: {decision.tool_name}"
@@ -391,15 +409,25 @@ def plan_with_llm(state: AuditState) -> AuditState:
                 state.setdefault("errors", []).append(f"LLM omitted required input for {decision.tool_name}: {missing}")
                 skipped.append({"tool_name": decision.tool_name, "reason": "missing_required_input", "missing": missing})
                 continue
+            signature = (decision.tool_name, _json_hash(tool_input))
+            if signature in executed_signatures:
+                skipped.append({"tool_name": decision.tool_name, "reason": "duplicate_call"})
+                round_record["decisions"].append({"tool_name": decision.tool_name, "status": "skipped_duplicate"})
+                continue
+            executed_signatures.add(signature)
             output = executor.execute(decision.tool_name, tool_input, state)
             status = getattr(output, "status", "ok")
             _record_step(state, decision.tool_name, f"{decision.tool_name} selected by LLM: {decision.rationale}")
             record = {"tool_name": decision.tool_name, "status": str(status)}
             executed.append(record)
+            round_executed += 1
             round_record["decisions"].append(record)
         planner_rounds.append(round_record)
         if all(_planner_milestones(state).values()):
             stop_reason = "milestones_complete"
+            break
+        if round_executed == 0:
+            stop_reason = "planner_no_new_actions"
             break
         if plan.stop:
             stop_reason = "planner_requested_stop"

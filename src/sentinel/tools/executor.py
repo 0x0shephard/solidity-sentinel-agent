@@ -88,8 +88,50 @@ class ToolExecutor:
         record.output_hash = _json_hash(parsed_output.model_dump(mode="json"))
         self._record_call(state, record, start_timer)
         state.setdefault("last_outputs", {})[tool.full_name] = parsed_output.model_dump(mode="json")
+        self._apply_state_effects(tool, parsed_output, state)
         log_event(run_dir, run_id=state["run_id"], event="tool_completed", tool_name=tool.full_name, status=record.status.value, latency_ms=record.latency_ms)
         return parsed_output
+
+    @staticmethod
+    def _apply_state_effects(tool, parsed_output: BaseModel, state: AuditState) -> None:
+        """Merge a tool's typed output into canonical audit-state keys.
+
+        This is the bridge that lets model-selected tool calls advance the same
+        milestone gates the deterministic graph nodes populate.
+        """
+
+        if not getattr(tool, "state_effects", None):
+            return
+        dumped = parsed_output.model_dump(mode="json")
+        for effect in tool.state_effects:
+            value = dumped
+            if effect.output_path:
+                for part in effect.output_path.split("."):
+                    value = value.get(part) if isinstance(value, dict) else None
+                    if value is None:
+                        break
+            if value is None:
+                continue
+            parts = [part for part in effect.state_path.split(".") if part]
+            if not parts:
+                continue
+            container = state
+            for part in parts[:-1]:
+                nxt = container.get(part)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    container[part] = nxt
+                container = nxt
+            leaf = parts[-1]
+            if effect.merge == "extend":
+                existing = container.get(leaf)
+                existing = list(existing) if isinstance(existing, list) else []
+                existing.extend(value if isinstance(value, list) else [value])
+                container[leaf] = existing
+            elif effect.merge == "update" and isinstance(container.get(leaf), dict) and isinstance(value, dict):
+                container[leaf].update(value)
+            else:
+                container[leaf] = value
 
     def _record_call(self, state: AuditState, record: ToolCallRecord, start_timer: float) -> None:
         record.ended_at = datetime.now(UTC).isoformat()

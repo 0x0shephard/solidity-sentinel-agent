@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from sentinel.reliability.subprocess import CommandResult, run_command
 from sentinel.schemas.common import SideEffect, ToolStatus
-from sentinel.tools.base import RegisteredTool
+from sentinel.tools.base import RegisteredTool, StateEffect
 from sentinel.tools.repo import RepoPathInput
 
 
@@ -151,7 +151,7 @@ def clean(inp: RepoPathInput, state) -> BuildToolOutput:
 
 def register(registry) -> None:
     for tool in [
-        RegisteredTool(namespace="build", name="detect_framework", description="Detect Solidity project framework.", input_model=RepoPathInput, output_model=DetectFrameworkOutput, fn=detect_framework, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="build", name="detect_framework", description="Detect Solidity project framework.", input_model=RepoPathInput, output_model=DetectFrameworkOutput, fn=detect_framework, side_effects=[SideEffect.READ_FILES], state_effects=[StateEffect(output_path="", state_path="build_facts.framework", merge="set")]),
         RegisteredTool(namespace="build", name="detect_solc", description="Detect Solidity pragma versions.", input_model=RepoPathInput, output_model=BuildToolOutput, fn=detect_solc, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="build", name="install_dependencies", description="Install project dependencies when explicitly enabled.", input_model=RepoPathInput, output_model=BuildToolOutput, fn=install_dependencies, side_effects=[SideEffect.EXECUTE_LOCAL]),
         RegisteredTool(namespace="build", name="check_foundry_available", description="Check Foundry availability.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=check_foundry_available, side_effects=[SideEffect.EXECUTE_LOCAL]),

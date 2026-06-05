@@ -43,3 +43,32 @@ def test_executor_runs_research_tool():
     assert output.status == "ok"
     assert output.hypotheses[0].id == "hyp-1"
 
+
+def test_state_effects_advance_milestone_gates(tmp_path):
+    """Model-selected tool calls must populate the canonical state keys that
+    milestone gates read, so an LLM planner can make real progress."""
+    from sentinel.graphs.parent import _planner_milestones
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "Vault.sol").write_text("pragma solidity ^0.8.20;\ncontract Vault {}\n", encoding="utf-8")
+    (tmp_path / "foundry.toml").write_text("[profile.default]\n", encoding="utf-8")
+    state = initial_audit_state("run-effects", str(tmp_path), "Find bugs", "runs/run-effects")
+    executor = ToolExecutor(build_default_registry())
+
+    assert not _planner_milestones(state)["repo_inspected"]
+    assert not _planner_milestones(state)["framework_detected"]
+    assert not _planner_milestones(state)["static_facts_extracted"]
+
+    executor.execute("repo.list_files", {"repo_path": str(tmp_path)}, state)
+    executor.execute("repo.find_contracts", {"repo_path": str(tmp_path)}, state)
+    executor.execute("build.detect_framework", {"repo_path": str(tmp_path)}, state)
+    executor.execute("static.extract_functions", {"repo_path": str(tmp_path)}, state)
+
+    milestones = _planner_milestones(state)
+    assert milestones["repo_inspected"]
+    assert milestones["framework_detected"]
+    assert milestones["static_facts_extracted"]
+    assert state["repo_facts"]["contracts"]
+    assert state["build_facts"]["framework"]["framework"] in {"foundry", "mixed", "unknown"}
+    assert isinstance(state["static_facts"]["functions"], list)
+

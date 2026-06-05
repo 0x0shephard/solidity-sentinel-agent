@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sentinel.reliability.subprocess import run_command
 from sentinel.errors import SandboxViolationError
 from sentinel.schemas.common import SideEffect, ToolStatus
-from sentinel.tools.base import RegisteredTool
+from sentinel.tools.base import RegisteredTool, StateEffect
 
 
 class RepoPathInput(BaseModel):
@@ -195,11 +195,11 @@ def register(registry) -> None:
     for tool in [
         RegisteredTool(namespace="repo", name="clone", description="Clone a remote repository.", input_model=RepoCloneInput, output_model=RepoGenericOutput, fn=clone, side_effects=[SideEffect.EXTERNAL_NETWORK]),
         RegisteredTool(namespace="repo", name="checkout", description="Checkout a git ref.", input_model=RepoCheckoutInput, output_model=RepoGenericOutput, fn=checkout, side_effects=[SideEffect.EXECUTE_LOCAL]),
-        RegisteredTool(namespace="repo", name="list_files", description="List repository files.", input_model=RepoListFilesInput, output_model=RepoListFilesOutput, fn=list_files, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="repo", name="list_files", description="List repository files.", input_model=RepoListFilesInput, output_model=RepoListFilesOutput, fn=list_files, side_effects=[SideEffect.READ_FILES], state_effects=[StateEffect(output_path="files", state_path="repo_facts.files", merge="set")]),
         RegisteredTool(namespace="repo", name="read_file", description="Read a single repository file.", input_model=RepoReadFileInput, output_model=RepoReadFileOutput, fn=read_file, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="repo", name="write_file", description="Write a repository file.", input_model=RepoWriteFileInput, output_model=RepoGenericOutput, fn=write_file, side_effects=[SideEffect.WRITE_FILES]),
         RegisteredTool(namespace="repo", name="patch_file", description="Patch a repository file.", input_model=RepoWriteFileInput, output_model=RepoGenericOutput, fn=patch_file, side_effects=[SideEffect.WRITE_FILES]),
-        RegisteredTool(namespace="repo", name="find_contracts", description="Find Solidity contract files.", input_model=RepoPathInput, output_model=RepoListFilesOutput, fn=find_contracts, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="repo", name="find_contracts", description="Find Solidity contract files.", input_model=RepoPathInput, output_model=RepoListFilesOutput, fn=find_contracts, side_effects=[SideEffect.READ_FILES], state_effects=[StateEffect(output_path="files", state_path="repo_facts.contracts", merge="set")]),
         RegisteredTool(namespace="repo", name="find_tests", description="Find Solidity test files.", input_model=RepoPathInput, output_model=RepoListFilesOutput, fn=find_tests, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="repo", name="search_text", description="Search repository text.", input_model=RepoSearchInput, output_model=RepoSearchOutput, fn=search_text, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="repo", name="git_status", description="Return a safe git status summary.", input_model=RepoPathInput, output_model=RepoGenericOutput, fn=git_status, side_effects=[SideEffect.READ_FILES]),

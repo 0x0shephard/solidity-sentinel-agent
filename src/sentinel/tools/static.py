@@ -15,7 +15,7 @@ from sentinel.schemas.common import SideEffect, ToolStatus
 from sentinel.schemas.research import SlitherFinding
 from sentinel.schemas.static import FunctionRange, SourceEvidence, StaticDetection, StaticDetectionsOutput
 from sentinel.solidity.ranges import build_function_ranges, containing_function
-from sentinel.tools.base import RegisteredTool
+from sentinel.tools.base import RegisteredTool, StateEffect
 from sentinel.tools.repo import RepoPathInput
 
 
@@ -794,9 +794,9 @@ def parse_slither(inp: ParseSlitherInput, state) -> ParseSlitherOutput:
 
 def register(registry) -> None:
     for tool in [
-        RegisteredTool(namespace="static", name="extract_contracts", description="Extract Solidity contract declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_contracts, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="extract_contracts", description="Extract Solidity contract declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_contracts, side_effects=[SideEffect.READ_FILES], state_effects=[StateEffect(output_path="facts", state_path="static_facts.contracts", merge="set")]),
         RegisteredTool(namespace="static", name="extract_inheritance", description="Extract Solidity inheritance declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_inheritance, side_effects=[SideEffect.READ_FILES]),
-        RegisteredTool(namespace="static", name="extract_functions", description="Extract Solidity function declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_functions, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="extract_functions", description="Extract Solidity function declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_functions, side_effects=[SideEffect.READ_FILES], state_effects=[StateEffect(output_path="facts", state_path="static_facts.functions", merge="set")]),
         RegisteredTool(namespace="static", name="map_function_ranges", description="Map Solidity functions to source ranges.", input_model=RepoPathInput, output_model=FunctionRangesOutput, fn=map_function_ranges, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="extract_modifiers", description="Extract Solidity modifier declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_modifiers, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="find_access_control_terms", description="Find access-control related source terms.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=find_access_control_terms, side_effects=[SideEffect.READ_FILES]),

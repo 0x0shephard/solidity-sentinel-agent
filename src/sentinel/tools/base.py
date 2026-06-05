@@ -12,6 +12,25 @@ from sentinel.state import AuditState
 ToolFn = Callable[[BaseModel, AuditState], BaseModel | dict[str, Any]]
 
 
+class StateEffect(BaseModel):
+    """Declarative mapping from a tool's output into canonical audit state.
+
+    This lets the executor merge a model-selected tool's typed output into the
+    same state keys the deterministic graph nodes populate, so milestone gates
+    (which read those keys) respond to model-driven tool calls instead of only
+    to hand-routed nodes.
+    """
+
+    output_path: str = ""
+    """Dotted path into the tool output dict. Empty string means the whole output."""
+
+    state_path: str
+    """Dotted path into AuditState. Intermediate dicts are created as needed."""
+
+    merge: str = "set"
+    """One of: ``set`` (replace), ``update`` (dict.update), ``extend`` (list extend)."""
+
+
 class RegisteredTool(BaseModel):
     """A typed capability that can be selected by an agent and run by executor."""
 
@@ -29,6 +48,7 @@ class RegisteredTool(BaseModel):
     examples: list[dict[str, Any]] = Field(default_factory=list)
     chaining_hints: list[str] = Field(default_factory=list)
     execution_kind: str = "deterministic"
+    state_effects: list[StateEffect] = Field(default_factory=list)
 
     @property
     def full_name(self) -> str:
