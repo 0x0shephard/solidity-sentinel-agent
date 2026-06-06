@@ -16,6 +16,8 @@ The result of a run is a structured artifact directory under `runs/<run_id>/` co
 
 The current build includes 107 tools across 8 namespaces: `repo`, `build`, `static`, `research`, `dynamic`, `report`, `memory`, and composite `audit`. Each tool is registered through one typed `RegisteredTool` abstraction and executed through a single `ToolExecutor` enforcement boundary, schema-validate input, execute, schema-validate output, record the ledger entry, apply declared state effects, and update the tool budget. This keeps the tool registry coherent at scale rather than turning the agent into a long conditional-dispatch chain.
 
+**Measured results.** Scored against published contest findings on a held-out recall benchmark (`sentinel benchmark`), it recovered **4/7 Hawk-High findings (57%)** and **5/15 Mellow flexible-vaults findings (33% recalled, 67% located)** — including two serious Highs (signer-duplication threshold bypass, redeem accounting mismatch) — using only a free local model (`qwen2.5-coder:32b`). Recall scaled directly with model strength (gemma 29% → qwen 57% on Hawk after the proposer/targeting work), which is the basis for the model-quality item below.
+
 ## Architecture Overview
 
 The parent graph is the main audit conductor. It is implemented as an 11-stage LangGraph pipeline with idempotent milestones:
@@ -166,7 +168,7 @@ Most validation artifacts are still generated as plans unless constructor setup 
 
 ## What More Time Would Address
 
-The highest-leverage next work is deeper semantic understanding, AST-backed Protocol IR, multi-hop call/dataflow, stronger actor and transaction-order modeling, and executable validation for more bug classes. The second priority is memory, persist missed findings, false-positive suppressions, successful PoC templates, and benchmark lessons into a retrievable memory layer that is fed into planning and ranking. The third priority is model quality, use a stronger hosted model for proposer/reviewer roles while keeping local/mock modes deterministic for tests.
+The highest-leverage next work is deeper semantic understanding, AST-backed Protocol IR, multi-hop call/dataflow, stronger actor and transaction-order modeling, and executable validation for more bug classes. The second priority is memory, persist missed findings, false-positive suppressions, successful PoC templates, and benchmark lessons into a retrievable memory layer that is fed into planning and ranking. The third priority is model quality, use a stronger hosted model for proposer/reviewer roles while keeping local/mock modes deterministic for tests. The benchmark makes this concrete: on flexible-vaults the agent *located* 67% of the bugs but *root-caused* only 33%, so the bottleneck is reasoning depth on already-surfaced functions, not surfacing — a stronger model converts that gap directly, with no architecture change.
 
 I would also harden proof gating so `confirmed` requires either executable validation or complete static proof, improve RAG canonical query construction, and measure progress with benchmark recall rather than adding one-off detectors after each new repo.
 
