@@ -1128,12 +1128,52 @@ def summarize_context(state: AuditState) -> AuditState:
     return state
 
 
+_STATE_OMIT_KEYS = {"protocol_graph", "protocol_ir", "working_memory"}
+
+
+def _state_for_persist(state: AuditState) -> dict:
+    """Slim the persisted state.json to keep run dirs small and inspectable.
+
+    The full tool ledger lives in tool_ledger.jsonl; large analysis objects are
+    written as their own artifacts. We replace those bulky values with pointers
+    and digests rather than inlining megabytes of duplicated data. Set
+    SENTINEL_PERSIST_FULL_STATE=true to keep the verbatim state.
+    """
+
+    if get_settings().persist_full_state:
+        return dict(state)
+    slim: dict = {}
+    for key, value in state.items():
+        if key == "tool_ledger" and isinstance(value, list):
+            slim[key] = f"<{len(value)} records; see tool_ledger.jsonl>"
+        elif key == "last_outputs" and isinstance(value, dict):
+            slim[key] = {
+                name: ({"status": out.get("status"), "keys": sorted(out.keys())[:25]} if isinstance(out, dict) else {"type": type(out).__name__})
+                for name, out in value.items()
+            }
+        elif key == "static_facts" and isinstance(value, dict):
+            slim[key] = {fk: _digest_persist_value(fv) for fk, fv in value.items()}
+        elif key in _STATE_OMIT_KEYS:
+            slim[key] = f"<omitted from state.json; persisted as run artifact when available>"
+        else:
+            slim[key] = value
+    return slim
+
+
+def _digest_persist_value(value) -> object:
+    """Summarize bulky list/dict values; keep small scalars and dicts intact."""
+
+    if isinstance(value, list):
+        return f"<list:{len(value)} items>"
+    if isinstance(value, dict):
+        if len(json.dumps(value, default=str)) > 2000:
+            return f"<dict:{len(value)} keys; omitted>"
+        return value
+    return value
+
+
 def finish(state: AuditState) -> AuditState:
-    # Add two harmless final inspection calls so the mock graph demonstrates a
-    # long-horizon path over 20 tool calls without requiring external mutation.
     repo_path = state["repo_path"]
-    _run_tool(state, "repo.list_files", {"repo_path": repo_path, "max_files": 50})
-    _run_tool(state, "static.extract_functions", {"repo_path": repo_path})
     hypotheses = state.get("hypotheses", [])
     if hypotheses:
         for hypothesis in _select_hypotheses_for_deepening(hypotheses):
@@ -1200,7 +1240,7 @@ def finish(state: AuditState) -> AuditState:
         finding_count=len(state["findings"]),
     )
     state["current_focus"] = "done"
-    write_json(Path(state["run_dir"]) / "state.json", state)
+    write_json(Path(state["run_dir"]) / "state.json", _state_for_persist(state))
     log_event(
         state["run_dir"],
         run_id=state["run_id"],

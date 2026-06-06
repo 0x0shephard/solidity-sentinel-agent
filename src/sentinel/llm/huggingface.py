@@ -53,7 +53,7 @@ class HuggingFacePlanner(BasePlanner):
 
     def plan(self, prompt: str, tools: list[dict]) -> ToolPlan:
         tool_catalog = json.dumps(tools, indent=2, default=str)[:120_000]
-        response = self.llm.invoke(
+        response = invoke_chat(self.llm, 
             [
                 SystemMessage(
                     content=(
@@ -80,7 +80,7 @@ class HuggingFaceResearchRefiner(BaseResearchRefiner):
         self.llm = llm or ChatHuggingFace(llm=endpoint, model_id=model, temperature=0.0)
 
     def refine(self, prompt: str) -> ResearchRefinement:
-        response = self.llm.invoke(
+        response = invoke_chat(self.llm, 
             [
                 SystemMessage(
                     content=(
@@ -108,7 +108,7 @@ class HuggingFaceHypothesisProposer(BaseHypothesisProposer):
 
     def propose(self, prompt: str) -> ProposedHypothesisBatch:
         self.last_raw = ""
-        response = self.llm.invoke(
+        response = invoke_chat(self.llm, 
             [SystemMessage(content=_PROPOSER_SYSTEM), HumanMessage(content=prompt)]
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
@@ -127,7 +127,7 @@ class HuggingFaceAdversarialReviewer(BaseAdversarialReviewer):
         self.llm = llm or ChatHuggingFace(llm=endpoint, model_id=model, temperature=0.0)
 
     def review(self, prompt: str) -> AdversarialVerdict:
-        response = self.llm.invoke(
+        response = invoke_chat(self.llm, 
             [SystemMessage(content=_REVIEWER_SYSTEM), HumanMessage(content=prompt)]
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)

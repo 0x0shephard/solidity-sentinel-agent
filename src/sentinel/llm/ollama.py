@@ -8,6 +8,7 @@ from langchain_ollama import ChatOllama
 
 from sentinel.errors import NonRetryableExternalError
 from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BasePlanner, BaseResearchRefiner, ToolPlan
+from sentinel.llm.resilience import invoke_chat
 from sentinel.schemas.research import AdversarialVerdict, ProposedHypothesisBatch, ResearchRefinement
 
 
@@ -192,11 +193,16 @@ _REVIEWER_SYSTEM = (
     "You are Solidity Sentinel's adversarial reviewer, a senior auditor verifying a single vulnerability "
     "hypothesis. You are given the affected function and its cross-contract CALLERS. Decide whether the "
     "hypothesis is actually exploitable. "
-    "If a caller (e.g. a factory or configurator) satisfies the dangerous precondition ATOMICALLY in the "
-    "same transaction as deployment, the issue is mitigated -> verdict 'rejected' with the specific "
-    "counterevidence (name the function/file). If an attacker can reach the function first or independently, "
-    "verdict 'confirmed' with a concrete ordered attack_trace. If callers are insufficient to decide, verdict "
-    "'needs_manual_review'. "
+    "DECISIVE MITIGATION RULE: if ANY supplied caller is a factory/configurator/deployer (e.g. a function "
+    "named create/deploy/configure/setup, or one that constructs a proxy via `new ...Proxy(... "
+    "abi.encodeCall(IFactoryEntity.initialize, ...))`) and it invokes the affected function in the SAME "
+    "transaction as deployment, then the dangerous precondition (e.g. an uninitialized one-time setter or "
+    "initializer) is satisfied atomically and CANNOT be front-run. In that case you MUST return verdict "
+    "'rejected' and cite that caller (function + file) as counterevidence. Apply this rule consistently: "
+    "the same affected-function pattern wired by the same atomic caller is always 'rejected'. "
+    "Only return 'confirmed' (with a concrete ordered attack_trace) when NO supplied caller closes the window "
+    "and an attacker can reach the function first or independently. If callers are insufficient to decide, "
+    "verdict 'needs_manual_review'. "
     "Return ONLY JSON: "
     '{"verdict":"confirmed|likely|rejected|needs_manual_review","attack_trace":["step 1","step 2"],'
     '"counterevidence":["mitigation found, with function/file"],"reasoning":"...","confidence_delta":0.0}. '
@@ -215,7 +221,7 @@ class OllamaAdversarialReviewer(BaseAdversarialReviewer):
         )
 
     def review(self, prompt: str) -> AdversarialVerdict:
-        response = self.llm.invoke(
+        response = invoke_chat(self.llm, 
             [SystemMessage(content=_REVIEWER_SYSTEM), HumanMessage(content=prompt)]
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
@@ -234,7 +240,7 @@ class OllamaHypothesisProposer(BaseHypothesisProposer):
 
     def propose(self, prompt: str) -> ProposedHypothesisBatch:
         self.last_raw = ""
-        response = self.llm.invoke(
+        response = invoke_chat(self.llm, 
             [SystemMessage(content=_PROPOSER_SYSTEM), HumanMessage(content=prompt)]
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
@@ -254,7 +260,7 @@ class OllamaPlanner(BasePlanner):
 
     def plan(self, prompt: str, tools: list[dict]) -> ToolPlan:
         tool_catalog = json.dumps(tools, indent=2, default=str)[:120_000]
-        response = self.llm.invoke(
+        response = invoke_chat(self.llm, 
             [
                 SystemMessage(
                     content=(
@@ -282,7 +288,7 @@ class OllamaResearchRefiner(BaseResearchRefiner):
         )
 
     def refine(self, prompt: str) -> ResearchRefinement:
-        response = self.llm.invoke(
+        response = invoke_chat(self.llm, 
             [
                 SystemMessage(
                     content=(

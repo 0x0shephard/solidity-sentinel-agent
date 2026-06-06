@@ -135,6 +135,41 @@ def test_propose_hypotheses_drops_dependency_scoped_proposals(monkeypatch, tmp_p
     assert out.hypotheses == []
 
 
+def test_high_value_functions_prioritized_in_proposer_prompt(tmp_path):
+    """A fund-moving + upgrading + looping function must be flagged high-value and
+    shown to the proposer, even when no static detector fires on it."""
+    from sentinel.tools.research import _build_proposer_prompt, _high_value_function_names
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "foundry.toml").write_text("[profile.default]\n", encoding="utf-8")
+    (tmp_path / "src" / "School.sol").write_text(
+        "pragma solidity ^0.8.20;\n"
+        "interface IERC20 { function transfer(address to, uint256 a) external; }\n"
+        "contract School {\n"
+        "    IERC20 usdc; address[] teachers; uint256 bursary;\n"
+        "    function ping() external pure returns (uint256) { return 1; }\n"
+        "    function graduateAndUpgrade(address impl) external {\n"
+        "        _authorizeUpgrade(impl);\n"
+        "        for (uint256 i; i < teachers.length; i++) { usdc.transfer(teachers[i], bursary); }\n"
+        "    }\n"
+        "    function _authorizeUpgrade(address) internal {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    state = initial_audit_state("hv", str(tmp_path), "find bugs", "runs/hv")
+    state["use_llm_refiner"] = True
+    ToolExecutor(build_default_registry()).execute("audit.run_static_analysis", {"repo_path": str(tmp_path)}, state)
+
+    hv = _high_value_function_names(state, str(tmp_path))
+    assert "graduateAndUpgrade" in hv
+    assert "ping" not in hv  # pure, no funds/upgrade/loop
+
+    prompt = _build_proposer_prompt(state, "find bugs")
+    assert "graduateAndUpgrade" in prompt
+    assert "focus_functions" in prompt
+    assert "_authorizeUpgrade" in prompt  # the risky body is actually shown
+
+
 def test_propose_hypotheses_skips_when_llm_disabled(tmp_path):
     repo = _vault_repo(tmp_path)
     state = initial_audit_state("propose-off", str(repo), "Find bugs", "runs/propose-off")

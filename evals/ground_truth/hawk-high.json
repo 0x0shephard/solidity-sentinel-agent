@@ -1,0 +1,77 @@
+{
+  "contest": "2025-05-hawk-high",
+  "repo_path": "Test/2025-05-hawk-high",
+  "source": "CodeHawks First Flight #39 official findings report",
+  "notes": "Most Highs are business-logic bugs concentrated in LevelOne.graduateAndUpgrade, so each carries distinguishing keywords to avoid one hypothesis matching several findings.",
+  "findings": [
+    {
+      "id": "H-01",
+      "severity": "high",
+      "title": "Missing cutOffScore enforcement allows ineligible students to graduate",
+      "file_contains": "LevelOne.sol",
+      "function": "graduateAndUpgrade",
+      "vulnerability_class": "business_logic",
+      "match_any": ["cutoff", "cut-off", "cutoffscore", "studentscore", "below the cut", "eligib"]
+    },
+    {
+      "id": "H-02",
+      "severity": "high",
+      "title": "Missing division by totalTeachers sends 35% bursary to every teacher (fund mismanagement / DoS)",
+      "file_contains": "LevelOne.sol",
+      "function": "graduateAndUpgrade",
+      "vulnerability_class": "accounting",
+      "match_any": ["totalteachers", "division", "payperteacher", "divide", "per teacher", "35%"]
+    },
+    {
+      "id": "H-03",
+      "severity": "high",
+      "title": "Incorrect UUPS upgrade mechanism (authorize without upgradeTo) leads to failed upgrades",
+      "file_contains": "LevelOne.sol",
+      "function": "graduateAndUpgrade",
+      "vulnerability_class": "upgradeability",
+      "match_any": ["upgradeto", "_authorizeupgrade", "uups", "upgradetoandcall", "does not upgrade", "fails to upgrade", "onlyproxy"]
+    },
+    {
+      "id": "H-04",
+      "severity": "high",
+      "title": "Bursary state not decremented after payouts (accounting desync)",
+      "file_contains": "LevelOne.sol",
+      "function": "graduateAndUpgrade",
+      "vulnerability_class": "accounting",
+      "match_any": ["bursary", "not updated", "not decrement", "desync", "out of sync"]
+    },
+    {
+      "id": "H-05",
+      "severity": "high",
+      "title": "No mechanism to handle remaining bursary; funds remain idle in LevelTwo",
+      "file_contains": "LevelTwo.sol",
+      "function": "graduate",
+      "vulnerability_class": "business_logic",
+      "match_any": ["bursary", "idle", "withdraw", "stuck", "60%", "remaining"]
+    },
+    {
+      "id": "M-01",
+      "severity": "medium",
+      "title": "Storage layout inconsistency between LevelOne and LevelTwo",
+      "file_contains": "LevelTwo.sol",
+      "function": "graduate",
+      "vulnerability_class": "storage_layout",
+      "match_any": ["storage layout", "storage slot", "slot", "storage gap", "__gap", "layout mismatch", "schoolfees"]
+    },
+    {
+      "id": "M-02",
+      "severity": "medium",
+      "title": "Unprotected initialization (no _disableInitializers in constructor)",
+      "file_contains": "LevelOne.sol",
+      "function": "initialize",
+      "vulnerability_class": "unguarded_initializer",
+      "match_any": ["initial", "_disableinitializers", "front-run", "frontrun", "unprotected init", "uninitialized", "become principal"]
+    }
+  ],
+  "low_findings": [
+    {"id": "L-02", "severity": "low", "title": "reviewCount not incrementing", "file_contains": "LevelOne.sol", "function": "giveReview", "vulnerability_class": "business_logic", "match_any": ["reviewcount", "increment"]},
+    {"id": "L-07", "severity": "low", "title": "Principal can maliciously expel students after session", "file_contains": "LevelOne.sol", "function": "expel", "vulnerability_class": "access_control", "match_any": ["expel"]},
+    {"id": "L-09", "severity": "low", "title": "Costly for loop in removeTeacher", "file_contains": "LevelOne.sol", "function": "removeTeacher", "vulnerability_class": "dos", "match_any": ["removeteacher", "loop", "gas", "o(n)"]},
+    {"id": "L-10", "severity": "low", "title": "DoS via linear iteration in expel", "file_contains": "LevelOne.sol", "function": "expel", "vulnerability_class": "dos", "match_any": ["expel", "loop", "iteration", "dos", "gas"]}
+  ]
+}

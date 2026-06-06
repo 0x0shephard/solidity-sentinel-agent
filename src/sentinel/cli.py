@@ -162,6 +162,42 @@ def tools_show(tool_name: str) -> None:
     typer.echo(json.dumps(build_default_registry().get(tool_name).public_dict(), indent=2))
 
 
+@app.command()
+def benchmark(
+    ground_truth: str = typer.Option(..., "--ground-truth", help="Path to a ground-truth JSON (e.g. evals/ground_truth/hawk-high.json)."),
+    run_dir: str | None = typer.Option(None, "--run-dir", help="Existing run directory to score. If omitted, an audit is run first."),
+    repo: str | None = typer.Option(None, "--repo", help="Repo to audit when --run-dir is not given (defaults to the ground-truth repo_path)."),
+    real_llm: bool = typer.Option(False, "--real-llm/--mock-llm", help="Run the audit with the real LLM (needed for proposer recall)."),
+    include_low: bool = typer.Option(False, "--include-low", help="Also score low-severity findings."),
+) -> None:
+    """Score an audit run against a contest's published findings (recall benchmark)."""
+
+    import json as _json
+
+    from sentinel.evals.recall import (
+        candidates_from_run,
+        load_ground_truth,
+        render_recall_markdown,
+        score_recall,
+    )
+
+    gt, contest = load_ground_truth(ground_truth, include_low=include_low)
+    if run_dir is None:
+        from pathlib import Path as _Path
+
+        gt_repo = _json.loads(_Path(ground_truth).read_text(encoding="utf-8")).get("repo_path")
+        target = repo or gt_repo
+        if not target:
+            typer.echo("Provide --run-dir or --repo (or repo_path in the ground-truth file).")
+            raise typer.Exit(1)
+        objective = "Find bugs in this Foundry smart contract repo; produce evidence-grounded findings."
+        state = run_audit(repo=target, objective=objective, mock_llm=not real_llm)
+        run_dir = state["run_dir"]
+    report = score_recall(gt, candidates_from_run(run_dir), contest=contest)
+    typer.echo(render_recall_markdown(report))
+    typer.echo(f"Run scored: {run_dir}")
+
+
 @eval_app.callback(invoke_without_command=True)
 def eval_main(
     all_fixtures: bool = typer.Option(False, "--all", help="Run all fixtures."),

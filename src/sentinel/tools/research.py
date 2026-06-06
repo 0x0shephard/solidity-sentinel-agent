@@ -46,7 +46,7 @@ class RankHypothesesOutput(BaseModel):
 class ProposeHypothesesInput(BaseModel):
     repo_path: str
     objective: str = ""
-    max_hypotheses: int = Field(default=6, ge=1, le=20)
+    max_hypotheses: int = Field(default=8, ge=1, le=20)
 
 
 class ProposeHypothesesOutput(BaseModel):
@@ -1155,9 +1155,39 @@ def _priority_function_names(state) -> set[str]:
     return {n for n in names if n}
 
 
-def _proposer_code_context(state, repo_path: str) -> str:
+_FUND_MARKERS = (".transfer(", ".safetransfer(", ".transferfrom(", ".safetransferfrom(", ".call{", ".send(", ".mint(", ".burn(")
+_UPGRADE_MARKERS = ("_authorizeupgrade", "upgradeto", "delegatecall", "_disableinitializers", "reinitializer")
+_LOOP_MARKERS = ("for (", "for(", "while (", "while(")
+
+
+def _high_value_function_names(state, repo_path: str) -> set[str]:
+    """Functions that move funds, perform upgrades, or loop over collections.
+
+    These are where critical-severity logic bugs concentrate (e.g. a payout loop
+    that also authorizes an upgrade), yet static detectors often miss them. We
+    surface them so the proposer always reasons about the riskiest code, not just
+    detector-flagged or graph-entry functions.
+    """
+
+    out: set[str] = set()
+    for r in _function_range_index(state.get("static_facts", {})):
+        s, e = r.get("start_line"), r.get("end_line")
+        if not isinstance(s, int) or not isinstance(e, int):
+            continue
+        body = _read_source_block(repo_path, str(r.get("file_path")), s, e, max_chars=4000).lower()
+        has_funds = any(m in body for m in _FUND_MARKERS)
+        has_upgrade = any(m in body for m in _UPGRADE_MARKERS)
+        has_loop = any(m in body for m in _LOOP_MARKERS)
+        if has_funds or has_upgrade or (has_loop and ("[" in body or ".length" in body)):
+            name = r.get("function_name")
+            if name:
+                out.add(str(name))
+    return out
+
+
+def _proposer_code_context(state, repo_path: str, boost: set[str] | None = None) -> str:
     ranges = _function_range_index(state.get("static_facts", {}))
-    priority = _priority_function_names(state)
+    priority = _priority_function_names(state) | (boost or set())
     prioritized = sorted(ranges, key=lambda r: (r.get("function_name") not in priority, str(r.get("file_path"))))
     blocks: list[str] = []
     used = 0
@@ -1172,11 +1202,11 @@ def _proposer_code_context(state, repo_path: str) -> str:
             continue
         seen.add((fp, fn))
         block = f"// file: {fp} | contract: {r.get('contract_name')} | function: {fn} | lines {s}-{e}\n{body}"
-        if used + len(block) > 12000:
+        if used + len(block) > 16000:
             break
         used += len(block)
         blocks.append(block)
-        if len(blocks) >= 12:
+        if len(blocks) >= 16:
             break
     return "\n\n".join(blocks)
 
@@ -1204,21 +1234,28 @@ def _build_proposer_prompt(state, objective: str) -> str:
         for c in state.get("static_facts", {}).get("contracts", [])[:30]
         if isinstance(c, dict)
     ]
+    repo_path = state.get("repo_path", "")
+    high_value = sorted(_high_value_function_names(state, repo_path))
     header = _json.dumps(
         {
             "objective": objective,
             "contracts": contracts,
             "attack_path_candidates": attack_paths,
             "historical_checklist": checklist,
+            "focus_functions": high_value[:20],
             "instruction": (
-                "Reason like a protocol auditor over the SOURCE CODE below. Propose concrete, code-specific "
-                "vulnerability hypotheses. Set affected_file and affected_function to names that appear in the "
-                "source headers below. Explain the exploit precondition. Do not invent files or functions."
+                "Reason like a protocol auditor over the SOURCE CODE below. The focus_functions move funds, "
+                "perform upgrades, or loop over collections — analyze EACH of them for logic errors: missing "
+                "validation/threshold checks, wrong or missing division, state not updated after payouts, "
+                "broken upgrade sequencing, and unbounded loops. Propose concrete, code-specific hypotheses "
+                "(aim for 4-8, covering the focus_functions). Set affected_file and affected_function to names "
+                "that appear verbatim in the source headers below. Explain the exploit precondition. Do not "
+                "invent files or functions."
             ),
         },
         indent=2,
     )
-    return f"{header}\n\n=== SOURCE CODE ===\n{_proposer_code_context(state, state.get('repo_path', ''))}"
+    return f"{header}\n\n=== SOURCE CODE ===\n{_proposer_code_context(state, repo_path, boost=set(high_value))}"
 
 
 def _ground_proposal(index: int, proposal, ranges: list[dict], repo_path: str) -> VulnerabilityHypothesis | None:

@@ -28,6 +28,11 @@ class Settings(BaseModel):
     max_tool_calls: int = Field(default=200, ge=1)
     planner_max_rounds: int = Field(default=14, ge=1)
     context_summary_interval: int = Field(default=6, ge=1)
+    llm_max_retries: int = Field(default=3, ge=1)
+    llm_backoff_base_seconds: float = Field(default=0.5, ge=0.0)
+    llm_backoff_max_seconds: float = Field(default=8.0, ge=0.0)
+    llm_max_calls_per_minute: int = Field(default=120, ge=1)
+    persist_full_state: bool = False
     solodit_api_url: str = "https://solodit.cyfrin.io/api/v1/solodit"
     solodit_api_key: str | None = None
     rag_dir: Path = Path("data/rag")
@@ -61,6 +66,11 @@ def get_settings() -> Settings:
         max_tool_calls=int(os.getenv("SENTINEL_MAX_TOOL_CALLS", "200")),
         planner_max_rounds=int(os.getenv("SENTINEL_PLANNER_MAX_ROUNDS", "14")),
         context_summary_interval=int(os.getenv("SENTINEL_CONTEXT_SUMMARY_INTERVAL", "6")),
+        llm_max_retries=int(os.getenv("SENTINEL_LLM_MAX_RETRIES", "3")),
+        llm_backoff_base_seconds=float(os.getenv("SENTINEL_LLM_BACKOFF_BASE_SECONDS", "0.5")),
+        llm_backoff_max_seconds=float(os.getenv("SENTINEL_LLM_BACKOFF_MAX_SECONDS", "8.0")),
+        llm_max_calls_per_minute=int(os.getenv("SENTINEL_LLM_MAX_CALLS_PER_MINUTE", "120")),
+        persist_full_state=os.getenv("SENTINEL_PERSIST_FULL_STATE", "false").lower() in {"1", "true", "yes", "on"},
         solodit_api_url=os.getenv("SOLODIT_API_URL", "https://solodit.cyfrin.io/api/v1/solodit"),
         solodit_api_key=os.getenv("SOLODIT_API_KEY") or None,
         rag_dir=Path(os.getenv("SENTINEL_RAG_DIR", "data/rag")),
