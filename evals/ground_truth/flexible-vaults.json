@@ -1,0 +1,141 @@
+{
+  "contest": "2025-07-mellow-flexible-vaults",
+  "repo_path": "Test/flexible-vaults",
+  "findings": [
+    {
+      "id": "H-1",
+      "severity": "high",
+      "title": "Consensus.checkSignatures does not check duplicate signers (threshold bypass)",
+      "file_contains": "Consensus.sol",
+      "function": "checkSignatures",
+      "vulnerability_class": "access_control",
+      "match_any": ["duplicat", "same signer", "repeated signer", "repeated signature", "unique signer", "distinct signer", "bypass the threshold", "reuse a signature"]
+    },
+    {
+      "id": "H-2",
+      "severity": "high",
+      "title": "RedeemQueue accounting mismatch between batch creation and claim eligibility",
+      "file_contains": "RedeemQueue.sol",
+      "function": "_handleReport",
+      "vulnerability_class": "accounting",
+      "match_any": ["latesteligible", "upperlookup", "off-by-one", "boundary", "batch", "eligibility", "claimable", "exclude"]
+    },
+    {
+      "id": "H-3",
+      "severity": "high",
+      "title": "Vault/redeem hooks do not handle native token (withdraw reverts)",
+      "file_contains": "",
+      "function": "getLiquidAssets",
+      "vulnerability_class": "business_logic",
+      "match_any": ["native", "balanceof", "ether", "eth ", "native token"]
+    },
+    {
+      "id": "H-4",
+      "severity": "high",
+      "title": "Protocol fee multiple accrual across non-base assets in Oracle.submitReports",
+      "file_contains": "",
+      "function": "handleReport",
+      "vulnerability_class": "accounting",
+      "match_any": ["non-base", "base asset", "multiple", "submitreports", "each report", "per report", "accru", "twice"]
+    },
+    {
+      "id": "H-5",
+      "severity": "high",
+      "title": "Incorrect performance fee calculation in FeeManager",
+      "file_contains": "FeeManager.sol",
+      "function": "calculateFee",
+      "vulnerability_class": "accounting",
+      "match_any": ["performance fee", "performancefee", "minprice", "price difference", "wrong formula", "incorrect formula", "denominator", "muldiv"]
+    },
+    {
+      "id": "H-6",
+      "severity": "high",
+      "title": "Redeems through RedeemQueue avoid management and performance fees",
+      "file_contains": "RedeemQueue.sol",
+      "function": "redeem",
+      "vulnerability_class": "accounting",
+      "match_any": ["avoid", "bypass", "escape", "management fee", "performance fee", "not subject", "burned immediately", "do not pay"]
+    },
+    {
+      "id": "M-1",
+      "severity": "medium",
+      "title": "ShareManager.updateChecks inverts transfer-whitelist behavior",
+      "file_contains": "ShareManager.sol",
+      "function": "updateChecks",
+      "vulnerability_class": "access_control",
+      "match_any": ["cantransfer", "whitelist", "invert", "inverted", "opposite", "transfer whitelist"]
+    },
+    {
+      "id": "M-2",
+      "severity": "medium",
+      "title": "ETH redemptions via SignatureRedeemQueue broken (missing receive)",
+      "file_contains": "SignatureRedeemQueue.sol",
+      "function": "redeem",
+      "vulnerability_class": "business_logic",
+      "match_any": ["receive", "fallback", "payable", "sendvalue", "native", "ether", "eth "]
+    },
+    {
+      "id": "M-3",
+      "severity": "medium",
+      "title": "stETH 1-2 wei transfer rounding causes DoS for depositors/redeemers",
+      "file_contains": "DepositQueue.sol",
+      "function": "deposit",
+      "vulnerability_class": "accounting",
+      "match_any": ["steth", "rounding", "1-2 wei", "1 wei", "wei", "less than requested", "actual received", "balance before"]
+    },
+    {
+      "id": "M-4",
+      "severity": "medium",
+      "title": "Protocol fee exponential compounding in ShareModule.handleReport",
+      "file_contains": "ShareModule.sol",
+      "function": "handleReport",
+      "vulnerability_class": "accounting",
+      "match_any": ["compound", "exponential", "inflated", "previously accrued", "each subsequent", "includes all previously"]
+    },
+    {
+      "id": "M-5",
+      "severity": "medium",
+      "title": "cancelDepositRequest always reverts (wrong Fenwick index)",
+      "file_contains": "DepositQueue.sol",
+      "function": "cancelDepositRequest",
+      "vulnerability_class": "business_logic",
+      "match_any": ["index", "fenwick", "indexoutofbounds", "out of bounds", "latestcheckpoint", "wrong index", "always revert"]
+    },
+    {
+      "id": "M-6",
+      "severity": "medium",
+      "title": "Targeted-lockup bypass: freshly minted shares transferable in same call",
+      "file_contains": "TokenizedShareManager.sol",
+      "function": "_update",
+      "vulnerability_class": "business_logic",
+      "match_any": ["lockup", "lockeduntil", "claimshares", "freshly minted", "bypass", "targeted lockup", "same transaction"]
+    },
+    {
+      "id": "M-7",
+      "severity": "medium",
+      "title": "Redemption DoS via unchecked asset support in subvaults (1 wei grief)",
+      "file_contains": "",
+      "function": "getLiquidAssets",
+      "vulnerability_class": "business_logic",
+      "match_any": ["subvault", "notallowedasset", "allowedasset", "unsupported asset", "1 wei", "not supported"]
+    },
+    {
+      "id": "M-8",
+      "severity": "medium",
+      "title": "feeRecipient shares perpetually lockable via targeted-lockup reset",
+      "file_contains": "ShareManager.sol",
+      "function": "mint",
+      "vulnerability_class": "business_logic",
+      "match_any": ["feerecipient", "fee recipient", "lockeduntil", "reset", "targetlockup", "targeted lockup", "perpetual", "lock timer"]
+    },
+    {
+      "id": "M-9",
+      "severity": "medium",
+      "title": "Stuck stETH rewards in queue contracts (rebasing not handled)",
+      "file_contains": "DepositQueue.sol",
+      "function": "deposit",
+      "vulnerability_class": "accounting",
+      "match_any": ["rebase", "rebasing", "reward", "share price increase", "wsteth", "stuck", "rebase token"]
+    }
+  ]
+}
