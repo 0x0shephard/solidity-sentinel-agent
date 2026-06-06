@@ -216,8 +216,6 @@ def _is_unchecked_token_transfer(fact: dict) -> bool:
         return False
     if ".transfer(" not in text and ".transferFrom(" not in text:
         return False
-    # ETH transfers such as `to.transfer(...)` do not return a bool, so they
-    # belong to access/reentrancy triage rather than unchecked ERC20 return triage.
     if compact.startswith("to.transfer(") or "address(this).balance" in compact:
         return False
     return True

@@ -176,6 +176,6 @@ def render_recall_markdown(report: RecallReport) -> str:
             lines.append(f"| {severity} | {bucket['recalled']} | {bucket['touched']} | {bucket['total']} |")
     lines += ["", "| id | severity | result | matched by | title |", "|---|---|---|---|---|"]
     for match in report.matches:
-        result = "✅ recalled" if match.recalled else ("🟡 touched" if match.touched else "❌ missed")
+        result = "recalled" if match.recalled else ("touched" if match.touched else "missed")
         lines.append(f"| {match.id} | {match.severity} | {result} | {match.matched_by or '—'} | {match.title[:60]} |")
     return "\n".join(lines) + "\n"

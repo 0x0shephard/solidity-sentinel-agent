@@ -303,16 +303,13 @@ def _caller_context_snippets(state: AuditState, hypothesis: VulnerabilityHypothe
         file_path = str(raw_range.get("file_path") or "")
         function_name = raw_range.get("function_name")
         if function_name in targets:
-            continue  # the definition itself, not a caller
+            continue  
         if classify_source_path(file_path) not in {"production", "unknown"}:
-            continue  # only target protocol callers, not lib/test/script
+            continue  
         start_line, end_line = raw_range.get("start_line"), raw_range.get("end_line")
         if not isinstance(start_line, int) or not isinstance(end_line, int):
             continue
         body = "\n".join(_lines(file_path)[max(0, start_line - 1):end_line])
-        # Whole-word match so indirect call sites are captured too, e.g.
-        # `abi.encodeCall(IFactoryEntity.initialize, (params))` for proxy-based
-        # atomic initialization — not just direct `name(` calls.
         if not any(re.search(rf"(?<![A-Za-z0-9_]){re.escape(target)}(?![A-Za-z0-9_])", body) for target in targets):
             continue
         key = (file_path, function_name, start_line)
@@ -560,8 +557,6 @@ def _model_or_mapping_json(value) -> dict:
     return {}
 
 
-# Ordered audit pipeline. Each milestone maps to the graph node that completes
-# it and the composite ``audit.*`` tool the planner can call to drive it.
 _PIPELINE: list[tuple[str, str, str]] = [
     ("repo_inspected", "inspect_repo", "audit.inspect_repo"),
     ("framework_detected", "detect_framework", "audit.detect_framework"),
@@ -950,6 +945,14 @@ def maybe_sync_solodit_rag(state: AuditState) -> AuditState:
     return state
 
 
+
+
+# "`@_stage(milestone, next_focus)` wraps a graph node so it (a) skips itself if its milestone is already 
+# in `completed_stages`, and (b) records that milestone when it finishes — that's what makes every stage 
+# run *exactly once* whether the model or the deterministic chain reaches it first. `build_protocol_ir` 
+# is the stage that turns flat static facts into the connected Protocol IR + reachability graph; `contest_reasoning` 
+# is the next stage that builds the adversarial layer (race actors, reasoning packets, gap hunters, working memory) 
+# on top of that IR. Both follow the same node contract: read state → call pure helpers → store typed + JSON results → trace → point to the next stage → return."
 @_stage("repo_inspected", "detect_framework")
 def inspect_repo(state: AuditState) -> AuditState:
     """Stage 1: enumerate repo files, contracts, and pragma/contract hits.
@@ -1719,8 +1722,6 @@ def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bo
     run_dir = str(Path("runs") / actual_run_id)
     state = initial_audit_state(run_id=actual_run_id, repo=repo, objective=objective, run_dir=run_dir)
     state["use_llm_refiner"] = not mock_llm
-    # Never let an unreachable LangSmith endpoint stall LLM calls: reconcile
-    # auto-tracing with settings before the graph (and its LLM calls) run.
     tracing_requested = get_settings().langsmith_tracing
     remote_tracing = configure_tracing()
     if tracing_requested and not remote_tracing:

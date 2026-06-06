@@ -1,25 +1,179 @@
 # Solidity Sentinel Memo
 
+![Sentinel Agent architecture](assets/sentinel_clean.png)
+
 ## What I Built
 
-Solidity Sentinel is a LangGraph/LangChain autonomous agent for Solidity repository triage. It is a **reason→verify auditor**, not a static-detector wrapper: the model drives an 11-stage audit pipeline, proposes code-grounded hypotheses, and adversarially verifies each one against its cross-contract callers.
+Solidity Sentinel is a production-shaped autonomous smart-contract audit agent. It combines a typed tool registry, a LangGraph parent pipeline, model-driven planning, Solodit-backed Self-RAG, scoped subagents, protocol-level intermediate representations, validation artifacts, and an evaluation harness.
 
-- **107 tools across 8 namespaces** (`repo`, `build`, `static`, `research`, `dynamic`, `report`, `memory`, and composite `audit`) behind one typed `RegisteredTool` model and a single `ToolExecutor` enforcement boundary (schema-validate in → run → schema-validate out → ledger → declarative `state_effects` → budget check). No conditional dispatch chain.
-- **Model-driven control.** With `--real-llm`, `plan_with_llm` is the spine: it loops (up to `planner_max_rounds`) calling self-healing composite `audit.*` tools that run the pipeline through any milestone. Each of the 11 stage nodes is idempotent (`@_stage` guards skip completed milestones), so the deterministic chain is a guarded gap-filler, not the default path. Anti-repeat + per-milestone tool hints keep the planner from looping.
-- **Two real subagents in isolated contexts.** The research subagent (`ResearchState`, scoped `research.*` tools enforced by `validate_scope`) runs propose-refine-**adversarial review**-result and returns a structured `ResearchSubgraphResult`; a RAG subagent grades historical-finding context (self-RAG).
-- **Hypothesis generation, grounded.** `research.propose_hypotheses` feeds the model real protocol source (function bodies + attack-path slices + Solodit checklist), and only accepts proposals that ground to a real `src/` function — hallucinated file/function citations are dropped. Cross-contract callers/callees are attached as evidence so findings span ≥2 contracts.
-- **Adversarial verification.** For each lead, the reviewer is shown the affected function plus its cross-contract callers and rules `confirmed` (with an attack trace) or `rejected` (with counterevidence, e.g. an atomic factory/proxy `initialize`). On a real Lido/Mellow vault codebase this auto-rejected two front-running false positives with cited counterevidence.
-- **Production scaffolding.** Observability (structlog + LangSmith with a safe preflight + `tool_ledger.jsonl`), tenacity retries with exponential backoff and a token-bucket rate limiter on every LLM call (`llm/resilience.py`), typed error hierarchy, a ~30-metric eval harness, a ground-truth **recall benchmark** (`sentinel benchmark`), ~170 unit+integration tests, and slimmed run artifacts (state.json ~18× smaller).
-- **Solodit RAG**, dependency-tolerant (runs without Chroma; a fresh install enables the vector path), used as historical context only — never as proof of a target-repo bug.
+The agent is run from the CLI:
+
+```bash
+sentinel audit --repo <repo> --objective "Find bugs" --real-llm
+```
+
+The result of a run is a structured artifact directory under `runs/<run_id>/` containing `report.md`, `report.json`, `state.json`, `tool_ledger.jsonl`, `working_memory.json`, `protocol_graph.json`, `candidate_rank_trace.json`, `proof_packets.json`, RAG telemetry, and validation artifacts.
+
+The current build includes 107 tools across 8 namespaces: `repo`, `build`, `static`, `research`, `dynamic`, `report`, `memory`, and composite `audit`. Each tool is registered through one typed `RegisteredTool` abstraction and executed through a single `ToolExecutor` enforcement boundary, schema-validate input, execute, schema-validate output, record the ledger entry, apply declared state effects, and update the tool budget. This keeps the tool registry coherent at scale rather than turning the agent into a long conditional-dispatch chain.
+
+## Architecture Overview
+
+The parent graph is the main audit conductor. It is implemented as an 11-stage LangGraph pipeline with idempotent milestones:
+
+```text
+initialize_run
+maybe_sync_solodit_rag
+inspect_repo
+detect_framework
+run_static_analysis
+build_protocol_ir
+contest_reasoning
+build_protocol_model
+build_targeted_rag_context
+mine_invariant_candidates
+rank_hypotheses
+rag_retrieve_context
+research_subgraph
+summarize_context
+finish
+```
+
+The stages are deliberately ordered. First the agent understands the repository and framework. Then it extracts local source facts and builds a Protocol IR. Then it performs contest-style reasoning, mines invariants, retrieves historical context, ranks hypotheses, deepens the strongest hypotheses through RAG and research subgraphs, validates them, and writes the final report.
+
+The important architectural choice is that the graph can run in two modes:
+
+```text
+Mock/deterministic mode:
+  The pipeline runs directly through the fixed stage chain.
+
+Real-LLM mode:
+  plan_with_llm becomes the planner spine. The model receives the full tool catalog,
+  schemas, risk metadata, current state summary, previous outputs, output references,
+  completed milestones, remaining budget, and the next recommended milestone.
+```
+
+This gives the model real control over tool selection while the graph still protects completeness. If the planner stalls, repeats itself, or skips a required stage, the graph routes to the first incomplete milestone. That is the central reliability mechanism.
+
+## How The LLM Planner Works
+
+The planner loop is bounded by `planner_max_rounds`. Each round builds a planner prompt from the current `AuditState`, including:
+
+- the objective and repo path
+- the compressed context
+- completed and missing milestones
+- the next milestone and suggested composite tool
+- the full tool catalog and JSON schemas
+- previous tool outputs by reference
+- Protocol IR and RAG summaries
+- remaining tool budget
+
+The LLM must return strict JSON, selected tool names, typed inputs, rationale, optional output references, and a stop/continue decision. The executor then validates that the tool exists, resolves references such as prior output paths, injects common fields like `repo_path` when safe, rejects malformed inputs, skips exact duplicate calls, executes through `ToolExecutor`, and records the result in `tool_ledger.jsonl`.
+
+The planner is therefore model-driven but not unconstrained. It can choose tools, but it cannot bypass schema validation, budget checks, scoped registries, or required audit milestones.
+
+## Self-RAG Flow
+
+Solodit RAG is used as historical context and checklist guidance, never as proof of a bug in the target repo.
+
+The global RAG cache lives under `data/rag/`:
+
+```text
+solodit_raw_cache.jsonl
+solodit_normalized_findings.jsonl
+sync_state.json
+index_metadata.json
+chroma/
+```
+
+Findings are normalized, embedded with `SENTINEL_RAG_EMBED_MODEL` (`sentence-transformers/all-MiniLM-L6-v2` by default), and indexed in Chroma. The index metadata fingerprints the embedding model to avoid silently querying an index built with a different embedding model.
+
+For each top hypothesis, the RAG subgraph runs:
+
+```text
+expand_queries
+retrieve_and_merge
+maybe_repair
+critique_matches
+build_bundle
+```
+
+The subgraph expands one hypothesis into multiple query intents using the vulnerability class, root-cause terms, affected function, local source snippets, checklist refs, and exploit precondition terms. It retrieves across those queries, merges duplicates, grades retrieval quality, repairs weak retrieval once, critiques matches for shared root cause and exploit preconditions, and returns only `safe_to_cite` matches in a `RAGContextBundle`.
+
+This prevents the report from citing generic "similar vault issue" matches as if they prove the local bug. Historical matches are rendered as "Historical Similar Findings" and kept separate from source evidence.
+
+## Subagents
+The research subagent receives one hypothesis at a time. It has its own `ResearchState`, a scoped research tool set, and a separate ledger. Its graph is:
+
+```text
+validate_scope
+analyze_hypothesis
+retrieve_historical_context
+refine_with_llm
+adversarial_review
+create_result
+```
+
+The scope validation step ensures the subagent cannot call parent repo/write/execute tools. It analyzes local evidence, uses historical context if available, asks the LLM to refine the claim, performs adversarial review with full function bodies and cross-contract callers, and returns a structured result to the parent graph.
+
+The RAG subgraph is also per-hypothesis and isolated around retrieval quality. Together, these subgraphs let the parent audit graph fan out into focused analysis without exposing every tool everywhere.
+
+## Short-Term And Long-Term Memory
+
+Short-term memory is held in `AuditState` during the run and persisted to:
+
+```text
+runs/<run_id>/working_memory.json
+```
+
+It contains Feynman-style function summaries, actor assumptions, adversarial questions, open proof obligations, rejected hypotheses, and benchmark lessons detected during the current audit.
+
+Long-term memory is currently advisory and stored under:
+
+```text
+data/memory/benchmark_lessons.jsonl
+```
+
+At the end of a run, the parent graph extracts selected `benchmark_lessons` from the working memory and appends them to this JSONL file. Examples include lessons such as "mutable order terms require slippage or min/max bound reasoning" or "CEI-safe SafeERC20 reentrancy candidates need a concrete secondary target before promotion." These lessons are intended to guide future audits, but they cannot promote a finding without local source evidence.
+
+The honest limitation is that long-term memory is still narrow, it stores benchmark lessons, but it is not yet a full semantic feedback loop over missed findings, false positives, successful proof templates, and future planner retrieval.
+
+## Example Audit Flow
+
+Suppose the user runs:
+
+```bash
+sentinel audit \
+  --repo Test/2025-07-orderbook \
+  --objective "Find bugs in this Foundry smart contract repo" \
+  --real-llm
+```
+
+The run starts with `run_audit()`, creates `runs/<run_id>/`, configures LangSmith tracing if enabled, and builds the parent graph. The agent optionally syncs Solodit RAG, inspects the repo, detects Foundry, runs build/static tools, extracts contracts/functions/state writes/token transfers/external calls, and builds a Protocol IR.
+
+The contest reasoning stage summarizes functions in plain English, asks adversarial questions, builds an actor/transaction model, and runs gap-hunter reasoning over flow gaps, numerical gaps, trust gaps, market/order races, and lifecycle bugs. The invariant miner turns these facts into proof-oriented candidates.
+
+Next, targeted RAG builds a repo profile from the Protocol IR and retrieves historical Solodit context by domain, asset flow, lifecycle, auth model, and invariant family. `rank_hypotheses` merges deterministic detector outputs, invariant candidates, gap candidates, RAG checklist context, and LLM-proposed hypotheses. Ungrounded LLM proposals are dropped if they cite non-existent files/functions.
+
+For the top hypotheses, the Self-RAG subgraph expands queries, retrieves and critiques historical matches, and attaches only safe-to-cite context. The research subagent then reviews each hypothesis with local evidence, full function bodies, cross-contract caller context, historical context, and adversarial review. The finish stage runs semantic validation, generates validation plans/tests where setup is known, compiles/runs validation artifacts, gates findings, writes reports, and persists state.
+
+The final report is therefore not just "the model said so." It is a structured product of local evidence, ranked hypotheses, historical context, research verdicts, proof packets, and validation artifacts.
 
 ## What I Cut
 
-I kept RAG and Chroma optional so the agent runs in a minimal venv. I did not build a from-scratch Solidity parser — static facts come from regex/Slither extraction feeding a Protocol IR, which is good enough for call-graph and evidence grounding but misses some semantic precision. Validation artifacts are emitted as plans for most classes rather than always-compiling Foundry PoCs. The deterministic graph remains as a fallback rather than being deleted, because it guarantees a complete audit when the model stalls or the endpoint fails.
+I kept RAG and Chroma dependency-tolerant so the agent can still run in a minimal environment. I did not write a full Solidity parser from scratch, the current Protocol IR combines regex/range mapping, Slither output when available, and source-derived facts. That is enough for evidence grounding and useful graph slices, but it is weaker than a full AST/CFG/dataflow engine.
+
+Most validation artifacts are still generated as plans unless constructor setup and project fixtures are clear enough to safely emit executable Foundry tests. I kept the deterministic stage chain as a fallback rather than deleting it because security tooling should fail complete and debuggable, not silently half-run when a model endpoint fails.
 
 ## What More Time Would Address
 
-In priority order for real-world usefulness: (1) swap in a frontier model for the proposer/reviewer — quality and verdict consistency are model-bound today; (2) raise recall with iterative/budgeted proposing and broader vuln-class coverage (current proposer emits 3–6 hypotheses); (3) make PoCs executable — compile a failing `forge test` against the target and pass-after-fix; (4) sandbox the `forge`/`slither` subprocess in a container; (5) richer counterevidence gathering (deployment scripts, test setup, modifiers) for more consistent rejections. The recall benchmark added here is the gate that makes (1)–(2) measurable.
+The highest-leverage next work is deeper semantic understanding, AST-backed Protocol IR, multi-hop call/dataflow, stronger actor and transaction-order modeling, and executable validation for more bug classes. The second priority is memory, persist missed findings, false-positive suppressions, successful PoC templates, and benchmark lessons into a retrievable memory layer that is fed into planning and ranking. The third priority is model quality, use a stronger hosted model for proposer/reviewer roles while keeping local/mock modes deterministic for tests.
+
+I would also harden proof gating so `confirmed` requires either executable validation or complete static proof, improve RAG canonical query construction, and measure progress with benchmark recall rather than adding one-off detectors after each new repo.
 
 ## Design Decision I Would Defend
 
-**Composite `audit.*` tools + idempotent stages, instead of either a pure LLM ReAct loop or a fixed pipeline.** An engineer might reasonably have built a single ReAct agent that free-forms every tool call. I made each pipeline stage an idempotent node and exposed a self-healing composite tool per milestone, so the model genuinely *drives* (it selects and sequences the stages, and `research.propose_hypotheses`/the reviewer are real model decisions) while a guarded deterministic chain guarantees a complete, reproducible audit if the model stalls, repeats, or the remote endpoint drops a connection. This buys autonomy *and* reliability — which matters because an audit report that silently half-runs is worse than useless. The cost is that pipeline ordering is encoded in `_PIPELINE` rather than discovered by the model; I accept that trade for determinism and debuggability of a security tool.
+I would defend the hybrid design, composite `audit.*` tools plus idempotent LangGraph stages, instead of either a pure free-form ReAct loop or a rigid static pipeline.
+
+A pure ReAct agent gives the model freedom, but it can loop, skip important setup, or produce an impressive report after an incomplete audit. A rigid pipeline is reliable, but it reduces the model to a formatter. Sentinel splits the difference: the LLM planner chooses tools and reasoning paths, while milestone guards, typed schemas, scoped subagents, ledgers, and proof gates keep the run reproducible and inspectable.
+
+That tradeoff is especially important for security work. An autonomous auditor needs creativity, but the final report must still be traceable back to local source evidence, tool calls, and validation artifacts.

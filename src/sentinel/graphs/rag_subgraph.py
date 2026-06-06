@@ -158,7 +158,16 @@ def build_bundle(state: RAGState) -> RAGState:
     state["subagent_tool_ledger"] = [*state.get("subagent_tool_ledger", []), *tool_state.get("tool_ledger", [])]
     return state
 
-
+# Builds the Self-RAG subgraph for one hypothesis: the flow first expands the
+# hypothesis into multiple retrieval queries, then retrieves and merges historical
+# matches across those queries, optionally repairs weak retrieval by generating a
+# better query, critiques the retrieved matches for real shared root cause and
+# safe-to-cite relevance, and finally packages the approved matches into a
+# structured RAG context bundle. The graph is linear because each step depends on
+# the previous one: query expansion improves recall, retrieval/merge deduplicates
+# candidates, repair handles weak results, critique prevents irrelevant historical
+# citations, and build_bundle returns the final context consumed by the parent
+# audit graph and research subagent.
 def build_rag_graph():
     graph = StateGraph(RAGState)
     graph.add_node("expand_queries", expand_queries)

@@ -331,10 +331,7 @@ def create_result(state: ResearchState) -> ResearchState:
     else:
         finding_status = "needs_manual_review"
 
-    # Adversarial verdict (Phase 2.2) is the deepest signal: it reviewed the
-    # affected function against its cross-contract callers. A decisive verdict
-    # overrides the static heuristic and supplies the attack trace or the
-    # mitigation counterevidence.
+    
     reasoning_summary = likely_impact
     verdict = state.get("adversarial_verdict")
     if verdict is not None and verdict.verdict in {"confirmed", "likely", "rejected"}:
@@ -396,7 +393,17 @@ def _has_cross_function_or_static_proof(hypothesis: VulnerabilityHypothesis, fun
         )
     )
 
-
+# Builds the isolated research subgraph for a single vulnerability hypothesis:
+# the flow first validates that the subagent only has access to its approved
+# research-scoped tools, then analyzes the local hypothesis and source evidence,
+# retrieves historical context when available, asks the LLM to refine the claim,
+# performs an adversarial review to challenge assumptions and look for
+# counterevidence, and finally returns a structured research result to the parent
+# audit graph. The graph is linear because each stage strengthens or filters the
+# previous one: scope validation enforces isolation, local analysis grounds the
+# hypothesis, historical retrieval adds context, LLM refinement improves the
+# explanation, adversarial review reduces false positives, and create_result
+# packages the final status, rationale, validation ideas, and subagent ledger.
 def build_research_graph():
     graph = StateGraph(ResearchState)
     graph.add_node("validate_scope", validate_scope)
