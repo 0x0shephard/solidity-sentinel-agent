@@ -31,24 +31,72 @@ from sentinel.tools.executor import ToolExecutor, _json_hash
 
 
 def make_run_id() -> str:
+    """Generate a unique, sortable run identifier.
+
+    Args:
+        (none)
+    Returns:
+        A string like ``20260606-143005-a1b2c3`` (UTC timestamp + short uuid),
+        used to name the run directory and tag every artifact/log line.
+    """
     return datetime.now(UTC).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
 
 def _executor() -> ToolExecutor:
+    """Build a tool executor over the full default tool registry.
+
+    Args:
+        (none)
+    Returns:
+        A fresh ``ToolExecutor`` wrapping the 100+ tool registry — the single
+        enforcement boundary through which every deterministic-node tool call runs.
+    """
     return ToolExecutor(build_default_registry())
 
 
 def _record_step(state: AuditState, step_id: str, summary: str) -> None:
+    """Append a completed-step record to the audit's plan trace.
+
+    Args:
+        state: The mutable audit state.
+        step_id: Identifier of the step/tool that ran (e.g. a tool name).
+        summary: Human-readable one-line description of what happened.
+    Returns:
+        None. Mutates ``state['completed_steps']`` in place.
+    """
     state.setdefault("completed_steps", []).append(CompletedStep(step_id=step_id, summary=summary))
 
 
 def _run_tool(state: AuditState, tool_name: str, raw_input: dict):
+    """Execute one registered tool and record it on the plan trace.
+
+    Args:
+        state: The mutable audit state (the executor records the call on it).
+        tool_name: Fully-qualified tool name (``namespace.name``).
+        raw_input: Raw input dict, validated against the tool's input schema.
+    Returns:
+        The tool's validated, typed output model (also stored in
+        ``state['last_outputs'][tool_name]`` by the executor).
+    """
     output = _executor().execute(tool_name, raw_input, state)
     _record_step(state, tool_name, f"{tool_name} returned {getattr(output, 'status', 'ok')}")
     return output
 
 
 def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: VulnerabilityHypothesis) -> list[dict]:
+    """Gather the evidence snippets to hand a hypothesis to the research subagent.
+
+    Assembles (in priority order) the invariant proof packet, full function
+    bodies, explicit evidence lines, and class-relevant static facts (reentrancy
+    → external calls/state writes, unchecked_transfer → token transfers, etc.).
+
+    Args:
+        state: The audit state (reads proof_packets and static_facts).
+        hypothesis: The hypothesis to collect supporting evidence for.
+    Returns:
+        Up to 12 snippet dicts (each with kind/file/line/text) used as the
+        subagent's scoped evidence context.
+    """
     proof_packet = next((packet for packet in state.get("proof_packets", []) if packet.packet_id == hypothesis.proof_packet_id), None)
     proof_snippets: list[dict] = []
     if proof_packet:
@@ -139,6 +187,18 @@ def _evidence_snippets_for_hypothesis(state: AuditState, hypothesis: Vulnerabili
 
 
 def _function_body_snippets_for_hypothesis(state: AuditState, hypothesis: VulnerabilityHypothesis) -> list[dict]:
+    """Read the full source bodies of a hypothesis's affected functions.
+
+    Uses the static-analysis ``function_ranges`` to slice real source out of the
+    repo for the affected files/functions/contracts, so the subagent reasons over
+    actual code rather than summaries. Bounded to ~12K chars / 4 snippets.
+
+    Args:
+        state: The audit state (reads repo_path and static_facts.function_ranges).
+        hypothesis: The hypothesis whose functions' bodies are wanted.
+    Returns:
+        Up to 4 ``function_body`` snippet dicts with real source text.
+    """
     repo_path = Path(state.get("repo_path", ""))
     ranges = state.get("static_facts", {}).get("function_ranges", [])
     if not repo_path or not ranges:
@@ -207,7 +267,15 @@ def _caller_context_snippets(state: AuditState, hypothesis: VulnerabilityHypothe
     Adversarial deepening needs to see who calls the affected function to decide
     whether a precondition is satisfied atomically (mitigation) or reachable by
     an attacker (confirmation) — e.g. a factory/configurator that initializes and
-    wires a manager in the same transaction.
+    wires a manager in the same transaction. Matching is whole-word so indirect
+    sites (e.g. ``abi.encodeCall(Iface.initialize, ...)``) are captured.
+
+    Args:
+        state: The audit state (reads repo_path and static_facts.function_ranges).
+        hypothesis: The hypothesis whose affected functions' callers are wanted.
+    Returns:
+        Up to 4 target-scoped ``caller_context`` snippet dicts (lib/test/script
+        excluded), each with the caller's real source body.
     """
 
     from sentinel.evidence import classify_source_path
@@ -273,7 +341,20 @@ def _caller_context_snippets(state: AuditState, hypothesis: VulnerabilityHypothe
 
 
 def _cross_contract_neighbor_evidence(state: AuditState, hypothesis: VulnerabilityHypothesis, existing_files: set[str]) -> SourceEvidence | None:
-    """A callee/caller of the affected function in a different target file, from the call graph."""
+    """A callee/caller of the affected function in a different target file, from the call graph.
+
+    Fallback to ``_caller_context_snippets`` for cross-contract evidence: walks
+    the Protocol IR ``call_edges`` for graph neighbours of the affected function
+    and reads one neighbour's real source from a file not already cited.
+
+    Args:
+        state: The audit state (reads protocol_ir, static_facts, repo_path).
+        hypothesis: The hypothesis to broaden evidence for.
+        existing_files: Files already cited (so the neighbour adds a new file).
+    Returns:
+        A ``SourceEvidence`` for a cross-contract neighbour, or None if none
+        exists in target (production/unknown) source.
+    """
 
     from sentinel.evidence import classify_source_path
 
@@ -328,7 +409,13 @@ def _attach_cross_contract_evidence(state: AuditState) -> None:
     Findings should cite the cross-contract call path, not just the single
     affected function. We attach one real, target-scoped caller or callee from a
     different file (via the call graph) so reports and the cross-contract metric
-    reflect the protocol structure that already exists in the IR.
+    reflect the protocol structure that already exists in the IR. If no genuine
+    cross-contract neighbour exists, nothing is attached (no fabrication).
+
+    Args:
+        state: The audit state; iterates and mutates ``state['hypotheses']``.
+    Returns:
+        None. Appends at most one cross-file ``SourceEvidence`` per hypothesis.
     """
 
     for hypothesis in state.get("hypotheses", []):
@@ -360,6 +447,19 @@ def _attach_cross_contract_evidence(state: AuditState) -> None:
 
 
 def _tool_prompt(state: AuditState) -> str:
+    """Build the LLM planner's prompt for the next round of tool selection.
+
+    Compresses the current audit state into planner guidance: objective, budget,
+    Protocol IR / graph summaries, RAG checklist, milestone progress, the next
+    required milestone and how to advance it, already-executed tools (anti-repeat),
+    and recent results. This is the in-code context-management strategy for the
+    long-horizon planner loop.
+
+    Args:
+        state: The audit state to summarize.
+    Returns:
+        A prompt string (paired with the tool catalog when calling the planner).
+    """
     remaining_budget = max(0, get_settings().max_tool_calls - state.get("tool_call_count", 0))
     rag_context = state.get("last_outputs", {}).get("research.retrieve_historical_findings", {})
     protocol_ir = state.get("protocol_ir")
@@ -409,6 +509,20 @@ def _tool_prompt(state: AuditState) -> str:
 
 
 def _resolve_output_references(state: AuditState, tool_input: dict, references: list[dict]) -> dict:
+    """Wire one tool's prior output into another tool's input (composability).
+
+    Each reference is ``{from_tool, path, target_input}``: the dotted ``path`` is
+    read from ``state['last_outputs'][from_tool]`` and injected into the new
+    tool's input under ``target_input`` — this is what lets the model chain tools.
+
+    Args:
+        state: The audit state (reads ``last_outputs``).
+        tool_input: The base input dict for the tool about to run.
+        references: List of output-reference specs from the planner decision.
+    Returns:
+        A new input dict with resolved references merged in (originals preserved
+        when a reference can't be resolved).
+    """
     resolved = dict(tool_input)
     for ref in references:
         from_tool = ref.get("from_tool")
@@ -429,6 +543,14 @@ def _resolve_output_references(state: AuditState, tool_input: dict, references: 
 
 
 def _model_or_mapping_json(value) -> dict:
+    """Normalize a Pydantic model or mapping (or None) into a plain dict.
+
+    Args:
+        value: A Pydantic model, a dict, or None.
+    Returns:
+        ``value.model_dump(mode="json")`` for models, the dict itself for dicts,
+        or ``{}`` for None/other — a safe accessor for optional state fields.
+    """
     if not value:
         return {}
     if hasattr(value, "model_dump"):
@@ -466,6 +588,12 @@ def _stage(milestone: str, next_focus: str):
     completion is recorded in ``state['completed_stages']`` on success. This is
     what turns the deterministic chain into a guarded gap-filler behind the
     model-driven planner.
+
+    Args:
+        milestone: The milestone key this node completes (e.g. ``protocol_ir_built``).
+        next_focus: The node to route to when this stage is skipped as already-done.
+    Returns:
+        A decorator that wraps a ``(state) -> state`` node with the skip/mark logic.
     """
 
     def decorator(fn):
@@ -487,7 +615,14 @@ def _stage(milestone: str, next_focus: str):
 
 
 def _next_milestone_tool_hint(next_milestone: str | None) -> str:
-    """Tell the planner which composite tool advances the next milestone."""
+    """Tell the planner which composite tool advances the next milestone.
+
+    Args:
+        next_milestone: The first incomplete milestone, or None if all are done.
+    Returns:
+        A one-line instruction naming the ``audit.*`` composite tool to call
+        next (or to stop), injected into the planner prompt.
+    """
 
     if not next_milestone:
         return "All milestones complete; set stop=true."
@@ -502,6 +637,16 @@ def _next_milestone_tool_hint(next_milestone: str | None) -> str:
 
 
 def _planner_milestones(state: AuditState) -> dict[str, bool]:
+    """Report which audit pipeline milestones are complete.
+
+    Completion is authoritative — keyed off ``state['completed_stages']`` (set by
+    the ``_stage`` decorator), not loose state-key presence.
+
+    Args:
+        state: The audit state.
+    Returns:
+        An ordered ``{milestone: bool}`` map over the 11 pipeline stages.
+    """
     done = set(state.get("completed_stages", []))
     return {milestone: (milestone in done) for milestone in _PIPELINE_MILESTONES}
 
@@ -512,6 +657,12 @@ def _ensure_pipeline_through(state: AuditState, target_milestone: str) -> AuditS
     Each stage node is idempotent (see ``_stage``), so already-completed stages
     are skipped. This lets a single composite tool call resume the pipeline from
     wherever the model left it, guaranteeing prerequisites without redoing work.
+
+    Args:
+        state: The audit state, mutated in place as stages run.
+        target_milestone: The milestone to ensure completion through (inclusive).
+    Returns:
+        The same ``state`` object, with all stages up to the target completed.
     """
 
     node_fns = _pipeline_node_fns()
@@ -523,6 +674,16 @@ def _ensure_pipeline_through(state: AuditState, target_milestone: str) -> AuditS
 
 
 def _pipeline_node_fns() -> dict[str, "Callable[[AuditState], AuditState]"]:
+    """Map each milestone to the (decorated) node function that completes it.
+
+    Resolved lazily at call time to avoid a forward-reference problem (the node
+    functions are defined later in this module).
+
+    Args:
+        (none)
+    Returns:
+        A ``{milestone: node_fn}`` dict used by ``_ensure_pipeline_through``.
+    """
     return {
         "repo_inspected": inspect_repo,
         "framework_detected": detect_framework,
@@ -539,6 +700,17 @@ def _pipeline_node_fns() -> dict[str, "Callable[[AuditState], AuditState]"]:
 
 
 def _next_missing_graph_node(state: AuditState) -> str:
+    """Find the first incomplete pipeline stage's graph node name.
+
+    Used after the planner runs to route the deterministic chain to the first
+    gap the model left, so it only fills what's missing.
+
+    Args:
+        state: The audit state.
+    Returns:
+        The graph node name to run next, or ``"summarize_context"`` if every
+        stage is complete.
+    """
     milestones = _planner_milestones(state)
     ordered = [
         ("repo_inspected", "inspect_repo"),
@@ -560,10 +732,28 @@ def _next_missing_graph_node(state: AuditState) -> str:
 
 
 def _route_after_planner(state: AuditState) -> str:
+    """Conditional-edge router from the planner node into the stage chain.
+
+    Args:
+        state: The audit state (the planner sets ``current_focus`` on exit).
+    Returns:
+        The next node name — the planner's chosen focus, or the first missing
+        milestone's node as a fallback.
+    """
     return state.get("current_focus") or _next_missing_graph_node(state)
 
 
 def _persist_long_term_memory(state: AuditState) -> ArtifactRef | None:
+    """Append this run's advisory lessons to cross-run long-term memory.
+
+    Writes de-duplicated ``benchmark_lessons`` from working memory to a gitignored
+    JSONL under ``data/memory/`` so knowledge accumulates across audits.
+
+    Args:
+        state: The audit state (reads working_memory, run_id, repo_path).
+    Returns:
+        An ``ArtifactRef`` to the memory file, or None if there are no lessons.
+    """
     working_memory = state.get("working_memory")
     if not working_memory:
         return None
@@ -590,6 +780,23 @@ def _persist_long_term_memory(state: AuditState) -> ArtifactRef | None:
 
 
 def plan_with_llm(state: AuditState) -> AuditState:
+    """Model-driven planner spine: let the LLM select and run tools in a loop.
+
+    Each round builds the planner prompt + full tool catalog, asks the model for
+    tool decisions, and executes them through the enforcement executor with
+    schema validation, required-input checks, anti-repeat de-duplication, and
+    per-call exception isolation. Loops until milestones complete / budget low /
+    no new actions / the model stops. Falls back to the Ollama planner, then to
+    the deterministic graph, if the primary planner is unavailable.
+
+    Args:
+        state: The audit state, mutated as tools run (ledger, last_outputs,
+            completed_stages, errors/warnings).
+    Returns:
+        The same ``state``, with ``last_outputs['llm.plan_with_llm']`` (executed/
+        skipped/rounds/stop_reason/milestones) recorded and ``current_focus`` set
+        to the first incomplete stage for the chain to finish.
+    """
     registry = build_default_registry()
     tool_catalog = [tool.public_dict() for tool in registry.list()]
     planner_source = "primary"
@@ -701,6 +908,14 @@ def plan_with_llm(state: AuditState) -> AuditState:
 
 
 def initialize_run(state: AuditState) -> AuditState:
+    """Entry node: create the run directory, log start, and seed the plan.
+
+    Args:
+        state: The fresh audit state.
+    Returns:
+        The same ``state`` with the run dir ensured, a ``run_started`` event
+        logged, ``plan`` populated, and ``current_focus`` set to inspect_repo.
+    """
     ensure_run_dir(state["run_dir"])
     log_event(state["run_dir"], run_id=state["run_id"], event="run_started", status="running")
     state["current_focus"] = "inspect_repo"
@@ -719,6 +934,14 @@ def initialize_run(state: AuditState) -> AuditState:
 
 
 def maybe_sync_solodit_rag(state: AuditState) -> AuditState:
+    """Sync the Solodit historical-findings RAG cache (stale-ok).
+
+    Args:
+        state: The audit state.
+    Returns:
+        The same ``state`` with the sync status in ``last_outputs`` and any
+        message appended to ``warnings``; tolerates a stale/unavailable corpus.
+    """
     result = sync_solodit(stale_ok=True)
     state["last_outputs"]["research.solodit_sync"] = {"status": result.status.value, "state": result.model_dump(mode="json")}
     if result.message:
@@ -729,6 +952,14 @@ def maybe_sync_solodit_rag(state: AuditState) -> AuditState:
 
 @_stage("repo_inspected", "detect_framework")
 def inspect_repo(state: AuditState) -> AuditState:
+    """Stage 1: enumerate repo files, contracts, and pragma/contract hits.
+
+    Args:
+        state: The audit state.
+    Returns:
+        The same ``state`` with ``repo_facts`` (files, contracts) populated;
+        marks the ``repo_inspected`` milestone.
+    """
     repo_path = state["repo_path"]
     _run_tool(state, "repo.list_files", {"repo_path": repo_path})
     _run_tool(state, "repo.find_contracts", {"repo_path": repo_path})
@@ -744,6 +975,17 @@ def inspect_repo(state: AuditState) -> AuditState:
 
 @_stage("framework_detected", "run_static_analysis")
 def detect_framework(state: AuditState) -> AuditState:
+    """Stage 2: detect the build framework, solc, and tool availability.
+
+    Detects Foundry/Hardhat, the compiler, and whether forge/slither are present;
+    runs a Foundry build when available.
+
+    Args:
+        state: The audit state.
+    Returns:
+        The same ``state`` with ``build_facts`` (framework, solc, foundry_build)
+        populated; marks the ``framework_detected`` milestone.
+    """
     repo_path = state["repo_path"]
     _run_tool(state, "build.detect_framework", {"repo_path": repo_path})
     _run_tool(state, "build.detect_solc", {"repo_path": repo_path})
@@ -764,6 +1006,19 @@ def detect_framework(state: AuditState) -> AuditState:
 
 @_stage("static_facts_extracted", "build_protocol_ir")
 def run_static_analysis(state: AuditState) -> AuditState:
+    """Stage 3: the authoritative static-analysis pass.
+
+    Runs all extractors (contracts, functions, ranges, access control, external
+    calls, token transfers/types, storage writes), the 10 custom detectors, and
+    Slither, and assembles them into the canonical ``static_facts`` dict that the
+    rest of the pipeline consumes.
+
+    Args:
+        state: The audit state.
+    Returns:
+        The same ``state`` with ``static_facts`` fully populated; marks the
+        ``static_facts_extracted`` milestone.
+    """
     repo_path = state["repo_path"]
     _run_tool(state, "static.extract_contracts", {"repo_path": repo_path})
     _run_tool(state, "static.extract_functions", {"repo_path": repo_path})
@@ -816,6 +1071,17 @@ def run_static_analysis(state: AuditState) -> AuditState:
 
 @_stage("protocol_ir_built", "contest_reasoning")
 def build_protocol_ir(state: AuditState) -> AuditState:
+    """Stage 4: build the Protocol IR and cross-contract graph.
+
+    Derives the typed IR (contracts, call edges, asset flows, auth constraints)
+    and the protocol graph (slices + attack-path candidates) from static facts.
+
+    Args:
+        state: The audit state (reads static_facts).
+    Returns:
+        The same ``state`` with ``protocol_ir`` and ``protocol_graph`` set and
+        summarized into ``last_outputs``; marks the ``protocol_ir_built`` milestone.
+    """
     ir = build_protocol_ir_from_facts(state["repo_path"], state.get("static_facts", {}))
     graph = build_protocol_graph(ir)
     state["protocol_ir"] = ir
@@ -842,6 +1108,17 @@ def build_protocol_ir(state: AuditState) -> AuditState:
 
 @_stage("contest_reasoning_done", "build_protocol_model")
 def contest_reasoning(state: AuditState) -> AuditState:
+    """Stage 5: actor/race modeling, reasoning packets, and gap hunters.
+
+    Builds the adversarial reasoning layer over the IR (transaction-race actors,
+    reasoning packets, gap-hunter candidates) and the short-term working memory.
+
+    Args:
+        state: The audit state (requires ``protocol_ir``; skips gracefully if absent).
+    Returns:
+        The same ``state`` with reasoning_packets, gap_candidates, and
+        working_memory populated; marks the ``contest_reasoning_done`` milestone.
+    """
     ir = state.get("protocol_ir")
     if not ir:
         state.setdefault("warnings", []).append("Contest reasoning skipped because Protocol IR is unavailable.")
@@ -875,6 +1152,14 @@ def contest_reasoning(state: AuditState) -> AuditState:
 
 @_stage("protocol_model_built", "build_targeted_rag_context")
 def build_protocol_model(state: AuditState) -> AuditState:
+    """Stage 6: summarize protocol roles, assets, accounting, and upgrades.
+
+    Args:
+        state: The audit state (reads static_facts/protocol_ir).
+    Returns:
+        The same ``state`` with ``protocol_model`` populated; marks the
+        ``protocol_model_built`` milestone.
+    """
     if state.get("protocol_ir"):
         state.setdefault("static_facts", {})["protocol_ir"] = state["protocol_ir"].model_dump(mode="json")
     model = build_protocol_model_from_facts(state.get("static_facts", {}))
@@ -887,6 +1172,14 @@ def build_protocol_model(state: AuditState) -> AuditState:
 
 @_stage("invariants_mined", "rank_hypotheses")
 def mine_invariants(state: AuditState) -> AuditState:
+    """Stage 8: mine protocol invariant candidates and build proof packets.
+
+    Args:
+        state: The audit state (reads static_facts).
+    Returns:
+        The same ``state`` with ``invariant_candidates`` and ``proof_packets``
+        populated; marks the ``invariants_mined`` milestone.
+    """
     candidates = mine_invariant_candidates(state["repo_path"], state.get("static_facts", {}))
     proof_packets = build_invariant_proof_packets(candidates, state.get("static_facts", {}))
     state["invariant_candidates"] = candidates
@@ -904,6 +1197,17 @@ def mine_invariants(state: AuditState) -> AuditState:
 
 @_stage("targeted_rag_built", "mine_invariant_candidates")
 def build_targeted_rag_context(state: AuditState) -> AuditState:
+    """Stage 7: build the repo profile and Solodit checklist RAG context.
+
+    Produces a graph-derived repo profile and retrieves historical-finding
+    checklist items (used as prompts only, not proof) to steer ranking.
+
+    Args:
+        state: The audit state (reads static_facts/protocol_ir/graph).
+    Returns:
+        The same ``state`` with ``repo_rag_profile`` and ``targeted_rag`` set;
+        marks the ``targeted_rag_built`` milestone.
+    """
     repo_path = state["repo_path"]
     profile = _run_tool(
         state,
@@ -938,6 +1242,18 @@ def build_targeted_rag_context(state: AuditState) -> AuditState:
 
 @_stage("hypotheses_ranked", "rag_retrieve_context")
 def rank_hypotheses(state: AuditState) -> AuditState:
+    """Stage 9: produce and rank vulnerability hypotheses, then enrich them.
+
+    Ranks deterministic-detector hypotheses, merges in LLM-proposed code-grounded
+    hypotheses (real-LLM mode only; hallucinations dropped), and attaches
+    cross-contract evidence so findings span >=2 contracts.
+
+    Args:
+        state: The audit state (reads static_facts, invariants, gap candidates, RAG).
+    Returns:
+        The same ``state`` with ``hypotheses`` populated; marks the
+        ``hypotheses_ranked`` milestone.
+    """
     _run_tool(
         state,
         "research.rank_hypotheses",
@@ -982,7 +1298,13 @@ def _merge_model_proposed_hypotheses(state: AuditState) -> None:
     """Ask the LLM for novel, code-grounded hypotheses and merge the survivors.
 
     Only runs in real-LLM mode. Proposals that do not ground to existing source
-    are dropped inside the tool, so this never injects hallucinated findings.
+    are dropped inside the tool, so this never injects hallucinated findings;
+    survivors are de-duplicated against existing hypotheses before merging.
+
+    Args:
+        state: The audit state; appends to ``state['hypotheses']`` in place.
+    Returns:
+        None. No-op when the LLM refiner is disabled (deterministic/mock mode).
     """
     if not state.get("use_llm_refiner", False):
         return
@@ -1018,7 +1340,19 @@ def _merge_model_proposed_hypotheses(state: AuditState) -> None:
 
 
 def _select_hypotheses_for_deepening(hypotheses: list[VulnerabilityHypothesis], max_items: int = 10) -> list[VulnerabilityHypothesis]:
-    """Choose a diversified evidence-backed set for expensive RAG/research/validation work."""
+    """Choose a diversified evidence-backed set for expensive RAG/research/validation work.
+
+    Scores hypotheses by confidence + proof status + evidence/graph signals (with
+    a penalty for profile-only leads), then selects strong proofs first, one per
+    vulnerability class for diversity, then the remaining best — capped at
+    ``max_items`` to bound the cost of per-hypothesis subagent work.
+
+    Args:
+        hypotheses: All ranked hypotheses.
+        max_items: Maximum number to deepen (default 10).
+    Returns:
+        The selected, de-duplicated list of hypotheses to deepen.
+    """
     selected: list[VulnerabilityHypothesis] = []
     selected_ids: set[str] = set()
 
@@ -1066,6 +1400,17 @@ def _select_hypotheses_for_deepening(hypotheses: list[VulnerabilityHypothesis], 
 
 @_stage("rag_context_bundled", "research_subgraph")
 def rag_retrieve_context(state: AuditState) -> AuditState:
+    """Stage 10: run the RAG subagent per deepened hypothesis.
+
+    For each selected hypothesis, spawns the isolated RAG subgraph to retrieve and
+    self-RAG-grade historical findings, attaching only the safe matches.
+
+    Args:
+        state: The audit state (reads hypotheses, targeted_rag).
+    Returns:
+        The same ``state`` with ``rag_context_bundles`` populated and each
+        hypothesis's ``historical_matches`` set; marks ``rag_context_bundled``.
+    """
     hypotheses = state.get("hypotheses", [])
     if not hypotheses:
         return state
@@ -1089,6 +1434,19 @@ def rag_retrieve_context(state: AuditState) -> AuditState:
 
 @_stage("research_completed", "summarize_context")
 def research_subgraph(state: AuditState) -> AuditState:
+    """Stage 11: deepen each hypothesis in the isolated research subagent.
+
+    For each selected hypothesis, gathers evidence + cross-contract caller context
+    and runs the research subgraph (analyze → historical context → refine →
+    adversarial review → result), which confirms or rejects with a structured
+    verdict.
+
+    Args:
+        state: The audit state (reads hypotheses, evidence, rag bundles).
+    Returns:
+        The same ``state`` with ``subgraph_results`` appended and per-hypothesis
+        results in ``last_outputs``; marks the ``research_completed`` milestone.
+    """
     hypotheses = state.get("hypotheses", [])
     if not hypotheses:
         state.setdefault("errors", []).append("No hypothesis available for research subgraph.")
@@ -1117,6 +1475,14 @@ def research_subgraph(state: AuditState) -> AuditState:
 
 
 def summarize_context(state: AuditState) -> AuditState:
+    """Compress the run into a short context summary before finishing.
+
+    Args:
+        state: The audit state.
+    Returns:
+        The same ``state`` with ``compressed_context`` set and ``current_focus``
+        pointed at the finish node.
+    """
     summary = (
         f"Repo files: {len(state.get('repo_facts', {}).get('files', []))}. "
         f"Contracts: {len(state.get('repo_facts', {}).get('contracts', []))}. "
@@ -1173,6 +1539,19 @@ def _digest_persist_value(value) -> object:
 
 
 def finish(state: AuditState) -> AuditState:
+    """Terminal node: validate, generate findings, and persist all artifacts.
+
+    Runs semantic validation and validation-artifact generation/compilation for
+    deepened hypotheses, writes durable artifacts (proof_packets, protocol_graph,
+    working_memory, candidate_rank_trace), builds the findings + report.json/md,
+    and writes a slimmed state.json.
+
+    Args:
+        state: The audit state at the end of the pipeline.
+    Returns:
+        The same ``state`` with ``findings`` and ``artifacts`` populated and
+        ``current_focus`` set to ``"done"``; all run files written to disk.
+    """
     repo_path = state["repo_path"]
     hypotheses = state.get("hypotheses", [])
     if hypotheses:
@@ -1252,6 +1631,19 @@ def finish(state: AuditState) -> AuditState:
 
 
 def build_parent_graph(use_llm_planner: bool = False):
+    """Assemble and compile the parent LangGraph audit graph.
+
+    Wires the 16 nodes and edges: in real-LLM mode the entry routes through the
+    ``plan_with_llm`` spine (which can drive the whole pipeline via composite
+    tools) with a conditional edge into the first missing stage; the idempotent
+    stage chain then fills any gaps through to ``finish``.
+
+    Args:
+        use_llm_planner: If True, route through the model-driven planner; if
+            False, run the deterministic stage chain directly.
+    Returns:
+        A compiled LangGraph ready to ``.invoke(state)``.
+    """
     graph = StateGraph(AuditState)
     graph.add_node("initialize_run", initialize_run)
     graph.add_node("maybe_sync_solodit_rag", maybe_sync_solodit_rag)
@@ -1308,6 +1700,21 @@ def build_parent_graph(use_llm_planner: bool = False):
 
 
 def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bool = True) -> AuditState:
+    """Top-level entry point: run one full audit over a repository.
+
+    Creates the run state, reconciles tracing (so an unreachable LangSmith
+    endpoint never stalls LLM calls), builds the graph in the requested mode, and
+    invokes it inside a trace span.
+
+    Args:
+        repo: Path to the target Solidity repository.
+        objective: Free-text audit objective shown to the planner.
+        run_id: Optional explicit run id; a timestamped one is generated if omitted.
+        mock_llm: If True (default) run the deterministic graph; if False use the
+            real LLM planner + refiner + proposer + adversarial reviewer.
+    Returns:
+        The final ``AuditState`` (also persisted under ``runs/<run_id>/``).
+    """
     actual_run_id = run_id or make_run_id()
     run_dir = str(Path("runs") / actual_run_id)
     state = initial_audit_state(run_id=actual_run_id, repo=repo, objective=objective, run_dir=run_dir)
