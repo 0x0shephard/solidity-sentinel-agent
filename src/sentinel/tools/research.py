@@ -1243,14 +1243,22 @@ def _build_proposer_prompt(state, objective: str) -> str:
             "attack_path_candidates": attack_paths,
             "historical_checklist": checklist,
             "focus_functions": high_value[:20],
+            "analysis_checklist": [
+                "access/eligibility: is a required role, threshold, score, deadline, or state precondition NOT enforced before a privileged action or state transition? (e.g. a function that promotes/graduates/pays without checking the eligibility threshold)",
+                "upgrade safety: for UUPS/proxy contracts, is _authorizeUpgrade missing an access guard, or does the function authorize an upgrade WITHOUT actually performing it (no upgradeToAndCall/upgradeTo), or omit _disableInitializers / onlyProxy?",
+                "accounting: is state (balances, counters, accrued debt) updated correctly AFTER transfers, and is every amount divided/normalized correctly (per-recipient division, precision, rounding)?",
+                "reentrancy / ordering: are external calls or token transfers made before state is finalized?",
+                "initialization: can initialize be front-run or called twice; are _disableInitializers / initializer guards present?",
+                "loops: does a loop over an unbounded array enable griefing/DoS or skipped iterations?",
+            ],
             "instruction": (
-                "Reason like a protocol auditor over the SOURCE CODE below. The focus_functions move funds, "
-                "perform upgrades, or loop over collections — analyze EACH of them for logic errors: missing "
-                "validation/threshold checks, wrong or missing division, state not updated after payouts, "
-                "broken upgrade sequencing, and unbounded loops. Propose concrete, code-specific hypotheses "
-                "(aim for 4-8, covering the focus_functions). Set affected_file and affected_function to names "
-                "that appear verbatim in the source headers below. Explain the exploit precondition. Do not "
-                "invent files or functions."
+                "Reason like a protocol auditor over the SOURCE CODE below. For EACH focus function, evaluate it "
+                "against EVERY item in analysis_checklist and emit a SEPARATE hypothesis for each distinct issue you "
+                "find — do not stop after one or two angles per function. A single risky function (e.g. one that pays "
+                "out, transfers, AND upgrades) often has multiple independent bugs; report each separately. Be "
+                "thorough: aim for 6-10 hypotheses overall. Set affected_file and affected_function to names that "
+                "appear verbatim in the source headers below. Explain the exploit precondition. Do not invent files "
+                "or functions."
             ),
         },
         indent=2,
