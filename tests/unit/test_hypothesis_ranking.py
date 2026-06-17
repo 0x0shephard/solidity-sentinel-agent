@@ -9,8 +9,8 @@ def test_rank_hypotheses_detects_reentrancy_from_call_before_state_write():
             objective="Find reentrancy bugs",
             static_facts=[
                 {"file_path": "src/ReentrantVault.sol", "function": "withdraw"},
-                {"file_path": "src/ReentrantVault.sol", "line": 14, "text": '(bool ok,) = msg.sender.call{value: amount}("");'},
-                {"file_path": "src/ReentrantVault.sol", "line": 17, "text": "balances[msg.sender] = 0;"},
+                {"file_path": "src/ReentrantVault.sol", "line": 14, "function": "withdraw", "text": '(bool ok,) = msg.sender.call{value: amount}("");'},
+                {"file_path": "src/ReentrantVault.sol", "line": 17, "function": "withdraw", "text": "balances[msg.sender] = 0;"},
             ],
         ),
         {},

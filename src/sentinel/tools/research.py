@@ -607,17 +607,24 @@ def _detect_reentrancy(functions: list[dict], external_calls: list[dict], storag
     for call in low_level_calls:
         call_file = call.get("file_path")
         call_line = int(call.get("line", 0) or 0)
+        call_fn = call.get("function")
+        if not call_fn:
+            continue  # cannot establish same-function (reachable-path) scope
+        # Require the later state write in the SAME function as the external call,
+        # not merely the same file — a call in f() + an unrelated write in g()
+        # is not reentrancy.
         later_storage_write = next(
             (
                 write
                 for write in storage_writes
-                if write.get("file_path") == call_file and int(write.get("line", 0) or 0) > call_line
+                if write.get("file_path") == call_file
+                and write.get("function") == call_fn
+                and int(write.get("line", 0) or 0) > call_line
             ),
             None,
         )
-        function_fact = _sensitive_function_for_file(functions, str(call_file))
-        if later_storage_write and function_fact:
-            function_name = function_fact.get("function", "unknown")
+        if later_storage_write:
+            function_name = str(call_fn)
             evidence = [
                 item
                 for item in [
@@ -670,20 +677,50 @@ def _detect_unchecked_transfer(functions: list[dict], token_transfers: list[dict
     return None
 
 
+_GUARD_MODIFIERS = ("onlyowner", "onlyrole", "onlygovernance", "onlyadmin", "onlykeeper", "onlyguardian", "onlyauthorized", "requiresauth", "authorized", "restricted")
+_GUARD_BODY_TERMS = ("require(msg.sender", "_checkowner", "_checkrole", "hasrole(", "msg.sender == owner", "msg.sender==owner", "onlyowner", "accesscontrol")
+
+
+def _function_is_guarded(function_fact: dict, functions: list[dict], access_facts: list[dict]) -> bool:
+    """Whether THIS function has an authorization guard — evaluated per function.
+
+    A function is guarded if its declaration carries a known access modifier, or
+    a guard expression appears within its own line window (declaration line up to
+    the next function in the same file). This replaces the previous global check
+    where a single guarded function anywhere suppressed every missing-AC finding.
+    """
+    decl = str(function_fact.get("text") or "").lower()
+    if any(modifier in decl for modifier in _GUARD_MODIFIERS):
+        return True
+    file_path = function_fact.get("file_path")
+    start = int(function_fact.get("line", 0) or 0)
+    later_starts = sorted(
+        int(f.get("line", 0) or 0)
+        for f in functions
+        if f.get("file_path") == file_path and int(f.get("line", 0) or 0) > start
+    )
+    end = later_starts[0] if later_starts else 10**9
+    for fact in access_facts:
+        if fact.get("file_path") != file_path:
+            continue
+        line_no = int(fact.get("line", 0) or 0)
+        if start <= line_no < end and any(term in str(fact.get("text") or "").lower() for term in _GUARD_BODY_TERMS):
+            return True
+    return False
+
+
 def _detect_missing_access_control(
     functions: list[dict],
     external_calls: list[dict],
     access_facts: list[dict],
 ) -> VulnerabilityHypothesis | None:
-    if _has_authorization_guard(access_facts):
-        return None
     eth_value_transfers = _facts_containing(external_calls, (".transfer(", ".call(", ".call{", ".send("))
     if not eth_value_transfers:
         return None
     for function_fact in functions:
         function_name = str(function_fact.get("function", ""))
         suspicious_name = any(term in function_name.lower() for term in ["emergency", "sweep", "drain"])
-        if suspicious_name:
+        if suspicious_name and not _function_is_guarded(function_fact, functions, access_facts):
             evidence = [
                 item
                 for item in [

@@ -121,6 +121,31 @@ def _status_with_evidence_gate(status: str, evidence: list[Evidence]) -> tuple[s
     ]
 
 
+def _has_validation_proof(hypothesis, state: AuditState) -> bool:
+    """Whether a finding has proof strong enough to be 'confirmed'.
+
+    Confirmation requires a complete static-dataflow proof (per-hypothesis
+    semantic validation set ``proof_status='static_proof_complete'``) or an
+    executable validation artifact that demonstrated the issue — not LLM or
+    heuristic reasoning alone.
+    """
+    if getattr(hypothesis, "proof_status", "") == "static_proof_complete":
+        return True
+    run_output = (state.get("last_outputs", {}) or {}).get("dynamic.run_validation_artifacts", {}) or {}
+    classification = str((run_output.get("data") or {}).get("classification", ""))
+    return classification == "security_invariant_violation_or_test_needs_review"
+
+
+def _status_with_proof_gate(status: str, hypothesis, state: AuditState) -> tuple[str, list[str]]:
+    if status != "confirmed":
+        return status, []
+    if _has_validation_proof(hypothesis, state):
+        return status, []
+    return "likely", [
+        "Demoted from confirmed: reserved for semantic validation, an executable PoC, or complete static-dataflow proof — model/heuristic reasoning alone does not confirm."
+    ]
+
+
 def _status_with_counterevidence_gate(status: str, hypothesis, research) -> tuple[str, list[str]]:
     if status not in {"confirmed", "likely"}:
         return status, []
@@ -227,12 +252,14 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
         severity = SEVERITY_BY_CLASS.get(hypothesis.vulnerability_class, "info")
         status = research.finding_status if research else hypothesis.status
         gated_status, gating_limitations = _status_with_evidence_gate(status, local_evidence)
+        gated_status, proof_limitations = _status_with_proof_gate(gated_status, hypothesis, state)
         gated_status, counterevidence_limitations = _status_with_counterevidence_gate(gated_status, hypothesis, research)
         limitations = [
             *(research.limitations if research else ["Generated before research subgraph refinement."]),
             *_proof_gate_limitations(hypothesis, research),
             *_rag_quality_limitations(state, hypothesis.id),
             *gating_limitations,
+            *proof_limitations,
             *counterevidence_limitations,
         ]
         findings.append(

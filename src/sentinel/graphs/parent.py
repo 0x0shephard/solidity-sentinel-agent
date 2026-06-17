@@ -23,7 +23,7 @@ from sentinel.observability.progress import console_sink, emit as emit_progress,
 from sentinel.observability.tracing import configure_tracing, trace_span
 from sentinel.rag.sync import sync_solodit
 from sentinel.reporting import build_report_document, create_findings_from_state, render_markdown_report
-from sentinel.schemas.common import ArtifactRef, CompletedStep, PlanStep
+from sentinel.schemas.common import ArtifactRef, CompletedStep, PlanStep, RiskLevel, SideEffect
 from sentinel.schemas.research import VulnerabilityHypothesis
 from sentinel.schemas.static import SourceEvidence
 from sentinel.state import AuditState, initial_audit_state, initial_research_state
@@ -776,6 +776,37 @@ def _persist_long_term_memory(state: AuditState) -> ArtifactRef | None:
     return ArtifactRef(kind="long_term_memory", path=str(path), description="Gitignored advisory benchmark lessons persisted across runs.")
 
 
+# The real-LLM planner may directly select only read/analysis tools. Tools that
+# write, reach the network, install dependencies, or clean/mutate the workspace
+# are blocked unless explicitly approved — the model never autonomously performs
+# a side effect on the target or the host.
+_PLANNER_BLOCKED_SIDE_EFFECTS = {SideEffect.WRITE_FILES, SideEffect.EXTERNAL_NETWORK}
+# Matched against underscore/dot-delimited name segments (not substrings), so
+# read tools like ``find_access_control_terms`` are not caught by "rm" in "terms".
+_PLANNER_BLOCKED_NAME_SEGMENTS = {"install", "clean", "clone", "checkout", "snapshot", "write", "patch", "delete", "remove"}
+
+
+def _planner_tool_allowed(tool) -> tuple[bool, str]:
+    """Decide whether the LLM planner may directly select a tool.
+
+    Args:
+        tool: The ``RegisteredTool`` the planner chose.
+    Returns:
+        ``(allowed, reason)`` — blocks write/network/install/cleanup and HIGH-risk
+        tools unless ``SENTINEL_PLANNER_ALLOW_SIDE_EFFECTS`` is set. Read/analysis
+        tools (incl. composite ``audit.*`` and ``static`` runs) pass.
+    """
+    if get_settings().planner_allow_side_effects:
+        return True, ""
+    if tool.risk_level == RiskLevel.HIGH:
+        return False, "high_risk"
+    if any(effect in _PLANNER_BLOCKED_SIDE_EFFECTS for effect in tool.side_effects):
+        return False, "side_effect"
+    if set(re.split(r"[_.]", tool.name.lower())) & _PLANNER_BLOCKED_NAME_SEGMENTS:
+        return False, "name_denylist"
+    return True, ""
+
+
 def plan_with_llm(state: AuditState) -> AuditState:
     """Model-driven planner spine: let the LLM select and run tools in a loop.
 
@@ -851,6 +882,12 @@ def plan_with_llm(state: AuditState) -> AuditState:
                 skipped.append({"tool_name": decision.tool_name, "reason": "unknown_tool"})
                 continue
             tool = registry.get(decision.tool_name)
+            allowed, block_reason = _planner_tool_allowed(tool)
+            if not allowed:
+                state.setdefault("errors", []).append(f"Planner blocked side-effect tool {decision.tool_name} ({block_reason})")
+                skipped.append({"tool_name": decision.tool_name, "reason": f"blocked_{block_reason}"})
+                round_record["decisions"].append({"tool_name": decision.tool_name, "status": f"blocked_{block_reason}"})
+                continue
             tool_input = _resolve_output_references(state, dict(decision.tool_input), decision.output_references)
             if "repo_path" in tool.input_model.model_fields and "repo_path" not in tool_input:
                 tool_input["repo_path"] = state["repo_path"]

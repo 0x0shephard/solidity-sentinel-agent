@@ -8,8 +8,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from sentinel.reliability.subprocess import CommandResult, run_command
-from sentinel.schemas.common import SideEffect, ToolStatus
+from sentinel.config import get_settings
+from sentinel.reliability.subprocess import CommandResult, run_command, sanitized_env
+from sentinel.schemas.common import RiskLevel, SideEffect, ToolStatus
 from sentinel.tools.base import RegisteredTool, StateEffect
 from sentinel.tools.repo import RepoPathInput
 
@@ -84,7 +85,7 @@ def check_slither_available(inp: RepoPathInput, state) -> CommandToolOutput:
         return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["slither", "--version"], message="slither is not installed")
     artifact_home = Path(state.get("run_dir", "runs/tmp")) / "artifacts" / "slither-home"
     artifact_home.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "HOME": str(artifact_home)}
+    env = sanitized_env(home=artifact_home)
     return _command_output(run_command(["slither", "--version"], cwd=inp.repo_path, timeout=15, env=env), ok_message=f"slither found at {slither}")
 
 
@@ -101,6 +102,11 @@ def foundry_test(inp: RepoPathInput, state) -> CommandToolOutput:
 
 
 def install_dependencies(inp: RepoPathInput, state) -> BuildToolOutput:
+    if not get_settings().allow_installs:
+        return BuildToolOutput(
+            status=ToolStatus.SKIPPED,
+            message="Dependency installs are disabled (they run untrusted network/postinstall code). Set SENTINEL_ALLOW_INSTALLS=true to opt in.",
+        )
     root = Path(inp.repo_path)
     if (root / "package-lock.json").exists() and shutil.which("npm"):
         result = run_command(["npm", "ci"], cwd=inp.repo_path, timeout=300)
@@ -153,7 +159,7 @@ def register(registry) -> None:
     for tool in [
         RegisteredTool(namespace="build", name="detect_framework", description="Detect Solidity project framework.", input_model=RepoPathInput, output_model=DetectFrameworkOutput, fn=detect_framework, side_effects=[SideEffect.READ_FILES], state_effects=[StateEffect(output_path="", state_path="build_facts.framework", merge="set")]),
         RegisteredTool(namespace="build", name="detect_solc", description="Detect Solidity pragma versions.", input_model=RepoPathInput, output_model=BuildToolOutput, fn=detect_solc, side_effects=[SideEffect.READ_FILES]),
-        RegisteredTool(namespace="build", name="install_dependencies", description="Install project dependencies when explicitly enabled.", input_model=RepoPathInput, output_model=BuildToolOutput, fn=install_dependencies, side_effects=[SideEffect.EXECUTE_LOCAL]),
+        RegisteredTool(namespace="build", name="install_dependencies", description="Install project dependencies when explicitly enabled.", input_model=RepoPathInput, output_model=BuildToolOutput, fn=install_dependencies, side_effects=[SideEffect.EXECUTE_LOCAL, SideEffect.EXTERNAL_NETWORK, SideEffect.WRITE_FILES], risk_level=RiskLevel.HIGH),
         RegisteredTool(namespace="build", name="check_foundry_available", description="Check Foundry availability.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=check_foundry_available, side_effects=[SideEffect.EXECUTE_LOCAL]),
         RegisteredTool(namespace="build", name="check_slither_available", description="Check Slither availability.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=check_slither_available, side_effects=[SideEffect.EXECUTE_LOCAL]),
         RegisteredTool(namespace="build", name="foundry_build", description="Run forge build in a Foundry repository.", input_model=RepoPathInput, output_model=CommandToolOutput, fn=foundry_build, side_effects=[SideEffect.EXECUTE_LOCAL]),

@@ -34,6 +34,11 @@ class Settings(BaseModel):
     anthropic_max_tokens: int = Field(default=16000, ge=1)
     max_tool_calls: int = Field(default=200, ge=1)
     planner_max_rounds: int = Field(default=14, ge=1)
+    # Safety: the real-LLM planner may only directly select read/analysis tools;
+    # write/network/install/cleanup tools are blocked unless explicitly approved.
+    planner_allow_side_effects: bool = False
+    # Dependency installs run untrusted postinstall scripts over the network; opt-in only.
+    allow_installs: bool = False
     context_summary_interval: int = Field(default=6, ge=1)
     llm_max_retries: int = Field(default=3, ge=1)
     llm_backoff_base_seconds: float = Field(default=0.5, ge=0.0)
@@ -78,6 +83,8 @@ def get_settings() -> Settings:
         anthropic_max_tokens=int(os.getenv("SENTINEL_ANTHROPIC_MAX_TOKENS", "16000")),
         max_tool_calls=int(os.getenv("SENTINEL_MAX_TOOL_CALLS", "200")),
         planner_max_rounds=int(os.getenv("SENTINEL_PLANNER_MAX_ROUNDS", "14")),
+        planner_allow_side_effects=os.getenv("SENTINEL_PLANNER_ALLOW_SIDE_EFFECTS", "false").lower() in {"1", "true", "yes", "on"},
+        allow_installs=os.getenv("SENTINEL_ALLOW_INSTALLS", "false").lower() in {"1", "true", "yes", "on"},
         context_summary_interval=int(os.getenv("SENTINEL_CONTEXT_SUMMARY_INTERVAL", "6")),
         llm_max_retries=int(os.getenv("SENTINEL_LLM_MAX_RETRIES", "3")),
         llm_backoff_base_seconds=float(os.getenv("SENTINEL_LLM_BACKOFF_BASE_SECONDS", "0.5")),

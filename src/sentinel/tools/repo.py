@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 
@@ -71,8 +72,35 @@ class RepoCheckoutInput(RepoPathInput):
 
 
 def _safe_files(repo_path: str) -> list[Path]:
-    root = Path(repo_path)
-    return [path for path in root.rglob("*") if path.is_file() and ".git" not in path.parts]
+    """Enumerate regular files strictly inside the repo, never escaping via symlinks.
+
+    Walks without following symlinked directories, skips symlinked files, and
+    drops any path whose resolved location leaves the canonical repo root — so a
+    malicious ``ln -s /etc/passwd`` inside the target repo can't be read.
+
+    Args:
+        repo_path: The repository root (relative or absolute).
+    Returns:
+        Regular-file ``Path``s under the original root (safe for ``relative_to``).
+    """
+    base = Path(repo_path)
+    root_resolved = base.resolve()
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        # Don't descend into .git or symlinked directories.
+        dirnames[:] = [d for d in dirnames if d != ".git" and not (Path(dirpath) / d).is_symlink()]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.is_symlink():
+                continue
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved != root_resolved and root_resolved not in resolved.parents:
+                continue
+            out.append(path)
+    return out
 
 
 def _resolve_inside(repo_path: str, file_path: str) -> Path:

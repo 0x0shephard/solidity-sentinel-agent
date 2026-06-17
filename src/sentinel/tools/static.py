@@ -9,7 +9,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from sentinel.evidence import classify_source_path
-from sentinel.reliability.subprocess import run_command
+from sentinel.reliability.subprocess import run_command, sanitized_env
 from sentinel.rag.checklist import checklist_by_id, write_generated_checklists
 from sentinel.schemas.common import SideEffect, ToolStatus
 from sentinel.schemas.research import SlitherFinding
@@ -748,7 +748,7 @@ def run_slither(inp: RepoPathInput, state) -> RunSlitherOutput:
     slither_home.mkdir(parents=True, exist_ok=True)
 
     command = ["slither", inp.repo_path, "--json", str(raw_json_path)]
-    env = {**os.environ, "HOME": str(slither_home)}
+    env = sanitized_env(home=slither_home)
     result = run_command(command, cwd=".", timeout=180, env=env)
 
     if not raw_json_path.exists():
