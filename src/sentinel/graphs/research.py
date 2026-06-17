@@ -5,6 +5,7 @@ import json
 from langgraph.graph import END, START, StateGraph
 
 from sentinel.llm import provider as llm_provider
+from sentinel.observability.progress import emit as emit_progress
 from sentinel.schemas.common import ToolStatus
 from sentinel.schemas.research import AdversarialVerdict, ResearchRefinement, ResearchSubgraphResult, VulnerabilityHypothesis
 from sentinel.state import ResearchState
@@ -201,6 +202,7 @@ def refine_with_llm(state: ResearchState) -> ResearchState:
     if not state.get("use_llm_refiner", False):
         state.setdefault("notes", []).append("LLM research refinement disabled; using deterministic refinement.")
         return state
+    emit_progress("    refining impact & exploit preconditions (LLM)…")
     try:
         refinement = llm_provider.get_research_refiner(mock=False).refine(_refinement_prompt(state))
     except Exception as exc:
@@ -257,6 +259,7 @@ def adversarial_review(state: ResearchState) -> ResearchState:
         state.setdefault("notes", []).append("Adversarial review skipped; no source context available.")
         return state
     prompt = _adversarial_prompt(state, function_bodies, callers)
+    emit_progress(f"    adversarial review ({len(callers)} cross-contract callers)…")
     try:
         verdict = llm_provider.get_adversarial_reviewer(mock=False).review(prompt)
     except Exception as exc:

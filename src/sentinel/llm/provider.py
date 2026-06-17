@@ -33,6 +33,10 @@ def get_planner(settings: Settings | None = None, mock: bool = False) -> BasePla
         if not cfg.hf_token:
             raise ConfigurationError("HF_TOKEN is required when SENTINEL_LLM_PROVIDER=huggingface")
         return HuggingFacePlanner(model=cfg.model, token=cfg.hf_token, base_url=cfg.hf_base_url)
+    if cfg.llm_provider == "anthropic":
+        from sentinel.llm.anthropic_provider import AnthropicPlanner, _anthropic_kwargs
+
+        return AnthropicPlanner(**_anthropic_kwargs(cfg))
     raise ConfigurationError(f"Unsupported LLM provider: {cfg.llm_provider}")
 
 
@@ -46,6 +50,10 @@ def get_research_refiner(settings: Settings | None = None, mock: bool = False) -
         if not cfg.hf_token:
             raise ConfigurationError("HF_TOKEN is required when SENTINEL_LLM_PROVIDER=huggingface")
         return HuggingFaceResearchRefiner(model=cfg.model, token=cfg.hf_token, base_url=cfg.hf_base_url)
+    if cfg.llm_provider == "anthropic":
+        from sentinel.llm.anthropic_provider import AnthropicResearchRefiner, _anthropic_kwargs
+
+        return AnthropicResearchRefiner(**_anthropic_kwargs(cfg))
     raise ConfigurationError(f"Unsupported LLM provider: {cfg.llm_provider}")
 
 
@@ -59,6 +67,10 @@ def get_hypothesis_proposer(settings: Settings | None = None, mock: bool = False
         if not cfg.hf_token:
             raise ConfigurationError("HF_TOKEN is required when SENTINEL_LLM_PROVIDER=huggingface")
         return HuggingFaceHypothesisProposer(model=cfg.model, token=cfg.hf_token, base_url=cfg.hf_base_url)
+    if cfg.llm_provider == "anthropic":
+        from sentinel.llm.anthropic_provider import AnthropicHypothesisProposer, _anthropic_kwargs
+
+        return AnthropicHypothesisProposer(**_anthropic_kwargs(cfg))
     raise ConfigurationError(f"Unsupported LLM provider: {cfg.llm_provider}")
 
 
@@ -77,6 +89,10 @@ def get_adversarial_reviewer(settings: Settings | None = None, mock: bool = Fals
         if not cfg.hf_token:
             raise ConfigurationError("HF_TOKEN is required when SENTINEL_LLM_PROVIDER=huggingface")
         return HuggingFaceAdversarialReviewer(model=cfg.model, token=cfg.hf_token, base_url=cfg.hf_base_url)
+    if cfg.llm_provider == "anthropic":
+        from sentinel.llm.anthropic_provider import AnthropicAdversarialReviewer, _anthropic_kwargs
+
+        return AnthropicAdversarialReviewer(**_anthropic_kwargs(cfg))
     raise ConfigurationError(f"Unsupported LLM provider: {cfg.llm_provider}")
 
 

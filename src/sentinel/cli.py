@@ -28,10 +28,11 @@ def audit(
     repo: str = typer.Option(..., "--repo", help="Local Solidity repository path."),
     objective: str = typer.Option(..., "--objective", help="Audit objective."),
     mock_llm: bool = typer.Option(True, "--mock-llm/--real-llm", help="Phase 5 uses deterministic graph routing."),
+    stream: bool = typer.Option(True, "--stream/--quiet", help="Stream live progress (stages, tools, LLM steps) to stderr."),
 ) -> None:
     """Run the parent LangGraph audit path."""
 
-    state = run_audit(repo=repo, objective=objective, mock_llm=mock_llm)
+    state = run_audit(repo=repo, objective=objective, mock_llm=mock_llm, stream=stream)
     typer.echo(f"Run ID: {state['run_id']}")
     typer.echo("Status: completed")
     typer.echo(f"Tool calls: {state['tool_call_count']}")
@@ -52,6 +53,27 @@ def rag_sync(stale_ok: bool = typer.Option(True, "--stale-ok/--strict", help="Us
         typer.echo(f"Message: {result.message}")
     if result.chroma_path:
         typer.echo(f"Chroma: {result.chroma_path}")
+
+
+@rag_app.command("ingest-auditvault")
+def rag_ingest_auditvault(
+    path: str | None = typer.Option(None, "--path", help="Local AuditVault clone (defaults to SENTINEL_AUDITVAULT_DIR)."),
+    limit: int | None = typer.Option(None, "--limit", help="Cap the number of notes ingested (for a quick run)."),
+) -> None:
+    """Ingest an AuditVault knowledge base into the historical-findings corpus."""
+
+    from sentinel.rag.auditvault import ingest_auditvault
+
+    vault_dir = path or get_settings().auditvault_dir
+    if not vault_dir:
+        typer.echo("Provide --path or set SENTINEL_AUDITVAULT_DIR to a local AuditVault clone.")
+        raise typer.Exit(1)
+    result = ingest_auditvault(vault_dir, limit=limit)
+    typer.echo(f"AuditVault notes parsed: {result['source_files']}")
+    typer.echo(f"Added to corpus: {result['added']} (total findings: {result['total']})")
+    if result.get("chroma"):
+        typer.echo(f"Index: {result['chroma']}")
+    typer.echo("Both surfaces updated: historical-finding retrieval + stage-7 sector checklist.")
 
 
 @rag_app.command("rebuild")
@@ -191,7 +213,7 @@ def benchmark(
             typer.echo("Provide --run-dir or --repo (or repo_path in the ground-truth file).")
             raise typer.Exit(1)
         objective = "Find bugs in this Foundry smart contract repo; produce evidence-grounded findings."
-        state = run_audit(repo=target, objective=objective, mock_llm=not real_llm)
+        state = run_audit(repo=target, objective=objective, mock_llm=not real_llm, stream=real_llm)
         run_dir = state["run_dir"]
     report = score_recall(gt, candidates_from_run(run_dir), contest=contest)
     typer.echo(render_recall_markdown(report))

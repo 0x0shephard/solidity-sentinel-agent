@@ -19,6 +19,7 @@ from sentinel.graphs.research import DEFAULT_RESEARCH_TOOLS, run_research_subgra
 from sentinel.graphs.rag_subgraph import initial_rag_state, run_rag_subgraph
 from sentinel.llm.provider import get_ollama_fallback_planner, get_planner
 from sentinel.observability.logging import log_event
+from sentinel.observability.progress import console_sink, emit as emit_progress, set_progress_sink
 from sentinel.observability.tracing import configure_tracing, trace_span
 from sentinel.rag.sync import sync_solodit
 from sentinel.reporting import build_report_document, create_findings_from_state, render_markdown_report
@@ -597,6 +598,7 @@ def _stage(milestone: str, next_focus: str):
             if milestone in state.get("completed_stages", []):
                 state["current_focus"] = next_focus
                 return state
+            emit_progress(f"▶ {milestone.replace('_', ' ')}")
             result = fn(state)
             result.setdefault("completed_stages", [])
             if milestone not in result["completed_stages"]:
@@ -828,6 +830,7 @@ def plan_with_llm(state: AuditState) -> AuditState:
     executed_signatures: set[tuple[str, str]] = set()
     max_rounds = get_settings().planner_max_rounds
     for round_index in range(1, max_rounds + 1):
+        emit_progress(f"  planner round {round_index} — model selecting tools…")
         remaining_budget = get_settings().max_tool_calls - state.get("tool_call_count", 0)
         if remaining_budget <= 2:
             stop_reason = "budget_low"
@@ -1311,6 +1314,7 @@ def _merge_model_proposed_hypotheses(state: AuditState) -> None:
     """
     if not state.get("use_llm_refiner", False):
         return
+    emit_progress("  proposing novel hypotheses (LLM, code-grounded)…")
     proposed = _run_tool(
         state,
         "research.propose_hypotheses",
@@ -1456,7 +1460,9 @@ def research_subgraph(state: AuditState) -> AuditState:
         state["current_focus"] = "summarize_context"
         return state
 
-    for index, hypothesis in enumerate(_select_hypotheses_for_deepening(hypotheses), start=1):
+    deepened = _select_hypotheses_for_deepening(hypotheses)
+    for index, hypothesis in enumerate(deepened, start=1):
+        emit_progress(f"  researching {hypothesis.id} ({index}/{len(deepened)}): {hypothesis.vulnerability_class}…")
         selected_snippets = _evidence_snippets_for_hypothesis(state, hypothesis) + _caller_context_snippets(state, hypothesis)
         subgraph_state = initial_research_state(
             subgraph_run_id=f"{state['run_id']}-research-{index}",
@@ -1702,12 +1708,14 @@ def build_parent_graph(use_llm_planner: bool = False):
     return graph.compile()
 
 
-def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bool = True) -> AuditState:
+def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bool = True, stream: bool = False) -> AuditState:
     """Top-level entry point: run one full audit over a repository.
 
     Creates the run state, reconciles tracing (so an unreachable LangSmith
     endpoint never stalls LLM calls), builds the graph in the requested mode, and
-    invokes it inside a trace span.
+    invokes it inside a trace span. When ``stream`` is set, live progress lines
+    (stage banners, per-tool, planner rounds, per-hypothesis research) are written
+    to stderr so a multi-minute run is never silent.
 
     Args:
         repo: Path to the target Solidity repository.
@@ -1715,6 +1723,7 @@ def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bo
         run_id: Optional explicit run id; a timestamped one is generated if omitted.
         mock_llm: If True (default) run the deterministic graph; if False use the
             real LLM planner + refiner + proposer + adversarial reviewer.
+        stream: If True, stream live progress to stderr (off for tests/eval).
     Returns:
         The final ``AuditState`` (also persisted under ``runs/<run_id>/``).
     """
@@ -1722,6 +1731,8 @@ def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bo
     run_dir = str(Path("runs") / actual_run_id)
     state = initial_audit_state(run_id=actual_run_id, repo=repo, objective=objective, run_dir=run_dir)
     state["use_llm_refiner"] = not mock_llm
+    if stream:
+        set_progress_sink(console_sink)
     tracing_requested = get_settings().langsmith_tracing
     remote_tracing = configure_tracing()
     if tracing_requested and not remote_tracing:
@@ -1729,6 +1740,10 @@ def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bo
             "LangSmith tracing requested but endpoint is unreachable; disabled remote tracing and using local spans."
         )
     ensure_run_dir(run_dir)
-    with trace_span("audit.run", run_dir, run_id=actual_run_id, repo=repo, mock_llm=mock_llm):
-        result = build_parent_graph(use_llm_planner=not mock_llm).invoke(state)
+    try:
+        with trace_span("audit.run", run_dir, run_id=actual_run_id, repo=repo, mock_llm=mock_llm):
+            result = build_parent_graph(use_llm_planner=not mock_llm).invoke(state)
+    finally:
+        if stream:
+            set_progress_sink(None)
     return result

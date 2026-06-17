@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-LLMProviderName = Literal["mock", "ollama", "huggingface"]
+LLMProviderName = Literal["mock", "ollama", "huggingface", "anthropic"]
 
 
 class Settings(BaseModel):
@@ -25,6 +25,13 @@ class Settings(BaseModel):
     ollama_fallback_model: str = "qwen2.5-coder:7b"
     hf_token: str | None = None
     hf_base_url: str = "https://router.huggingface.co/v1"
+    # Frontier model (Anthropic Claude) — the recommended provider for landing
+    # crit/high findings. Uses adaptive thinking + effort (no temperature).
+    anthropic_api_key: str | None = None
+    anthropic_model: str = "claude-opus-4-8"
+    anthropic_effort: str = "high"
+    anthropic_thinking: bool = True
+    anthropic_max_tokens: int = Field(default=16000, ge=1)
     max_tool_calls: int = Field(default=200, ge=1)
     planner_max_rounds: int = Field(default=14, ge=1)
     context_summary_interval: int = Field(default=6, ge=1)
@@ -36,6 +43,7 @@ class Settings(BaseModel):
     solodit_api_url: str = "https://solodit.cyfrin.io/api/v1/solodit"
     solodit_api_key: str | None = None
     rag_dir: Path = Path("data/rag")
+    auditvault_dir: str | None = None
     rag_embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     rag_stale_after_hours: int = Field(default=24, ge=1)
     rag_default_page_size: int = Field(default=100, ge=1, le=100)
@@ -63,6 +71,11 @@ def get_settings() -> Settings:
         ollama_fallback_model=os.getenv("SENTINEL_OLLAMA_FALLBACK_MODEL", "qwen2.5-coder:7b"),
         hf_token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN"),
         hf_base_url=os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1"),
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or None,
+        anthropic_model=os.getenv("SENTINEL_ANTHROPIC_MODEL", "claude-opus-4-8"),
+        anthropic_effort=os.getenv("SENTINEL_ANTHROPIC_EFFORT", "high"),
+        anthropic_thinking=os.getenv("SENTINEL_ANTHROPIC_THINKING", "true").lower() in {"1", "true", "yes", "on"},
+        anthropic_max_tokens=int(os.getenv("SENTINEL_ANTHROPIC_MAX_TOKENS", "16000")),
         max_tool_calls=int(os.getenv("SENTINEL_MAX_TOOL_CALLS", "200")),
         planner_max_rounds=int(os.getenv("SENTINEL_PLANNER_MAX_ROUNDS", "14")),
         context_summary_interval=int(os.getenv("SENTINEL_CONTEXT_SUMMARY_INTERVAL", "6")),
@@ -74,6 +87,7 @@ def get_settings() -> Settings:
         solodit_api_url=os.getenv("SOLODIT_API_URL", "https://solodit.cyfrin.io/api/v1/solodit"),
         solodit_api_key=os.getenv("SOLODIT_API_KEY") or None,
         rag_dir=Path(os.getenv("SENTINEL_RAG_DIR", "data/rag")),
+        auditvault_dir=os.getenv("SENTINEL_AUDITVAULT_DIR") or None,
         rag_embed_model=os.getenv("SENTINEL_RAG_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
         rag_stale_after_hours=int(os.getenv("SENTINEL_RAG_STALE_AFTER_HOURS", "24")),
         rag_default_page_size=int(os.getenv("SENTINEL_RAG_DEFAULT_PAGE_SIZE", "100")),
