@@ -495,16 +495,23 @@ def _hypotheses_from_invariant_candidates(static_facts: list[dict]) -> list[Vuln
             *candidate.suspicious_terms,
             *candidate.affected_state_variables,
         ]
+        candidate_contract = candidate.affected_contracts[0] if candidate.affected_contracts else evidence[0].contract_name
+        invariant_label = candidate.invariant_type.replace("_", " ")
+        candidate_title = (
+            f"Protocol invariant candidate: {invariant_label} in {candidate_contract}"
+            if candidate_contract
+            else f"Protocol invariant candidate: {invariant_label}"
+        )
         hypotheses.append(
             VulnerabilityHypothesis(
                 id=f"hyp-invariant-{index}",
-                title=f"Protocol invariant candidate: {candidate.invariant_type.replace('_', ' ')}",
+                title=candidate_title,
                 vulnerability_class=vulnerability_class,
                 affected_files=affected_files,
                 affected_functions=affected_functions,
                 evidence_summary=candidate.description,
                 confidence=candidate.confidence,
-                affected_contract=candidate.affected_contracts[0] if candidate.affected_contracts else evidence[0].contract_name,
+                affected_contract=candidate_contract,
                 affected_function=affected_functions[0] if affected_functions else evidence[0].function_name,
                 evidence_lines=evidence,
                 root_cause_terms=list(dict.fromkeys([term for term in roots if term])),

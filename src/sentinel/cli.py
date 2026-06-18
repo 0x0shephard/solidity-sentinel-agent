@@ -34,6 +34,7 @@ def audit(
 
     state = run_audit(repo=repo, objective=objective, mock_llm=mock_llm, stream=stream)
     typer.echo(f"Run ID: {state['run_id']}")
+    typer.echo(f"Mode: {'deterministic graph (mock LLM)' if mock_llm else 'real LLM (model-driven)'}")
     typer.echo("Status: completed")
     typer.echo(f"Tool calls: {state['tool_call_count']}")
     typer.echo(f"Current focus: {state['current_focus']}")

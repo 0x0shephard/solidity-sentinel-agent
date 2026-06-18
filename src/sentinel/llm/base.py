@@ -35,3 +35,15 @@ class BaseHypothesisProposer:
 class BaseAdversarialReviewer:
     def review(self, prompt: str) -> AdversarialVerdict:
         raise NotImplementedError
+
+
+class BasePocRepairer:
+    """Repairs a generated Foundry PoC test that failed to compile.
+
+    Given the failing test source, the real target-contract source, and the
+    compiler stderr, returns corrected Solidity test source (or "" to signal no
+    repair was produced, so the caller stops retrying).
+    """
+
+    def repair(self, prompt: str) -> str:
+        raise NotImplementedError

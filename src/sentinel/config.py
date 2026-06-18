@@ -33,6 +33,12 @@ class Settings(BaseModel):
     anthropic_thinking: bool = True
     anthropic_max_tokens: int = Field(default=16000, ge=1)
     max_tool_calls: int = Field(default=200, ge=1)
+    # Cold `forge build`/`forge test` on a real protocol (full src + test tree) can
+    # take minutes; 120s was timing out and surfacing as a blank build error.
+    forge_command_timeout: int = Field(default=300, ge=1)
+    # When a generated PoC test fails to compile, feed the solc error + real
+    # target source back to the LLM to fix it, up to this many attempts.
+    poc_repair_max_attempts: int = Field(default=2, ge=0)
     planner_max_rounds: int = Field(default=14, ge=1)
     # Safety: the real-LLM planner may only directly select read/analysis tools;
     # write/network/install/cleanup tools are blocked unless explicitly approved.
@@ -55,6 +61,11 @@ class Settings(BaseModel):
     rag_filter_languages: list[str] = Field(default_factory=lambda: ["Solidity"])
     rag_filter_impacts: list[str] = Field(default_factory=lambda: ["HIGH", "MEDIUM"])
     rag_quality_score: int = Field(default=2, ge=0, le=5)
+    # The per-hypothesis self-RAG subgraph is ~7-10 tool calls each; it is pure
+    # historical-context enrichment (research still deepens every hypothesis), so
+    # cap it to the top-ranked hypotheses to avoid spending most of the audit's
+    # calls on retrieval that often does not change findings.
+    rag_max_hypotheses: int = Field(default=6, ge=1)
     rag_auto_rebuild: bool = False
     langsmith_tracing: bool = False
     langsmith_api_key: str | None = None
@@ -82,6 +93,8 @@ def get_settings() -> Settings:
         anthropic_thinking=os.getenv("SENTINEL_ANTHROPIC_THINKING", "true").lower() in {"1", "true", "yes", "on"},
         anthropic_max_tokens=int(os.getenv("SENTINEL_ANTHROPIC_MAX_TOKENS", "16000")),
         max_tool_calls=int(os.getenv("SENTINEL_MAX_TOOL_CALLS", "200")),
+        forge_command_timeout=int(os.getenv("SENTINEL_FORGE_COMMAND_TIMEOUT", "300")),
+        poc_repair_max_attempts=int(os.getenv("SENTINEL_POC_REPAIR_MAX_ATTEMPTS", "2")),
         planner_max_rounds=int(os.getenv("SENTINEL_PLANNER_MAX_ROUNDS", "14")),
         planner_allow_side_effects=os.getenv("SENTINEL_PLANNER_ALLOW_SIDE_EFFECTS", "false").lower() in {"1", "true", "yes", "on"},
         allow_installs=os.getenv("SENTINEL_ALLOW_INSTALLS", "false").lower() in {"1", "true", "yes", "on"},
@@ -101,6 +114,7 @@ def get_settings() -> Settings:
         rag_filter_languages=split_csv("SENTINEL_RAG_FILTER_LANGUAGES", "Solidity"),
         rag_filter_impacts=split_csv("SENTINEL_RAG_FILTER_IMPACTS", "HIGH,MEDIUM"),
         rag_quality_score=int(os.getenv("SENTINEL_RAG_QUALITY_SCORE", "2")),
+        rag_max_hypotheses=int(os.getenv("SENTINEL_RAG_MAX_HYPOTHESES", "6")),
         rag_auto_rebuild=os.getenv("SENTINEL_RAG_AUTO_REBUILD", "false").lower() in {"1", "true", "yes", "on"},
         langsmith_tracing=os.getenv("LANGSMITH_TRACING", "false").lower() in {"1", "true", "yes", "on"},
         langsmith_api_key=os.getenv("LANGSMITH_API_KEY") or None,

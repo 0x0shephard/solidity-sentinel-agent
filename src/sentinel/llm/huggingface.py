@@ -9,17 +9,21 @@ from sentinel.llm.base import (
     BaseAdversarialReviewer,
     BaseHypothesisProposer,
     BasePlanner,
+    BasePocRepairer,
     BaseResearchRefiner,
     ToolPlan,
 )
 from sentinel.llm.ollama import (
+    _POC_REPAIR_SYSTEM,
     _PROPOSER_SYSTEM,
     _REVIEWER_SYSTEM,
     extract_json_object,
+    extract_solidity_code,
     parse_adversarial_verdict,
     parse_proposed_hypotheses,
     parse_research_refinement,
 )
+from sentinel.llm.resilience import invoke_chat
 from sentinel.schemas.research import AdversarialVerdict, ProposedHypothesisBatch, ResearchRefinement
 
 
@@ -127,8 +131,24 @@ class HuggingFaceAdversarialReviewer(BaseAdversarialReviewer):
         self.llm = llm or ChatHuggingFace(llm=endpoint, model_id=model, temperature=0.0)
 
     def review(self, prompt: str) -> AdversarialVerdict:
-        response = invoke_chat(self.llm, 
+        response = invoke_chat(self.llm,
             [SystemMessage(content=_REVIEWER_SYSTEM), HumanMessage(content=prompt)]
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
         return parse_adversarial_verdict(content)
+
+
+class HuggingFacePocRepairer(BasePocRepairer):
+    def __init__(self, model: str, token: str, base_url: str | None = None, llm: ChatHuggingFace | None = None) -> None:
+        endpoint = HuggingFaceEndpoint(
+            **_endpoint_kwargs(model, base_url),
+            huggingfacehub_api_token=token,
+            temperature=0.0,
+            max_new_tokens=2000,
+        )
+        self.llm = llm or ChatHuggingFace(llm=endpoint, model_id=model, temperature=0.0)
+
+    def repair(self, prompt: str) -> str:
+        response = invoke_chat(self.llm, [SystemMessage(content=_POC_REPAIR_SYSTEM), HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        return extract_solidity_code(content)

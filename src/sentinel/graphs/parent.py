@@ -23,7 +23,7 @@ from sentinel.observability.progress import console_sink, emit as emit_progress,
 from sentinel.observability.tracing import configure_tracing, trace_span
 from sentinel.rag.sync import sync_solodit
 from sentinel.reporting import build_report_document, create_findings_from_state, render_markdown_report
-from sentinel.schemas.common import ArtifactRef, CompletedStep, PlanStep, RiskLevel, SideEffect
+from sentinel.schemas.common import ArtifactRef, CompletedStep, PlanStep, RiskLevel, SideEffect, ToolStatus
 from sentinel.schemas.research import VulnerabilityHypothesis
 from sentinel.schemas.static import SourceEvidence
 from sentinel.state import AuditState, initial_audit_state, initial_research_state
@@ -1071,6 +1071,11 @@ def run_static_analysis(state: AuditState) -> AuditState:
     _run_tool(state, "static.extract_token_transfers", {"repo_path": repo_path})
     _run_tool(state, "static.extract_token_types", {"repo_path": repo_path})
     _run_tool(state, "static.extract_storage_writes", {"repo_path": repo_path})
+    # Authoritative static-facts pass: every registered extractor contributes here.
+    _run_tool(state, "static.extract_modifiers", {"repo_path": repo_path})
+    _run_tool(state, "static.extract_inheritance", {"repo_path": repo_path})
+    _run_tool(state, "static.extract_delegatecalls", {"repo_path": repo_path})
+    _run_tool(state, "static.find_oracle_patterns", {"repo_path": repo_path})
     detector_names = [
         "static.detect_tx_origin_auth",
         "static.detect_unguarded_initializer",
@@ -1101,6 +1106,10 @@ def run_static_analysis(state: AuditState) -> AuditState:
         "token_transfers": state["last_outputs"].get("static.extract_token_transfers", {}).get("facts", []),
         "token_types": state["last_outputs"].get("static.extract_token_types", {}).get("facts", []),
         "storage_writes": state["last_outputs"].get("static.extract_storage_writes", {}).get("facts", []),
+        "modifiers": state["last_outputs"].get("static.extract_modifiers", {}).get("facts", []),
+        "inheritance": state["last_outputs"].get("static.extract_inheritance", {}).get("facts", []),
+        "delegatecalls": state["last_outputs"].get("static.extract_delegatecalls", {}).get("facts", []),
+        "oracle_patterns": state["last_outputs"].get("static.find_oracle_patterns", {}).get("facts", []),
         "slither_findings": state["last_outputs"].get("static.parse_slither", {}).get("findings", []),
         "detections": [
             detection
@@ -1459,7 +1468,10 @@ def rag_retrieve_context(state: AuditState) -> AuditState:
     if not hypotheses:
         return state
     state.setdefault("rag_context_bundles", {})
-    for hypothesis in _select_hypotheses_for_deepening(hypotheses):
+    # RAG is enrichment only (research deepens every selected hypothesis); cap the
+    # expensive per-hypothesis self-RAG subgraph to the top-ranked few.
+    rag_cap = get_settings().rag_max_hypotheses
+    for hypothesis in _select_hypotheses_for_deepening(hypotheses)[:rag_cap]:
         bundle = run_rag_subgraph(
             initial_rag_state(
                 subgraph_run_id=f"{state['run_id']}-rag-{hypothesis.id}",
@@ -1619,7 +1631,11 @@ def finish(state: AuditState) -> AuditState:
             )
     else:
         _run_tool(state, "dynamic.generate_validation_artifacts", {"repo_path": repo_path})
-    _run_tool(state, "dynamic.compile_validation_artifacts", {"repo_path": repo_path})
+    compile_output = _run_tool(state, "dynamic.compile_validation_artifacts", {"repo_path": repo_path})
+    # If the generated PoC didn't compile, try to self-repair it (LLM-only) before
+    # running, so a hallucinated signature doesn't waste the whole dynamic tier.
+    if getattr(compile_output, "status", None) == ToolStatus.ERROR and state.get("use_llm_refiner", False):
+        _run_tool(state, "dynamic.repair_validation_artifacts", {"repo_path": repo_path})
     _run_tool(state, "dynamic.run_validation_artifacts", {"repo_path": repo_path})
     run_dir = Path(state["run_dir"])
     if state.get("proof_packets"):
@@ -1765,6 +1781,8 @@ def run_audit(repo: str, objective: str, run_id: str | None = None, mock_llm: bo
         The final ``AuditState`` (also persisted under ``runs/<run_id>/``).
     """
     actual_run_id = run_id or make_run_id()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", actual_run_id):
+        raise ValueError(f"Invalid run_id (must match [A-Za-z0-9_-]{{1,128}}, no path separators): {actual_run_id!r}")
     run_dir = str(Path("runs") / actual_run_id)
     state = initial_audit_state(run_id=actual_run_id, repo=repo, objective=objective, run_dir=run_dir)
     state["use_llm_refiner"] = not mock_llm

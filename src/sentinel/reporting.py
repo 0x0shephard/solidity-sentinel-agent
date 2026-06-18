@@ -136,6 +136,30 @@ def _has_validation_proof(hypothesis, state: AuditState) -> bool:
     return classification == "security_invariant_violation_or_test_needs_review"
 
 
+def _has_executed_validation_proof(hypothesis, state: AuditState) -> bool:
+    """True only when an executable validation run demonstrated the issue.
+
+    Stricter than :func:`_has_validation_proof`: a static-dataflow proof is enough
+    to *confirm* status, but only an executed PoC justifies near-certain
+    confidence on what is otherwise a mined/heuristic candidate.
+    """
+    run_output = (state.get("last_outputs", {}) or {}).get("dynamic.run_validation_artifacts", {}) or {}
+    classification = str((run_output.get("data") or {}).get("classification", ""))
+    return classification == "security_invariant_violation_or_test_needs_review"
+
+
+def _calibrated_confidence(raw: float, hypothesis, state: AuditState) -> float:
+    """Cap reported confidence for findings without an executed validation.
+
+    Mined invariant candidates and static-only proofs were surfacing at ~0.95,
+    which over-states certainty for a finding no PoC has actually executed. Cap
+    such findings at 0.85; an executed validation lifts the cap.
+    """
+    if _has_executed_validation_proof(hypothesis, state):
+        return raw
+    return min(raw, 0.85)
+
+
 def _status_with_proof_gate(status: str, hypothesis, state: AuditState) -> tuple[str, list[str]]:
     if status != "confirmed":
         return status, []
@@ -187,7 +211,6 @@ def build_analysis_completeness(state: AuditState) -> AnalysisCompleteness:
     completeness = AnalysisCompleteness(
         build=_tool_status_from_last_output(build_output),
         slither=_tool_status_from_last_output(last_outputs.get("static.run_slither")),
-        aderyn=_tool_status_from_last_output(last_outputs.get("static.run_aderyn")),
         validation=_tool_status_from_last_output(validation_output),
     )
     limitations: list[str] = []
@@ -195,7 +218,6 @@ def build_analysis_completeness(state: AuditState) -> AnalysisCompleteness:
     for label, tool_status in [
         ("Build", completeness.build),
         ("Slither", completeness.slither),
-        ("Aderyn", completeness.aderyn),
         ("Validation", completeness.validation),
     ]:
         if not tool_status.attempted:
@@ -267,7 +289,7 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
                 id=hypothesis.id.replace("hyp", "finding"),
                 title=research.refined_title if research else hypothesis.title,
                 severity=severity,
-                confidence=research.confidence if research else hypothesis.confidence,
+                confidence=_calibrated_confidence(research.confidence if research else hypothesis.confidence, hypothesis, state),
                 vulnerability_class=hypothesis.vulnerability_class,
                 summary=research.likely_impact if research else hypothesis.evidence_summary,
                 affected_files=hypothesis.affected_files,
@@ -377,7 +399,6 @@ def render_markdown_report(report: ReportDocument) -> str:
         for label, tool_status in [
             ("Build", report.analysis_completeness.build),
             ("Slither", report.analysis_completeness.slither),
-            ("Aderyn", report.analysis_completeness.aderyn),
             ("Validation", report.analysis_completeness.validation),
         ]:
             attempted = "attempted" if tool_status.attempted else "not attempted"

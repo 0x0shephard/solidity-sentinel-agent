@@ -92,6 +92,42 @@ def _constructor_args(repo_path: str, target_file: str, target_contract: str) ->
     return [part.strip() for part in args.split(",") if part.strip()]
 
 
+def _function_signature(repo_path: str, target_file: str, target_contract: str, fn_name: str) -> tuple[str, str] | None:
+    """Return (params, qualifiers) for a function declared in the target file.
+
+    ``params`` is the raw parameter list and ``qualifiers`` is everything between
+    the closing paren and the body/semicolon (visibility, mutability, returns).
+    Returns None when the function is not declared, so callers can decide whether
+    a hardcoded template that depends on that function would even compile.
+    """
+    source_path = Path(repo_path) / target_file
+    if not source_path.exists():
+        return None
+    text = source_path.read_text(encoding="utf-8", errors="replace")
+    contract_match = re.search(rf"\bcontract\s+{re.escape(target_contract)}\b", text)
+    start = contract_match.start() if contract_match else 0
+    match = re.search(rf"\bfunction\s+{re.escape(fn_name)}\s*\(([^)]*)\)([^{{;]*)", text[start:], flags=re.DOTALL)
+    if not match:
+        return None
+    return match.group(1).strip(), match.group(2)
+
+
+def _reentrancy_template_prerequisites_met(repo_path: str, target_file: str, target_contract: str, target_function: str) -> str | None:
+    """Return a reason string if the reentrancy template can't compile, else None.
+
+    The template hardcodes ``target.deposit{value: ...}()`` and a parameterless
+    ``target.<fn>()``; emit a proof plan instead of a broken test when the target
+    contract doesn't actually expose those members.
+    """
+    deposit = _function_signature(repo_path, target_file, target_contract, "deposit")
+    if deposit is None or deposit[0] != "" or "payable" not in deposit[1]:
+        return f"{target_contract} has no payable parameterless deposit(); the reentrancy template would not compile."
+    fn = _function_signature(repo_path, target_file, target_contract, target_function)
+    if fn is None or fn[0] != "":
+        return f"{target_contract}.{target_function} is not a parameterless function the reentrancy template can call."
+    return None
+
+
 def _is_library_or_interface(repo_path: str, target_file: str, target_contract: str) -> bool:
     source_path = Path(repo_path) / target_file
     if not source_path.exists():
@@ -140,6 +176,10 @@ def _can_generate_executable_validation(repo_path: str, hypothesis: Vulnerabilit
         return False, f"Could not inspect constructor setup for {target_contract}; emitting a proof plan instead."
     if arg_count > 0:
         return False, f"{target_contract} constructor requires {arg_count} argument(s); setup inference is incomplete, so executable validation is deferred."
+    if hypothesis.vulnerability_class == "reentrancy":
+        unmet = _reentrancy_template_prerequisites_met(repo_path, target_file, target_contract, _target_function)
+        if unmet:
+            return False, f"{unmet} Emitting a proof plan instead."
     return True, "Target contract has no constructor arguments and a generic executable scaffold is available."
 
 
@@ -523,6 +563,11 @@ def _prepare_validation_worktree(inp: ValidationCompileInput, state) -> tuple[Dy
     return None, worktree, copied_tests
 
 
+# Classifications that mean the validation did NOT actually run to completion —
+# these are tool/runtime failures, not successful (passed/violated) results.
+_VALIDATION_FAILURE_CLASSIFICATIONS = {"validation_timeout", "validation_runtime_error", "validation_execution_failed"}
+
+
 def _classify_validation_run(return_code: int | None, stdout: str, stderr: str, timed_out: bool) -> str:
     combined = f"{stdout}\n{stderr}"
     if timed_out:
@@ -825,7 +870,141 @@ def run_validation_artifacts(inp: ValidationCompileInput, state) -> DynamicGener
             description=f"Result of executing generated validation tests in a temporary worktree: {classification}.",
         )
     )
-    return DynamicGenericOutput(status=ToolStatus.OK, message=f"Validation run classified as {classification}.", data=manifest)
+    # A runtime/compile/timeout failure is a tool error, not a successful run —
+    # report it as ERROR so completeness and eval scoring don't treat a crashed
+    # validation as a clean result.
+    run_status = ToolStatus.ERROR if classification in _VALIDATION_FAILURE_CLASSIFICATIONS else ToolStatus.OK
+    return DynamicGenericOutput(status=run_status, message=f"Validation run classified as {classification}.", data=manifest)
+
+
+def _resolve_imported_sources(repo_path: str, test_source: str, max_chars: int = 12000) -> str:
+    """Read the real target-contract source(s) a generated test imports.
+
+    Resolves ``import {X} from "../<path>";`` (relative to the worktree ``test/``
+    dir, i.e. the repo root) and concatenates the referenced files, capped, so the
+    repairer can ground its fix in the contract's actual API.
+    """
+    chunks: list[str] = []
+    seen: set[str] = set()
+    for raw in re.findall(r'import\s*\{[^}]*\}\s*from\s*"([^"]+)"', test_source):
+        rel = re.sub(r"^(\.\./)+", "", raw)
+        candidate = Path(repo_path) / rel
+        if not candidate.exists() or str(candidate) in seen:
+            continue
+        seen.add(str(candidate))
+        try:
+            chunks.append(f"// file: {rel}\n{candidate.read_text(encoding='utf-8', errors='replace')}")
+        except OSError:
+            continue
+    return "\n\n".join(chunks)[:max_chars]
+
+
+def _build_poc_repair_prompt(test_source: str, target_source: str, compiler_stderr: str) -> str:
+    return "\n".join(
+        [
+            "A generated Foundry test FAILED to compile. Fix it so it compiles against the real contract API.",
+            "",
+            "=== solc error ===",
+            (compiler_stderr or "").strip()[:4000] or "(no stderr captured)",
+            "",
+            "=== failing test ===",
+            test_source.strip(),
+            "",
+            "=== real target contract source (use only signatures that appear here) ===",
+            target_source or "(target source unavailable)",
+            "",
+            "Return ONLY the corrected Solidity test in a single ```solidity block.",
+        ]
+    )
+
+
+def _writeback_repaired_artifact(state, inp: "ValidationCompileInput", filename: str, code: str) -> None:
+    """Mirror a repaired worktree test back to its source artifact so the
+    subsequent run uses the fixed version."""
+    for path in _validation_artifact_paths(inp, state):
+        if path.name == filename:
+            path.write_text(code, encoding="utf-8")
+            return
+
+
+def repair_validation_artifacts(inp: "ValidationCompileInput", state) -> DynamicGenericOutput:
+    """Self-repair loop: when a generated PoC won't compile, feed solc's error and
+    the real target source back to the LLM and retry until it compiles.
+
+    Runs only when the LLM is enabled. Edits the temporary worktree and mirrors any
+    fix back to the source artifact so the validation run uses the repaired test.
+    """
+    if not state.get("use_llm_refiner", False):
+        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="LLM disabled; PoC repair skipped.")
+    from sentinel.config import get_settings
+
+    settings = get_settings()
+    if settings.poc_repair_max_attempts <= 0:
+        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="PoC repair disabled (poc_repair_max_attempts=0).")
+    early_output, worktree, copied_tests = _prepare_validation_worktree(inp, state)
+    if early_output is not None:
+        return early_output
+    assert worktree is not None
+    timeout = settings.forge_command_timeout
+    result = run_command(["forge", "build", "--offline"], cwd=str(worktree), timeout=timeout)
+    if result.return_code == 0:
+        return DynamicGenericOutput(status=ToolStatus.OK, message="Validation artifacts already compile; no repair needed.", data={"return_code": 0, "attempts": 0})
+
+    from sentinel.llm import provider as llm_provider
+
+    try:
+        repairer = llm_provider.get_poc_repairer(mock=False)
+    except Exception as exc:
+        return DynamicGenericOutput(status=ToolStatus.ERROR, message=f"PoC repairer unavailable: {type(exc).__name__}: {exc}")
+
+    history: list[str] = []
+    repaired_files: list[str] = []
+    for attempt in range(1, settings.poc_repair_max_attempts + 1):
+        produced = False
+        for test_str in copied_tests:
+            test_path = Path(test_str)
+            if not test_path.exists():
+                continue
+            src = test_path.read_text(encoding="utf-8", errors="replace")
+            prompt = _build_poc_repair_prompt(src, _resolve_imported_sources(inp.repo_path, src), result.stderr)
+            try:
+                fixed = repairer.repair(prompt)
+            except Exception:
+                try:
+                    fixed = llm_provider.get_ollama_fallback_poc_repairer().repair(prompt)
+                except Exception:
+                    fixed = ""
+            if fixed and fixed.strip() != src.strip():
+                test_path.write_text(fixed, encoding="utf-8")
+                _writeback_repaired_artifact(state, inp, test_path.name, fixed)
+                produced = True
+                if test_path.name not in repaired_files:
+                    repaired_files.append(test_path.name)
+        if not produced:
+            history.append(f"attempt {attempt}: no repair produced; stopping.")
+            break
+        result = run_command(["forge", "build", "--offline"], cwd=str(worktree), timeout=timeout)
+        history.append(f"attempt {attempt}: recompiled return_code={result.return_code}")
+        if result.return_code == 0:
+            break
+
+    run_dir = Path(state.get("run_dir", "runs/tmp"))
+    manifest = {
+        "return_code": result.return_code,
+        "repaired": result.return_code == 0,
+        "attempts": len([entry for entry in history if "recompiled" in entry]),
+        "repaired_files": repaired_files,
+        "history": history,
+        "stderr": _clean_output(result.stderr[-8000:]),
+    }
+    manifest_path = run_dir / "artifacts" / "validation-repair-result.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    state.setdefault("artifacts", []).append(
+        ArtifactRef(kind="validation_repair_result", path=str(manifest_path), description="Result of LLM-driven PoC compile repair.")
+    )
+    if result.return_code == 0:
+        return DynamicGenericOutput(status=ToolStatus.OK, message="PoC repaired and now compiles.", data=manifest)
+    return DynamicGenericOutput(status=ToolStatus.ERROR, message="PoC repair attempted but compile still fails.", data=manifest)
 
 
 def register(registry) -> None:
@@ -841,10 +1020,11 @@ def register(registry) -> None:
         ("run_semantic_validation", "Run deterministic semantic validation for supported invariant classes.", PocInput, run_semantic_validation),
         ("generate_validation_artifacts", "Generate reviewable Foundry validation test artifacts under the run directory.", PocInput, generate_validation_artifacts),
         ("compile_validation_artifacts", "Compile generated validation tests in a non-mutating temporary worktree.", ValidationCompileInput, compile_validation_artifacts),
+        ("repair_validation_artifacts", "Repair a non-compiling generated PoC by feeding the solc error and real target source back to the LLM.", ValidationCompileInput, repair_validation_artifacts),
         ("run_validation_artifacts", "Run generated validation tests in a non-mutating temporary worktree and classify the result.", ValidationCompileInput, run_validation_artifacts),
     ]
     for name, description, input_model, fn in specs:
-        if name in {"compile_validation_artifacts", "run_validation_artifacts"}:
+        if name in {"compile_validation_artifacts", "run_validation_artifacts", "repair_validation_artifacts"}:
             side_effects = [SideEffect.WRITE_FILES, SideEffect.EXECUTE_LOCAL]
         elif name in {"patch_poc_test", "generate_validation_artifacts", "run_semantic_validation"}:
             side_effects = [SideEffect.WRITE_FILES]

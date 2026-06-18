@@ -48,7 +48,9 @@ def test_parent_graph_compiles_and_finishes(tmp_path):
     compile_status = result["last_outputs"]["dynamic.compile_validation_artifacts"]["status"]
     run_status = result["last_outputs"]["dynamic.run_validation_artifacts"]["status"]
     assert compile_status in {"ok", "error", "unavailable"}
-    assert run_status in {"ok", "skipped", "unavailable"}
+    # "error" is a legitimate outcome: a runtime failure now surfaces as a tool
+    # error instead of being masked as a successful validation run (#8).
+    assert run_status in {"ok", "skipped", "unavailable", "error"}
     if compile_status != "unavailable":
         assert (run_dir / "artifacts" / "validation-compile-result.json").exists()
     if run_status not in {"skipped", "unavailable"}:

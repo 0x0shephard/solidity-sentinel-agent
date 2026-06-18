@@ -21,13 +21,16 @@ from sentinel.llm.base import (
     BaseAdversarialReviewer,
     BaseHypothesisProposer,
     BasePlanner,
+    BasePocRepairer,
     BaseResearchRefiner,
     ToolPlan,
 )
 from sentinel.llm.ollama import (
+    _POC_REPAIR_SYSTEM,
     _PROPOSER_SYSTEM,
     _REVIEWER_SYSTEM,
     extract_json_object,
+    extract_solidity_code,
     parse_adversarial_verdict,
     parse_proposed_hypotheses,
     parse_research_refinement,
@@ -137,6 +140,12 @@ class AnthropicAdversarialReviewer(_AnthropicChat, BaseAdversarialReviewer):
     def review(self, prompt: str) -> AdversarialVerdict:
         content = self._chat(_REVIEWER_SYSTEM, prompt)
         return parse_adversarial_verdict(content)
+
+
+class AnthropicPocRepairer(_AnthropicChat, BasePocRepairer):
+    def repair(self, prompt: str) -> str:
+        content = self._chat(_POC_REPAIR_SYSTEM, prompt)
+        return extract_solidity_code(content)
 
 
 def _anthropic_kwargs(settings) -> dict:

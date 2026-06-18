@@ -28,7 +28,10 @@ def test_foundry_build_uses_safe_command(monkeypatch, tmp_path):
     assert output.status == ToolStatus.OK
     assert captured["command"] == ["forge", "build"]
     assert captured["cwd"] == str(tmp_path)
-    assert captured["timeout"] == 120
+    # Cold real-protocol builds need a generous, configurable timeout (was 120s,
+    # which was silently timing out and reporting a blank build error).
+    from sentinel.config import get_settings
+    assert captured["timeout"] == get_settings().forge_command_timeout
 
 
 def test_run_slither_uses_workspace_local_home(monkeypatch, tmp_path):

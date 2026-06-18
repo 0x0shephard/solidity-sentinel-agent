@@ -133,24 +133,83 @@ def build_protocol_ir(repo_path: str, static_facts: dict) -> ProtocolIR:
     return ir
 
 
-def build_protocol_graph(ir: ProtocolIR) -> ProtocolGraph:
+def _bounded_reachable(start: tuple, successors: dict[tuple, set[tuple]], max_depth: int) -> set[tuple]:
+    """Functions reachable from ``start`` within ``max_depth`` call hops (BFS).
+
+    Args:
+        start: The entry ``(contract, function)`` key.
+        successors: Adjacency map of callee keys per caller key.
+        max_depth: Maximum number of call hops to follow (bounds cost and cycles).
+    Returns:
+        The set of reachable ``(contract, function)`` keys, including ``start``.
+    """
+    seen = {start}
+    frontier = [start]
+    for _ in range(max_depth):
+        nxt: list[tuple] = []
+        for node in frontier:
+            for target in successors.get(node, set()):
+                if target not in seen:
+                    seen.add(target)
+                    nxt.append(target)
+        if not nxt:
+            break
+        frontier = nxt
+    return seen
+
+
+def build_protocol_graph(ir: ProtocolIR, max_depth: int = 5) -> ProtocolGraph:
     slices: list[GraphSlice] = []
     function_index = {
         (function.contract_name, function.name): function
         for contract in ir.contracts
         for function in contract.functions
     }
+    # Build the call adjacency: cross-contract/member edges from the IR PLUS
+    # internal same-contract calls (which the member-call regex misses), so
+    # reachability follows internal/transitive paths, not just one direct hop.
+    successors: dict[tuple, set[tuple]] = {}
+    internal_edges: list[CallEdge] = []
+    for edge in ir.call_edges:
+        target_key = (edge.to_contract, edge.to_function)
+        if target_key in function_index:
+            successors.setdefault((edge.from_contract, edge.from_function), set()).add(target_key)
+    for contract in ir.contracts:
+        for function in contract.functions:
+            src_key = (contract.name, function.name)
+            for callee in function.calls:
+                target_key = (contract.name, callee)
+                if target_key == src_key or target_key not in function_index:
+                    continue
+                successors.setdefault(src_key, set()).add(target_key)
+                internal_edges.append(
+                    CallEdge(
+                        from_contract=contract.name,
+                        from_function=function.name,
+                        to_contract=contract.name,
+                        to_function=callee,
+                        receiver_symbol=None,
+                        file_path=function.file_path,
+                        line=function.start_line,
+                        expression=f"{function.name} -> {callee}()",
+                        call_kind="internal",
+                    )
+                )
+    ir.call_edges.extend(internal_edges)
+    edges_by_src: dict[tuple, list[CallEdge]] = {}
+    for edge in ir.call_edges:
+        edges_by_src.setdefault((edge.from_contract, edge.from_function), []).append(edge)
+
     for contract in ir.contracts:
         for function in contract.functions:
             if function.visibility not in {"public", "external"}:
                 continue
             local_key = (contract.name, function.name)
-            local_edges = [edge for edge in ir.call_edges if (edge.from_contract, edge.from_function) == local_key]
-            reachable_keys = {local_key}
-            for edge in local_edges:
-                target_key = (edge.to_contract, edge.to_function)
-                if target_key in function_index:
-                    reachable_keys.add(target_key)
+            # Bounded transitive reachability over internal + member call edges.
+            reachable_keys = _bounded_reachable(local_key, successors, max_depth)
+            # Edges from ANY reachable function (e.g. an external call buried in a
+            # transitively-called internal helper), not just the entry function.
+            local_edges = [edge for key in reachable_keys for edge in edges_by_src.get(key, [])]
             storage = [item for item in ir.storage_accesses if (item.contract_name, item.function_name) in reachable_keys]
             flows = [item for item in ir.asset_flows if (item.contract_name, item.function_name) in reachable_keys]
             auth = [item for item in ir.auth_constraints if (item.contract_name, item.function_name) in reachable_keys]

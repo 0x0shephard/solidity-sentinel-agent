@@ -7,7 +7,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
 from sentinel.errors import NonRetryableExternalError
-from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BasePlanner, BaseResearchRefiner, ToolPlan
+from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BasePlanner, BasePocRepairer, BaseResearchRefiner, ToolPlan
 from sentinel.llm.resilience import invoke_chat
 from sentinel.schemas.research import AdversarialVerdict, ProposedHypothesisBatch, ResearchRefinement
 
@@ -28,6 +28,47 @@ def _ollama_client_kwargs(api_key: str | None) -> dict:
     if not api_key:
         return {}
     return {"headers": {"Authorization": f"Bearer {api_key}"}}
+
+
+def extract_solidity_code(text: str) -> str:
+    """Pull Solidity source from a model response.
+
+    Prefers a fenced ```solidity block; otherwise falls back to the first text
+    that looks like a Solidity file (has a pragma/contract). Returns "" when no
+    plausible source is present so the caller treats it as "no repair".
+    """
+    if not text:
+        return ""
+    fenced = re.search(r"```(?:solidity|sol)?\s*(.*?)```", text, flags=re.DOTALL)
+    candidate = fenced.group(1).strip() if fenced else text.strip()
+    if "pragma solidity" in candidate or re.search(r"\bcontract\s+\w+", candidate):
+        return candidate
+    return ""
+
+
+_POC_REPAIR_SYSTEM = (
+    "You are Solidity Sentinel's PoC repair engine. You are given a Foundry test that FAILED to compile, the "
+    "real source of the target contract(s), and the solc error output. Rewrite the test so it COMPILES against "
+    "the real contract API and still expresses the same security check. Use only members, constructor "
+    "signatures, and function signatures that actually exist in the supplied source — never invent methods. "
+    "Keep the existing import paths and the contract name prefixed with 'Sentinel'. "
+    "Return ONLY the corrected Solidity file inside a single ```solidity code block, with no prose."
+)
+
+
+class OllamaPocRepairer(BasePocRepairer):
+    def __init__(self, model: str, base_url: str, api_key: str | None = None, llm: ChatOllama | None = None) -> None:
+        self.llm = llm or ChatOllama(
+            model=model,
+            base_url=base_url,
+            temperature=0.0,
+            client_kwargs=_ollama_client_kwargs(api_key),
+        )
+
+    def repair(self, prompt: str) -> str:
+        response = invoke_chat(self.llm, [SystemMessage(content=_POC_REPAIR_SYSTEM), HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        return extract_solidity_code(content)
 
 
 def coerce_research_refinement_payload(payload: dict) -> dict:

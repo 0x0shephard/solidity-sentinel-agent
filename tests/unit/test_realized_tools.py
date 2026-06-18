@@ -188,8 +188,67 @@ def test_dynamic_run_validation_artifact_classifies_runtime_error(monkeypatch, t
     executor.execute("dynamic.generate_validation_artifacts", {"repo_path": str(repo)}, state)
     executed = executor.execute("dynamic.run_validation_artifacts", {"repo_path": str(repo)}, state)
 
-    assert executed.status == ToolStatus.OK
+    # A runtime crash is a tool failure, not a successful validation run.
+    assert executed.status == ToolStatus.ERROR
     assert executed.data["classification"] == "validation_runtime_error"
+
+
+def test_dynamic_repair_validation_artifacts_fixes_then_compiles(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "foundry.toml").write_text("[profile.default]\nsrc = 'src'\n", encoding="utf-8")
+    (repo / "src" / "Vault.sol").write_text("pragma solidity ^0.8.20; contract Vault {}\n", encoding="utf-8")
+    state = initial_audit_state("run-1", str(repo), "Find bugs", str(tmp_path / "runs" / "run-1"))
+    state["use_llm_refiner"] = True
+    state["hypotheses"] = [
+        VulnerabilityHypothesis(
+            id="hyp-1",
+            title="Missing access control",
+            vulnerability_class="missing_access_control",
+            affected_files=["src/Vault.sol"],
+            affected_functions=["emergencyWithdraw"],
+            evidence_summary="Sensitive function lacks auth",
+            confidence=0.7,
+        )
+    ]
+
+    monkeypatch.setattr("sentinel.tools.dynamic.shutil.which", lambda name: "/fake/forge")
+
+    # First compile fails (hallucinated member); after a repair is written, it compiles.
+    calls = {"n": 0}
+
+    def fake_run(command, cwd, timeout=60, env=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return CommandResult(command=command, cwd=str(cwd), return_code=1, stdout="", stderr='Error (9582): Member "deposit" not found')
+        return CommandResult(command=command, cwd=str(cwd), return_code=0, stdout="Compiling 1 files", stderr="")
+
+    monkeypatch.setattr("sentinel.tools.dynamic.run_command", fake_run)
+
+    class _StubRepairer:
+        def repair(self, prompt: str) -> str:
+            return "pragma solidity ^0.8.20;\ncontract SentinelFixed { function test_ok() public {} }\n"
+
+    monkeypatch.setattr("sentinel.llm.provider.get_poc_repairer", lambda mock=False: _StubRepairer())
+
+    executor = ToolExecutor(build_default_registry())
+    executor.execute("dynamic.generate_validation_artifacts", {"repo_path": str(repo)}, state)
+    repaired = executor.execute("dynamic.repair_validation_artifacts", {"repo_path": str(repo)}, state)
+
+    assert repaired.status == ToolStatus.OK
+    assert repaired.data["repaired"] is True
+    assert repaired.data["repaired_files"]
+
+
+def test_dynamic_repair_validation_artifacts_skips_without_llm(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "foundry.toml").write_text("[profile.default]\nsrc = 'src'\n", encoding="utf-8")
+    state = initial_audit_state("run-1", str(repo), "Find bugs", str(tmp_path / "runs" / "run-1"))
+    # use_llm_refiner defaults to False -> repair is a no-op skip.
+    executor = ToolExecutor(build_default_registry())
+    out = executor.execute("dynamic.repair_validation_artifacts", {"repo_path": str(repo)}, state)
+    assert out.status == ToolStatus.SKIPPED
 
 
 def test_dynamic_parse_and_classify_test_output():

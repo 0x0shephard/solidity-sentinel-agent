@@ -41,16 +41,36 @@ class FoundryTestMatchInput(RepoPathInput):
     match: str
 
 
+def _failure_message(result: CommandResult) -> str:
+    """Build a concise, operator-visible diagnostic for a failed command.
+
+    The full stdout/stderr live in the artifact, but the ledger/state only keep
+    ``message`` — so on failure we surface the timeout flag and the stderr tail
+    here, otherwise a failed build/slither shows up as a blank error.
+    """
+    if result.timed_out:
+        tail = (result.stderr or result.stdout or "").strip()[-300:]
+        return f"Command timed out (return_code {result.return_code}). {tail}".strip()
+    tail = (result.stderr or result.stdout or "").strip()[-600:]
+    return f"Command failed (return_code {result.return_code}). {tail}".strip() if tail else f"Command failed (return_code {result.return_code})."
+
+
 def _command_output(result: CommandResult, ok_message: str | None = None) -> CommandToolOutput:
+    ok = result.return_code == 0
     return CommandToolOutput(
-        status=ToolStatus.OK if result.return_code == 0 else ToolStatus.ERROR,
+        status=ToolStatus.OK if ok else ToolStatus.ERROR,
         command=result.command,
         return_code=result.return_code,
         stdout=result.stdout[-8000:],
         stderr=result.stderr[-8000:],
         timed_out=result.timed_out,
-        message=ok_message,
+        message=ok_message if ok else _failure_message(result),
     )
+
+
+def _forge_timeout() -> int:
+    """Timeout (seconds) for heavy forge/hardhat commands; cold builds are slow."""
+    return get_settings().forge_command_timeout
 
 
 def detect_framework(inp: RepoPathInput, state) -> DetectFrameworkOutput:
@@ -92,13 +112,13 @@ def check_slither_available(inp: RepoPathInput, state) -> CommandToolOutput:
 def foundry_build(inp: RepoPathInput, state) -> CommandToolOutput:
     if shutil.which("forge") is None:
         return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["forge", "build"], message="forge is not installed")
-    return _command_output(run_command(["forge", "build"], cwd=inp.repo_path, timeout=120))
+    return _command_output(run_command(["forge", "build"], cwd=inp.repo_path, timeout=_forge_timeout()))
 
 
 def foundry_test(inp: RepoPathInput, state) -> CommandToolOutput:
     if shutil.which("forge") is None:
         return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["forge", "test"], message="forge is not installed")
-    return _command_output(run_command(["forge", "test"], cwd=inp.repo_path, timeout=120))
+    return _command_output(run_command(["forge", "test"], cwd=inp.repo_path, timeout=_forge_timeout()))
 
 
 def install_dependencies(inp: RepoPathInput, state) -> BuildToolOutput:
@@ -123,25 +143,25 @@ def install_dependencies(inp: RepoPathInput, state) -> BuildToolOutput:
 def foundry_test_match(inp: FoundryTestMatchInput, state) -> CommandToolOutput:
     if shutil.which("forge") is None:
         return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["forge", "test", "--match-test", inp.match], message="forge is not installed")
-    return _command_output(run_command(["forge", "test", "--match-test", inp.match], cwd=inp.repo_path, timeout=120))
+    return _command_output(run_command(["forge", "test", "--match-test", inp.match], cwd=inp.repo_path, timeout=_forge_timeout()))
 
 
 def foundry_coverage(inp: RepoPathInput, state) -> CommandToolOutput:
     if shutil.which("forge") is None:
         return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["forge", "coverage"], message="forge is not installed")
-    return _command_output(run_command(["forge", "coverage"], cwd=inp.repo_path, timeout=120))
+    return _command_output(run_command(["forge", "coverage"], cwd=inp.repo_path, timeout=_forge_timeout()))
 
 
 def hardhat_compile(inp: RepoPathInput, state) -> CommandToolOutput:
     if shutil.which("npx") is None:
         return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["npx", "hardhat", "compile"], message="npx is not installed")
-    return _command_output(run_command(["npx", "hardhat", "compile"], cwd=inp.repo_path, timeout=120))
+    return _command_output(run_command(["npx", "hardhat", "compile"], cwd=inp.repo_path, timeout=_forge_timeout()))
 
 
 def hardhat_test(inp: RepoPathInput, state) -> CommandToolOutput:
     if shutil.which("npx") is None:
         return CommandToolOutput(status=ToolStatus.UNAVAILABLE, command=["npx", "hardhat", "test"], message="npx is not installed")
-    return _command_output(run_command(["npx", "hardhat", "test"], cwd=inp.repo_path, timeout=120))
+    return _command_output(run_command(["npx", "hardhat", "test"], cwd=inp.repo_path, timeout=_forge_timeout()))
 
 
 def clean(inp: RepoPathInput, state) -> BuildToolOutput:

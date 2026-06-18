@@ -28,7 +28,6 @@ class AnalysisToolStatus(BaseModel):
 class AnalysisCompleteness(BaseModel):
     build: AnalysisToolStatus = Field(default_factory=AnalysisToolStatus)
     slither: AnalysisToolStatus = Field(default_factory=AnalysisToolStatus)
-    aderyn: AnalysisToolStatus = Field(default_factory=AnalysisToolStatus)
     validation: AnalysisToolStatus = Field(default_factory=AnalysisToolStatus)
     confidence_penalty: float = Field(default=0.0, ge=0.0, le=1.0)
     limitations: list[str] = Field(default_factory=list)
