@@ -47,3 +47,14 @@ class BasePocRepairer:
 
     def repair(self, prompt: str) -> str:
         raise NotImplementedError
+
+
+class BasePocAuthor:
+    """Authors an executable Foundry PoC for a hypothesis by inheriting the
+    protocol's own test fixture (so proxies/initializers are set up correctly).
+
+    Returns Solidity test source, or "" when no PoC could be authored.
+    """
+
+    def author(self, prompt: str) -> str:
+        raise NotImplementedError

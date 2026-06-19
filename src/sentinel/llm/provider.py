@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from sentinel.config import Settings, get_settings
 from sentinel.errors import ConfigurationError
-from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BasePlanner, BasePocRepairer, BaseResearchRefiner
+from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BasePlanner, BasePocAuthor, BasePocRepairer, BaseResearchRefiner
 from sentinel.llm.huggingface import (
     HuggingFaceAdversarialReviewer,
     HuggingFaceHypothesisProposer,
     HuggingFacePlanner,
+    HuggingFacePocAuthor,
     HuggingFacePocRepairer,
     HuggingFaceResearchRefiner,
 )
@@ -14,6 +15,7 @@ from sentinel.llm.mock import (
     MockAdversarialReviewer,
     MockHypothesisProposer,
     MockPlanner,
+    MockPocAuthor,
     MockPocRepairer,
     MockResearchRefiner,
 )
@@ -21,6 +23,7 @@ from sentinel.llm.ollama import (
     OllamaAdversarialReviewer,
     OllamaHypothesisProposer,
     OllamaPlanner,
+    OllamaPocAuthor,
     OllamaPocRepairer,
     OllamaResearchRefiner,
 )
@@ -134,3 +137,25 @@ def get_poc_repairer(settings: Settings | None = None, mock: bool = False) -> Ba
 def get_ollama_fallback_poc_repairer(settings: Settings | None = None) -> BasePocRepairer:
     cfg = settings or get_settings()
     return OllamaPocRepairer(model=cfg.ollama_fallback_model, base_url=cfg.ollama_base_url, api_key=cfg.ollama_api_key)
+
+
+def get_poc_author(settings: Settings | None = None, mock: bool = False) -> BasePocAuthor:
+    cfg = settings or get_settings()
+    if mock or cfg.llm_provider == "mock":
+        return MockPocAuthor()
+    if cfg.llm_provider == "ollama":
+        return OllamaPocAuthor(model=cfg.model, base_url=cfg.ollama_base_url, api_key=cfg.ollama_api_key)
+    if cfg.llm_provider == "huggingface":
+        if not cfg.hf_token:
+            raise ConfigurationError("HF_TOKEN is required when SENTINEL_LLM_PROVIDER=huggingface")
+        return HuggingFacePocAuthor(model=cfg.model, token=cfg.hf_token, base_url=cfg.hf_base_url)
+    if cfg.llm_provider == "anthropic":
+        from sentinel.llm.anthropic_provider import AnthropicPocAuthor, _anthropic_kwargs
+
+        return AnthropicPocAuthor(**_anthropic_kwargs(cfg))
+    raise ConfigurationError(f"Unsupported LLM provider: {cfg.llm_provider}")
+
+
+def get_ollama_fallback_poc_author(settings: Settings | None = None) -> BasePocAuthor:
+    cfg = settings or get_settings()
+    return OllamaPocAuthor(model=cfg.ollama_fallback_model, base_url=cfg.ollama_base_url, api_key=cfg.ollama_api_key)

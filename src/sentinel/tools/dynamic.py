@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import json
 import re
 import shutil
@@ -750,6 +751,114 @@ def _semantic_validation_result(hypothesis: VulnerabilityHypothesis, matched_ter
     }
 
 
+def _foundry_test_dir(repo_path: str) -> str:
+    """Resolve the Foundry test directory (from foundry.toml, default 'test')."""
+    toml = Path(repo_path) / "foundry.toml"
+    if toml.exists():
+        match = re.search(r'^\s*test\s*=\s*[\'"]([^\'"]+)[\'"]', toml.read_text(encoding="utf-8", errors="replace"), flags=re.MULTILINE)
+        if match:
+            return match.group(1)
+    return "test"
+
+
+def _detect_test_fixture(repo_path: str, max_source_chars: int = 16000) -> dict | None:
+    """Find the protocol's own base test fixture for PoC inheritance.
+
+    Real protocols deploy via proxies/initializers, so a meaningful PoC must reuse
+    the project's deployment harness. Picks the test contract that is most often
+    inherited (``is <Name>``) and has the richest deploy setup (``new``/
+    ``initialize`` calls). Returns its name, the import path relative to the test
+    dir, and its (capped) source for grounding the author prompt.
+    """
+    test_dir = Path(repo_path) / _foundry_test_dir(repo_path)
+    if not test_dir.exists():
+        return None
+    inherit_counts: collections.Counter = collections.Counter()
+    contract_defs: dict[str, tuple[Path, str]] = {}
+    for path in test_dir.rglob("*.sol"):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in re.finditer(r"\b(?:abstract\s+)?contract\s+(\w+)", text):
+            contract_defs.setdefault(match.group(1), (path, text))
+        for match in re.finditer(r"\bis\s+([A-Za-z0-9_,\s]+?)\s*\{", text):
+            for base in match.group(1).split(","):
+                inherit_counts[base.strip()] += 1
+
+    def deploy_score(text: str) -> int:
+        return len(re.findall(r"\bnew\s+\w+\(", text)) + len(re.findall(r"\.initialize\(", text))
+
+    candidates = [
+        (name, path, text)
+        for name, (path, text) in contract_defs.items()
+        if "function setUp" in text or deploy_score(text) >= 3
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (inherit_counts.get(item[0], 0), deploy_score(item[2])), reverse=True)
+    name, path, text = candidates[0]
+    if deploy_score(text) < 3 and inherit_counts.get(name, 0) == 0:
+        return None
+    rel = path.relative_to(test_dir).as_posix()
+    return {"name": name, "import_path": f"./{rel}", "file": str(path), "source": text[:max_source_chars]}
+
+
+def _build_poc_author_prompt(hypothesis: VulnerabilityHypothesis, target_source: str, fixture: dict) -> str:
+    target_file, target_contract, target_function = _target_details(hypothesis)
+    return "\n".join(
+        [
+            f"Hypothesis: {hypothesis.title}",
+            f"Vulnerability class: {hypothesis.vulnerability_class}",
+            f"Affected: {target_contract}.{target_function} ({target_file})",
+            f"Why it may be exploitable: {hypothesis.evidence_summary}",
+            "",
+            f"Inherit this fixture: contract Sentinel...Test is {fixture['name']}",
+            f'Import it as: import {{{fixture["name"]}}} from "{fixture["import_path"]}";',
+            "",
+            "=== fixture source (reuse its setUp/deploy helpers; do not redeploy from scratch) ===",
+            fixture["source"],
+            "",
+            "=== target contract source (use only real signatures) ===",
+            target_source or "(target source unavailable)",
+            "",
+            "Write a Foundry test that deploys via the fixture, drives the target, and asserts the invariant.",
+            "Return ONLY the Solidity test in a single ```solidity block.",
+        ]
+    )
+
+
+def _author_executable_poc(repo_path: str, hypothesis: VulnerabilityHypothesis, state) -> tuple[str, str] | None:
+    """Author an executable, fixture-inheriting PoC via the LLM.
+
+    Returns (source, note) on success, or None when no fixture is available or no
+    PoC could be authored. Falls back to the Ollama author on provider errors.
+    """
+    fixture = _detect_test_fixture(repo_path)
+    if not fixture:
+        return None
+    target_file, _contract, _fn = _target_details(hypothesis)
+    target_source = ""
+    target_path = Path(repo_path) / target_file
+    if target_path.exists():
+        target_source = target_path.read_text(encoding="utf-8", errors="replace")[:14000]
+    prompt = _build_poc_author_prompt(hypothesis, target_source, fixture)
+
+    from sentinel.llm import provider as llm_provider
+
+    try:
+        author = llm_provider.get_poc_author(mock=False)
+        code = author.author(prompt)
+    except Exception:
+        try:
+            code = llm_provider.get_ollama_fallback_poc_author().author(prompt)
+        except Exception:
+            return None
+    if not code or "pragma solidity" not in code:
+        return None
+    return code, f"LLM-authored executable PoC inheriting fixture {fixture['name']}."
+
+
 def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
     hypothesis = inp.hypothesis or (state.get("hypotheses") or [None])[0]
     if hypothesis is None:
@@ -777,6 +886,7 @@ def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
     can_generate, setup_reason = _can_generate_executable_validation(inp.repo_path, hypothesis)
     content = ""
     generated_test = False
+    authored = False
     if can_generate:
         content = _validation_test_content(hypothesis)
         test_path.write_text(content, encoding="utf-8")
@@ -788,6 +898,21 @@ def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
                 description=f"Generated Foundry validation test for {hypothesis.vulnerability_class}; setup was inferred from local constructor shape.",
             )
         )
+    elif state.get("use_llm_refiner", False):
+        # Templates can't set up this contract (proxy/initializer deployment), so
+        # author an executable PoC that inherits the protocol's own test fixture.
+        # compile_validation_artifacts + the self-repair loop validate/fix it.
+        authored_result = _author_executable_poc(inp.repo_path, hypothesis, state)
+        if authored_result is not None:
+            content, author_note = authored_result
+            test_path.write_text(content, encoding="utf-8")
+            generated_test = True
+            authored = True
+            state.setdefault("artifacts", []).append(
+                ArtifactRef(kind="foundry_validation_test", path=str(test_path), description=author_note)
+            )
+        else:
+            state.setdefault("warnings", []).append(f"Validation artifact for {hypothesis.id} is plan-only: {setup_reason}")
     else:
         state.setdefault("warnings", []).append(f"Validation artifact for {hypothesis.id} is plan-only: {setup_reason}")
     data = {
@@ -797,6 +922,7 @@ def generate_validation_artifacts(inp: PocInput, state) -> DynamicGenericOutput:
         "hypothesis_id": hypothesis.id,
         "vulnerability_class": hypothesis.vulnerability_class,
         "generated_test": generated_test,
+        "authored_by_llm": authored,
         "setup_reason": setup_reason,
         "content": content,
         "plan": plan_content,

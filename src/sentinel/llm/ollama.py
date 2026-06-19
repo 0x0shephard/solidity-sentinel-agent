@@ -7,7 +7,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
 from sentinel.errors import NonRetryableExternalError
-from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BasePlanner, BasePocRepairer, BaseResearchRefiner, ToolPlan
+from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BasePlanner, BasePocAuthor, BasePocRepairer, BaseResearchRefiner, ToolPlan
 from sentinel.llm.resilience import invoke_chat
 from sentinel.schemas.research import AdversarialVerdict, ProposedHypothesisBatch, ResearchRefinement
 
@@ -56,6 +56,18 @@ _POC_REPAIR_SYSTEM = (
 )
 
 
+_POC_AUTHOR_SYSTEM = (
+    "You are Solidity Sentinel's PoC author. Write a Foundry test that proves or refutes ONE vulnerability "
+    "hypothesis. The protocol deploys its contracts through proxies/initializers, so you MUST inherit the "
+    "protocol's existing test fixture (given to you) rather than constructing contracts from scratch: declare "
+    "`contract Sentinel<Name> is <Fixture>` and call the fixture's setUp()/deploy helpers to obtain fully "
+    "initialized instances. Then drive those instances to demonstrate the issue and assert the security "
+    "invariant (use Foundry cheatcodes via the inherited Test/Vm). Use ONLY functions, state variables, and "
+    "signatures that actually appear in the supplied fixture and target source — never invent members. Import "
+    "the fixture from the given import path. Return ONLY the Solidity test in a single ```solidity code block."
+)
+
+
 class OllamaPocRepairer(BasePocRepairer):
     def __init__(self, model: str, base_url: str, api_key: str | None = None, llm: ChatOllama | None = None) -> None:
         self.llm = llm or ChatOllama(
@@ -67,6 +79,21 @@ class OllamaPocRepairer(BasePocRepairer):
 
     def repair(self, prompt: str) -> str:
         response = invoke_chat(self.llm, [SystemMessage(content=_POC_REPAIR_SYSTEM), HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        return extract_solidity_code(content)
+
+
+class OllamaPocAuthor(BasePocAuthor):
+    def __init__(self, model: str, base_url: str, api_key: str | None = None, llm: ChatOllama | None = None) -> None:
+        self.llm = llm or ChatOllama(
+            model=model,
+            base_url=base_url,
+            temperature=0.0,
+            client_kwargs=_ollama_client_kwargs(api_key),
+        )
+
+    def author(self, prompt: str) -> str:
+        response = invoke_chat(self.llm, [SystemMessage(content=_POC_AUTHOR_SYSTEM), HumanMessage(content=prompt)])
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
         return extract_solidity_code(content)
 

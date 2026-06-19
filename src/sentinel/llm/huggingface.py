@@ -9,11 +9,13 @@ from sentinel.llm.base import (
     BaseAdversarialReviewer,
     BaseHypothesisProposer,
     BasePlanner,
+    BasePocAuthor,
     BasePocRepairer,
     BaseResearchRefiner,
     ToolPlan,
 )
 from sentinel.llm.ollama import (
+    _POC_AUTHOR_SYSTEM,
     _POC_REPAIR_SYSTEM,
     _PROPOSER_SYSTEM,
     _REVIEWER_SYSTEM,
@@ -150,5 +152,21 @@ class HuggingFacePocRepairer(BasePocRepairer):
 
     def repair(self, prompt: str) -> str:
         response = invoke_chat(self.llm, [SystemMessage(content=_POC_REPAIR_SYSTEM), HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        return extract_solidity_code(content)
+
+
+class HuggingFacePocAuthor(BasePocAuthor):
+    def __init__(self, model: str, token: str, base_url: str | None = None, llm: ChatHuggingFace | None = None) -> None:
+        endpoint = HuggingFaceEndpoint(
+            **_endpoint_kwargs(model, base_url),
+            huggingfacehub_api_token=token,
+            temperature=0.0,
+            max_new_tokens=2600,
+        )
+        self.llm = llm or ChatHuggingFace(llm=endpoint, model_id=model, temperature=0.0)
+
+    def author(self, prompt: str) -> str:
+        response = invoke_chat(self.llm, [SystemMessage(content=_POC_AUTHOR_SYSTEM), HumanMessage(content=prompt)])
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
         return extract_solidity_code(content)

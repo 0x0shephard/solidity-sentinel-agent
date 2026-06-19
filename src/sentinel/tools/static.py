@@ -754,14 +754,31 @@ def run_slither(inp: RepoPathInput, state) -> RunSlitherOutput:
     if not raw_json_path.exists():
         raw_json_path.write_text(json.dumps({"success": False, "results": {"detectors": []}}), encoding="utf-8")
 
+    # Slither exits non-zero when it *finds* issues, so the exit code alone is not
+    # a failure signal — a successful analysis with detectors returns non-zero.
+    # Trust the JSON 'success' flag; only fall back to the exit code when no
+    # successful JSON was produced. Surface stderr on a real failure (it was
+    # previously reported as a blank error).
+    analysis_succeeded = False
+    try:
+        analysis_succeeded = bool(json.loads(raw_json_path.read_text(encoding="utf-8")).get("success"))
+    except (json.JSONDecodeError, OSError):
+        analysis_succeeded = False
+    ok = analysis_succeeded or result.return_code == 0
+    failure_message = None
+    if not ok:
+        tail = (result.stderr or result.stdout or "").strip()[-600:]
+        failure_message = (f"slither failed (return_code {result.return_code}). {tail}").strip() or None
+
     return RunSlitherOutput(
-        status=ToolStatus.OK if result.return_code == 0 else ToolStatus.ERROR,
+        status=ToolStatus.OK if ok else ToolStatus.ERROR,
         command=result.command,
         raw_json_path=str(raw_json_path),
         return_code=result.return_code,
         stdout=result.stdout[-8000:],
         stderr=result.stderr[-8000:],
         timed_out=result.timed_out,
+        message=failure_message,
     )
 
 

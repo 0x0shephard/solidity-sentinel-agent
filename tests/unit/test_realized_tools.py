@@ -251,6 +251,69 @@ def test_dynamic_repair_validation_artifacts_skips_without_llm(tmp_path):
     assert out.status == ToolStatus.SKIPPED
 
 
+def test_detect_test_fixture_picks_deploy_harness(tmp_path):
+    from sentinel.tools.dynamic import _detect_test_fixture
+
+    repo = tmp_path / "repo"
+    (repo / "test").mkdir(parents=True)
+    (repo / "foundry.toml").write_text("[profile.default]\nsrc = 'src'\n", encoding="utf-8")
+    (repo / "test" / "Fixture.t.sol").write_text(
+        "pragma solidity ^0.8.20;\n"
+        "contract Fixture {\n"
+        "    function setUp() public {}\n"
+        "    function createVault() public { new Vault(1); }\n"
+        "    function deploy() public { thing.initialize(abi.encode(1)); new Consensus(2); new Oracle(3); }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (repo / "test" / "Vault.t.sol").write_text(
+        "pragma solidity ^0.8.20;\ncontract VaultTest is Fixture { function test_x() public {} }\n", encoding="utf-8"
+    )
+    fixture = _detect_test_fixture(str(repo))
+    assert fixture is not None
+    assert fixture["name"] == "Fixture"
+    assert fixture["import_path"] == "./Fixture.t.sol"
+
+
+def test_generate_validation_artifacts_authors_when_plan_only(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "test").mkdir(parents=True)
+    (repo / "foundry.toml").write_text("[profile.default]\nsrc = 'src'\n", encoding="utf-8")
+    # Constructor args -> templates decline -> plan-only path.
+    (repo / "src" / "Vault.sol").write_text(
+        "pragma solidity ^0.8.20; contract Vault { constructor(address a) {} function emergencyWithdraw(address to) external {} }\n",
+        encoding="utf-8",
+    )
+    (repo / "test" / "Fixture.t.sol").write_text(
+        "pragma solidity ^0.8.20;\ncontract Fixture { function setUp() public {} function createVault() public { new Vault(address(1)); thing.initialize(x); new Oracle(); } }\n",
+        encoding="utf-8",
+    )
+    state = initial_audit_state("run-1", str(repo), "Find bugs", str(tmp_path / "runs" / "run-1"))
+    state["use_llm_refiner"] = True
+    hyp = VulnerabilityHypothesis(
+        id="hyp-1",
+        title="Missing access control",
+        vulnerability_class="missing_access_control",
+        affected_files=["src/Vault.sol"],
+        affected_functions=["emergencyWithdraw"],
+        evidence_summary="no auth",
+        confidence=0.7,
+    )
+
+    class _StubAuthor:
+        def author(self, prompt: str) -> str:
+            assert "Fixture" in prompt  # grounded in the detected fixture
+            return "pragma solidity ^0.8.20;\nimport {Fixture} from \"./Fixture.t.sol\";\ncontract SentinelPoC is Fixture { function test_poc() public {} }\n"
+
+    monkeypatch.setattr("sentinel.llm.provider.get_poc_author", lambda mock=False: _StubAuthor())
+
+    executor = ToolExecutor(build_default_registry())
+    out = executor.execute("dynamic.generate_validation_artifacts", {"repo_path": str(repo), "hypothesis": hyp.model_dump(mode="json")}, state)
+    assert out.data["generated_test"] is True
+    assert out.data["authored_by_llm"] is True
+
+
 def test_dynamic_parse_and_classify_test_output():
     state = initial_audit_state("run-1", ".", "Find bugs", "runs/run-1")
     executor = ToolExecutor(build_default_registry())

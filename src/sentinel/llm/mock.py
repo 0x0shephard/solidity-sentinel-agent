@@ -4,6 +4,7 @@ from sentinel.llm.base import (
     BaseAdversarialReviewer,
     BaseHypothesisProposer,
     BasePlanner,
+    BasePocAuthor,
     BasePocRepairer,
     BaseResearchRefiner,
     ToolPlan,
@@ -34,4 +35,10 @@ class MockAdversarialReviewer(BaseAdversarialReviewer):
 class MockPocRepairer(BasePocRepairer):
     def repair(self, prompt: str) -> str:
         # Deterministic: produce no repair so the loop stops without a model.
+        return ""
+
+
+class MockPocAuthor(BasePocAuthor):
+    def author(self, prompt: str) -> str:
+        # Deterministic: author nothing so plan-only behavior is unchanged.
         return ""

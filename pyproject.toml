@@ -41,3 +41,6 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "integration: slower end-to-end tests (full pipeline / eval runners). Skip with -m 'not integration'.",
+]
