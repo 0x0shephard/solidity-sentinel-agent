@@ -327,10 +327,13 @@ def _dedupe_hypotheses(hypotheses: list[VulnerabilityHypothesis]) -> list[Vulner
         function_key = item.affected_functions[0] if item.affected_functions else item.affected_function or ""
         source_key = item.source_detection_ids[0] if item.source_detection_ids else item.proof_packet_id or ""
         invariant_key = source_key.split(":", 1)[-1].split("-", 3)[0] if source_key else item.vulnerability_class
-        key = (item.vulnerability_class, invariant_key, file_key, function_key)
+        title_key = (item.vulnerability_class, " ".join(item.title.lower().split()))
+        # Include the title so two genuinely distinct bugs on the same function
+        # (e.g. an oracle's stale-read vs its constant staleness threshold) are not
+        # collapsed; identical-title duplicates are still merged below.
+        key = (item.vulnerability_class, invariant_key, file_key, function_key, title_key[1])
         if key in seen:
             continue
-        title_key = (item.vulnerability_class, " ".join(item.title.lower().split()))
         kept = by_title.get(title_key)
         if kept is not None:
             for fn in item.affected_functions:
