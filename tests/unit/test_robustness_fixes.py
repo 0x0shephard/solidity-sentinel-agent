@@ -122,3 +122,77 @@ def test_confidence_capped_without_executed_validation():
         }
     }
     assert _calibrated_confidence(0.95, _Hyp(), state) == 0.95
+
+
+# --- adversarial reviewer: guard counterevidence only valid for guard-class bugs ---
+
+def test_guard_counterevidence_only_rejects_guard_classes():
+    from sentinel.graphs.research import _rejection_invalid_for_class
+
+    # Real captured case: a fee-accrual (accounting) hypothesis rejected because
+    # handleReport is "gated by" the oracle / called immediately -> distrust it.
+    assert _rejection_invalid_for_class(
+        "accounting_invariant",
+        ["calculateFee is only reachable via ShareModule.handleReport, which is gated by the oracle check"],
+    ) is True
+    assert _rejection_invalid_for_class(
+        "accounting",
+        ["SignatureDepositQueue.deposit is marked nonReentrant"],
+    ) is True
+
+    # Legitimate rejections that must STILL be honored:
+    # init front-running refuted by atomic deployment (the Factory.initialize case).
+    assert _rejection_invalid_for_class(
+        "initialization",
+        ["Factory.create deploys every instance atomically via new TransparentUpgradeableProxy"],
+    ) is False
+    # reentrancy refuted by nonReentrant is valid counterevidence.
+    assert _rejection_invalid_for_class("reentrancy", ["callHook callers are nonReentrant"]) is False
+    # An accounting rejection with a real math refutation (no guard language) is honored.
+    assert _rejection_invalid_for_class(
+        "accounting",
+        ["the fee is subtracted before minting, so totals reconcile exactly"],
+    ) is False
+
+
+# --- hypothesis targeting: accounting bugs anchor on the entry-point caller ---
+
+def test_entry_point_caller_added_for_accounting_class():
+    from sentinel.graphs.parent import _add_entry_point_functions
+    from sentinel.schemas.research import VulnerabilityHypothesis
+
+    # Leaf math helper (calculateFee) reached by an entry point (handleReport).
+    hyp = VulnerabilityHypothesis(
+        id="h", title="fee", vulnerability_class="accounting_invariant",
+        affected_files=["src/managers/FeeManager.sol"], affected_functions=["calculateFee"],
+        evidence_summary="x", confidence=0.6,
+    )
+    _add_entry_point_functions(hyp, ["handleReport", "submitReports", "extra3"])
+    # entry points are anchored (capped at 2), leaf retained, deduped
+    assert "calculateFee" in hyp.affected_functions
+    assert "handleReport" in hyp.affected_functions
+    assert "submitReports" in hyp.affected_functions
+    assert "extra3" not in hyp.affected_functions  # cap=2
+
+    # No duplication when the caller is already present.
+    hyp2 = VulnerabilityHypothesis(
+        id="h2", title="fee", vulnerability_class="accounting",
+        affected_files=["x.sol"], affected_functions=["handleReport"],
+        evidence_summary="x", confidence=0.6,
+    )
+    _add_entry_point_functions(hyp2, ["handleReport"])
+    assert hyp2.affected_functions == ["handleReport"]
+
+
+def test_entry_point_caller_not_added_for_reentrancy_class():
+    from sentinel.graphs.parent import _add_entry_point_functions
+    from sentinel.schemas.research import VulnerabilityHypothesis
+
+    # Reentrancy/access bugs should name their own vulnerable function, not callers.
+    hyp = VulnerabilityHypothesis(
+        id="h", title="reentrancy", vulnerability_class="reentrancy",
+        affected_files=["src/Vault.sol"], affected_functions=["callHook"],
+        evidence_summary="x", confidence=0.6,
+    )
+    _add_entry_point_functions(hyp, ["deposit", "withdraw"])
+    assert hyp.affected_functions == ["callHook"]

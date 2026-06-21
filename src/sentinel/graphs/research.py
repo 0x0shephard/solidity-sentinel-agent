@@ -284,6 +284,60 @@ _ADVERSARIAL_STATUS = {
     "needs_manual_review": "needs_manual_review",
 }
 
+# Guard/atomicity counterevidence (a nonReentrant modifier, an access guard, an
+# oracle gate, atomic deployment) only refutes hypotheses whose exploit depends on
+# *reaching* or *ordering* a call. For accounting/fee/share-math/rounding bugs the
+# defect is in the arithmetic itself, so such mitigations are NOT counterevidence —
+# rejecting those on guard grounds silently drops real bugs.
+_GUARD_MITIGATION_VALID_CLASSES = {
+    "reentrancy",
+    "access_control",
+    "missing_access_control",
+    "initialization",
+    "front_running",
+    "transaction_ordering",
+}
+
+_GUARD_ONLY_COUNTEREVIDENCE_MARKERS = (
+    "nonreentrant",
+    "non-reentrant",
+    "reentrancyguard",
+    "reentrancy guard",
+    "atomic",
+    "atomically",
+    "same transaction",
+    "same-transaction",
+    "cannot be front-run",
+    "front-run",
+    "front run",
+    "oracle-gated",
+    "oracle gate",
+    "gated by",
+    "only callable",
+    "onlyowner",
+    "access control",
+    "access-control",
+    "guarded",
+    "deploys every instance",
+    "msgsender",
+    "_msgsender",
+)
+
+
+def _rejection_invalid_for_class(vulnerability_class: str, counterevidence: list[str]) -> bool:
+    """Whether a 'rejected' verdict should be distrusted for this hypothesis class.
+
+    Returns True when the class is an accounting/math class (not one whose exploit
+    depends on guards/ordering) and the counterevidence is purely guard/atomicity
+    language — i.e. the reviewer applied reentrancy/access reasoning to a math bug.
+    """
+    if (vulnerability_class or "") in _GUARD_MITIGATION_VALID_CLASSES:
+        return False
+    text = " ".join(counterevidence or []).lower()
+    if not text:
+        return False
+    return any(marker in text for marker in _GUARD_ONLY_COUNTEREVIDENCE_MARKERS)
+
 
 def create_result(state: ResearchState) -> ResearchState:
     hypothesis = state["hypothesis"]
@@ -348,8 +402,21 @@ def create_result(state: ResearchState) -> ResearchState:
             limitations = [*limitations, *(f"Counterevidence: {item}" for item in verdict.counterevidence)]
             hypothesis.counterevidence = [*hypothesis.counterevidence, *verdict.counterevidence]
         if finding_status == "rejected":
-            hypothesis.status = "rejected"
-            hypothesis.proof_status = "rejected_by_counterevidence"
+            if _rejection_invalid_for_class(hypothesis.vulnerability_class, verdict.counterevidence):
+                # Guard/atomicity counterevidence does not refute an accounting/math
+                # bug; keep it for human review instead of dropping it.
+                finding_status = "needs_manual_review"
+                limitations = [
+                    *limitations,
+                    "Rejection overridden: guard/atomicity counterevidence does not refute an "
+                    f"accounting/math hypothesis ({hypothesis.vulnerability_class}); routed to manual review.",
+                ]
+                state.setdefault("notes", []).append(
+                    "Adversarial rejection overridden for accounting/math class (guard-only counterevidence)."
+                )
+            else:
+                hypothesis.status = "rejected"
+                hypothesis.proof_status = "rejected_by_counterevidence"
 
     result = ResearchSubgraphResult(
         status=ToolStatus.OK,

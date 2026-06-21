@@ -52,6 +52,9 @@ _POC_REPAIR_SYSTEM = (
     "the real contract API and still expresses the same security check. Use only members, constructor "
     "signatures, and function signatures that actually exist in the supplied source — never invent methods. "
     "Keep the existing import paths and the contract name prefixed with 'Sentinel'. "
+    "CRITICAL STRUCTURE: declare every contract, interface, and library at FILE SCOPE (top level). NEVER nest a "
+    "contract/interface/library inside another contract or function — that is a syntax error (solc 9182). Put "
+    "mock/helper contracts before or after the test contract, not inside it. "
     "Return ONLY the corrected Solidity file inside a single ```solidity code block, with no prose."
 )
 
@@ -261,7 +264,12 @@ _REVIEWER_SYSTEM = (
     "You are Solidity Sentinel's adversarial reviewer, a senior auditor verifying a single vulnerability "
     "hypothesis. You are given the affected function and its cross-contract CALLERS. Decide whether the "
     "hypothesis is actually exploitable. "
-    "DECISIVE MITIGATION RULE: if ANY supplied caller is a factory/configurator/deployer (e.g. a function "
+    "CLASS-SCOPED MITIGATIONS: a guard, access modifier, nonReentrant, oracle gate, or atomic deployment only "
+    "refutes hypotheses whose exploit depends on REACHING or ORDERING a call (access control, reentrancy, "
+    "initialization/front-running). For accounting, fee, share/asset-math, and rounding hypotheses the defect "
+    "is in the arithmetic itself — a nonReentrant modifier or access guard is NOT counterevidence; judge those "
+    "purely on whether the math/accounting is wrong, and do NOT return 'rejected' citing a guard. "
+    "DECISIVE MITIGATION RULE (access/reentrancy/init only): if ANY supplied caller is a factory/configurator/deployer (e.g. a function "
     "named create/deploy/configure/setup, or one that constructs a proxy via `new ...Proxy(... "
     "abi.encodeCall(IFactoryEntity.initialize, ...))`) and it invokes the affected function in the SAME "
     "transaction as deployment, then the dangerous precondition (e.g. an uninitialized one-time setter or "

@@ -37,8 +37,10 @@ class Settings(BaseModel):
     # take minutes; 120s was timing out and surfacing as a blank build error.
     forge_command_timeout: int = Field(default=300, ge=1)
     # When a generated PoC test fails to compile, feed the solc error + real
-    # target source back to the LLM to fix it, up to this many attempts.
-    poc_repair_max_attempts: int = Field(default=2, ge=0)
+    # target source back to the LLM to fix it, up to this many attempts. Default 1:
+    # in practice the model repeats the same structural error on a 2nd pass, so a
+    # retry mostly burns minutes for no gain (raise it if your model improves).
+    poc_repair_max_attempts: int = Field(default=1, ge=0)
     planner_max_rounds: int = Field(default=14, ge=1)
     # Safety: the real-LLM planner may only directly select read/analysis tools;
     # write/network/install/cleanup tools are blocked unless explicitly approved.
@@ -94,7 +96,7 @@ def get_settings() -> Settings:
         anthropic_max_tokens=int(os.getenv("SENTINEL_ANTHROPIC_MAX_TOKENS", "16000")),
         max_tool_calls=int(os.getenv("SENTINEL_MAX_TOOL_CALLS", "200")),
         forge_command_timeout=int(os.getenv("SENTINEL_FORGE_COMMAND_TIMEOUT", "300")),
-        poc_repair_max_attempts=int(os.getenv("SENTINEL_POC_REPAIR_MAX_ATTEMPTS", "2")),
+        poc_repair_max_attempts=int(os.getenv("SENTINEL_POC_REPAIR_MAX_ATTEMPTS", "1")),
         planner_max_rounds=int(os.getenv("SENTINEL_PLANNER_MAX_ROUNDS", "14")),
         planner_allow_side_effects=os.getenv("SENTINEL_PLANNER_ALLOW_SIDE_EFFECTS", "false").lower() in {"1", "true", "yes", "on"},
         allow_installs=os.getenv("SENTINEL_ALLOW_INSTALLS", "false").lower() in {"1", "true", "yes", "on"},

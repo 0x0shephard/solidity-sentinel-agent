@@ -401,6 +401,38 @@ def _cross_contract_neighbor_evidence(state: AuditState, hypothesis: Vulnerabili
     return None
 
 
+# Math/economic bug classes whose root cause often lives in a leaf helper (e.g.
+# FeeManager.calculateFee) but whose trigger/impact is an entry point that calls it
+# (e.g. ShareModule.handleReport). For these we anchor the hypothesis on the entry
+# point too, so the bug is attributed where it manifests — not just the leaf.
+_ENTRY_POINT_ENRICH_CLASSES = {
+    "accounting",
+    "accounting_invariant",
+    "business_logic",
+    "fee",
+    "share_accounting",
+    "rounding",
+}
+
+
+def _add_entry_point_functions(hypothesis: VulnerabilityHypothesis, caller_functions: list[str], max_added: int = 2) -> None:
+    """Anchor an accounting/economic hypothesis on the entry points that reach its
+    affected function, so it points at where the bug is triggered (and is matched
+    against the contest's entry-point function), not only the leaf math helper.
+    """
+    if (hypothesis.vulnerability_class or "") not in _ENTRY_POINT_ENRICH_CLASSES:
+        return
+    existing = set(hypothesis.affected_functions)
+    added = 0
+    for fn in caller_functions:
+        if added >= max_added:
+            break
+        if fn and fn not in existing:
+            hypothesis.affected_functions.append(fn)
+            existing.add(fn)
+            added += 1
+
+
 def _attach_cross_contract_evidence(state: AuditState) -> None:
     """Phase 2.3: broaden each hypothesis's evidence to span >=2 contracts.
 
@@ -420,8 +452,12 @@ def _attach_cross_contract_evidence(state: AuditState) -> None:
         existing_files = {item.file_path for item in hypothesis.evidence_lines if item.file_path}
         if not existing_files:
             continue
+        snippets = _caller_context_snippets(state, hypothesis)
+        # Promote entry-point callers from evidence-only to affected functions for
+        # math/economic classes (e.g. handleReport reaching calculateFee).
+        _add_entry_point_functions(hypothesis, [s.get("function") for s in snippets if s.get("function")])
         added = False
-        for snippet in _caller_context_snippets(state, hypothesis):
+        for snippet in snippets:
             file_path = snippet.get("file_path")
             if not file_path or file_path in existing_files:
                 continue
