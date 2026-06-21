@@ -181,3 +181,48 @@ def test_propose_hypotheses_skips_when_llm_disabled(tmp_path):
 
     assert out.hypotheses == []
     assert any("disabled" in note.lower() for note in out.notes)
+
+
+def test_proposer_context_covers_every_contract_breadth(tmp_path, monkeypatch):
+    # Three production contracts; ContractA has several priority functions that
+    # would otherwise eat the whole budget and hide B and C.
+    import sentinel.tools.research as research
+    from sentinel.tools.research import _proposer_code_context
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "A.sol").write_text(
+        "pragma solidity ^0.8.20;\ncontract ContractA {\n"
+        "  function a1() external {}\n  function a2() external {}\n  function a3() external {}\n}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "B.sol").write_text(
+        "pragma solidity ^0.8.20;\ncontract ContractB {\n  function b1() external {}\n}\n", encoding="utf-8"
+    )
+    (tmp_path / "src" / "C.sol").write_text(
+        "pragma solidity ^0.8.20;\ncontract ContractC {\n  function c1() external {}\n}\n", encoding="utf-8"
+    )
+
+    def _range(fp, contract, fn, s, e):
+        return {"file_path": fp, "contract_name": contract, "function_name": fn, "start_line": s, "end_line": e}
+
+    state = {
+        "repo_path": str(tmp_path),
+        "static_facts": {
+            "function_ranges": [
+                _range("src/A.sol", "ContractA", "a1", 2, 2),
+                _range("src/A.sol", "ContractA", "a2", 3, 3),
+                _range("src/A.sol", "ContractA", "a3", 4, 4),
+                _range("src/B.sol", "ContractB", "b1", 2, 2),
+                _range("src/C.sol", "ContractC", "c1", 2, 2),
+            ],
+            # Make all of ContractA's functions "priority" so depth-only would hide B/C.
+            "detections": [{"affected_functions": ["a1", "a2", "a3"]}],
+        },
+    }
+
+    # Tight budget: only 3 blocks. Breadth must still surface all 3 contracts.
+    monkeypatch.setattr(research, "_PROPOSER_MAX_BLOCKS", 3)
+    context = _proposer_code_context(state, str(tmp_path))
+    assert "ContractA" in context
+    assert "ContractB" in context  # would be dropped without the breadth pass
+    assert "ContractC" in context

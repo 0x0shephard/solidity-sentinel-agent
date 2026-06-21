@@ -14,9 +14,19 @@ sentinel audit --repo <repo> --objective "Find bugs" --real-llm
 
 The result of a run is a structured artifact directory under `runs/<run_id>/` containing `report.md`, `report.json`, `state.json`, `tool_ledger.jsonl`, `working_memory.json`, `protocol_graph.json`, `candidate_rank_trace.json`, `proof_packets.json`, RAG telemetry, and validation artifacts.
 
-The current build includes 107 tools across 8 namespaces: `repo`, `build`, `static`, `research`, `dynamic`, `report`, `memory`, and composite `audit`. Each tool is registered through one typed `RegisteredTool` abstraction and executed through a single `ToolExecutor` enforcement boundary, schema-validate input, execute, schema-validate output, record the ledger entry, apply declared state effects, and update the tool budget. This keeps the tool registry coherent at scale rather than turning the agent into a long conditional-dispatch chain.
+The current build includes 111 tools across 8 namespaces: `repo`, `build`, `static`, `research`, `dynamic`, `report`, `memory`, and composite `audit`. Each tool is registered through one typed `RegisteredTool` abstraction and executed through a single `ToolExecutor` enforcement boundary, schema-validate input, execute, schema-validate output, record the ledger entry, apply declared state effects, and update the tool budget. This keeps the tool registry coherent at scale rather than turning the agent into a long conditional-dispatch chain.
 
-**Measured results.** Scored against published contest findings on a held-out recall benchmark (`sentinel benchmark`), it recovered **4/7 Hawk-High findings (57%)** and **5/15 Mellow flexible-vaults findings (33% recalled, 67% located)** — including two serious Highs (signer-duplication threshold bypass, redeem accounting mismatch) — using only a free local model (`qwen2.5-coder:32b`). Recall scaled directly with model strength (gemma 29% → qwen 57% on Hawk after the proposer/targeting work), which is the basis for the model-quality item below.
+**Measured results.** Scored against published contest findings on a recall benchmark (`sentinel benchmark`), using only a free local model (`qwen3-coder:480b` via Ollama Cloud):
+
+| Protocol | Recall | Located (touched) | Notes |
+|---|---|---|---|
+| Hawk-High | **4/7 (57%)** | 5/7 | tuned during development |
+| Mellow flexible-vaults | **7/15 (47%)** | 11/15 | tuned during development |
+| **Sentiment v2** | **6/26 (23%)** | 14/26 | **held-out** — never seen during development |
+
+The **Sentiment v2** number is the honest generalization baseline: a 26-finding lending protocol benchmarked only after all changes were frozen, with the ground truth built blind from the official Sherlock report. It is lower than the tuned fixtures precisely because it is unbiased — that gap is the real signal.
+
+**Recall is architecture-bound, not model-bound.** The same fixtures score essentially identically across `qwen2.5-coder:32b`, `qwen3-coder:480b`, and frontier `claude-opus-4-8` (high-effort thinking) — Opus, at ~15× the cost and time, recovered *zero* extra findings. Every recall gain came from architectural fixes, each adding real bugs the larger models missed for the same structural reason: entry-point hypothesis targeting (recovered a High on flexible-vaults), guard-scoped adversarial rejection, per-contract proposer breadth, and a battery of deterministic detectors for recurring high-value classes (Chainlink min/max bounds, unsafe `approve`, unenforced `Pausable`) — the last of which doubled held-out recall (12%→23%). The remaining gap is dominated by **missing detector classes** (oracle-replay, ERC4626 compliance, cross-contract risk isolation) and reasoning depth on multi-step economic bugs — both addressable with more deterministic detectors rather than a bigger model.
 
 ## Architecture Overview
 

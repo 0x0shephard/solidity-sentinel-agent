@@ -196,3 +196,39 @@ def test_entry_point_caller_not_added_for_reentrancy_class():
     )
     _add_entry_point_functions(hyp, ["deposit", "withdraw"])
     assert hyp.affected_functions == ["callHook"]
+
+
+# --- reviewer: rejection needs concrete counterevidence ---
+
+def test_rejection_requires_concrete_counterevidence():
+    from sentinel.graphs.research import _rejection_has_concrete_counterevidence
+
+    # Empty / vague -> not trustworthy to reject.
+    assert _rejection_has_concrete_counterevidence([]) is False
+    assert _rejection_has_concrete_counterevidence(["this is safe"]) is False
+    assert _rejection_has_concrete_counterevidence(["not exploitable"]) is False
+    # Concrete code references -> a real rejection.
+    assert _rejection_has_concrete_counterevidence(["Factory.create deploys via new TransparentUpgradeableProxy"]) is True
+    assert _rejection_has_concrete_counterevidence(["src/Pool.sol::borrow guards this"]) is True
+    assert _rejection_has_concrete_counterevidence(["riskManager.modifyVaultBalance(orderId)"]) is True
+
+
+# --- dedup: identical class+title hypotheses collapse (numerical_gap bug) ---
+
+def test_dedupe_collapses_same_title_merging_functions():
+    from sentinel.schemas.research import VulnerabilityHypothesis
+    from sentinel.tools.research import _dedupe_hypotheses
+
+    def _h(fn, file):
+        return VulnerabilityHypothesis(
+            id="x", title="Integer division can round protocol fees to zero",
+            vulnerability_class="accounting_invariant",
+            affected_files=[file], affected_functions=[fn], affected_function=fn,
+            evidence_summary="x", confidence=0.7,
+        )
+
+    out = _dedupe_hypotheses([_h("borrow", "src/Pool.sol"), _h("repay", "src/Pool.sol"), _h("getValueInEth", "src/oracle/O.sol")])
+    same_title = [h for h in out if "integer division" in h.title.lower()]
+    assert len(same_title) == 1  # collapsed from 3 -> 1
+    # coverage preserved: all three functions merged into the survivor
+    assert set(same_title[0].affected_functions) >= {"borrow", "repay", "getValueInEth"}

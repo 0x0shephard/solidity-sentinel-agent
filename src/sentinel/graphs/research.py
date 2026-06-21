@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from langgraph.graph import END, START, StateGraph
 
@@ -324,6 +325,17 @@ _GUARD_ONLY_COUNTEREVIDENCE_MARKERS = (
 )
 
 
+# A rejection must point at concrete code (a .sol file, a member access like
+# Factory.create, a `new Contract`, or a `func(...)` call). Empty or hand-wavy
+# counterevidence is not enough to drop a real bug to 'rejected'.
+_CONCRETE_COUNTEREVIDENCE = re.compile(r"\.sol\b|[A-Za-z_]\w*\.[A-Za-z_]\w*|\bnew\s+[A-Z]\w*|\b\w+\([^)]*\)")
+
+
+def _rejection_has_concrete_counterevidence(counterevidence: list[str]) -> bool:
+    text = " ".join(item for item in (counterevidence or []) if item)
+    return bool(text.strip()) and bool(_CONCRETE_COUNTEREVIDENCE.search(text))
+
+
 def _rejection_invalid_for_class(vulnerability_class: str, counterevidence: list[str]) -> bool:
     """Whether a 'rejected' verdict should be distrusted for this hypothesis class.
 
@@ -414,6 +426,15 @@ def create_result(state: ResearchState) -> ResearchState:
                 state.setdefault("notes", []).append(
                     "Adversarial rejection overridden for accounting/math class (guard-only counterevidence)."
                 )
+            elif not _rejection_has_concrete_counterevidence(verdict.counterevidence):
+                # A rejection with no concrete code reference is not trustworthy
+                # enough to drop a real bug; surface it for human review instead.
+                finding_status = "needs_manual_review"
+                limitations = [
+                    *limitations,
+                    "Rejection overridden: no concrete counterevidence (named code/mitigation) was cited; routed to manual review.",
+                ]
+                state.setdefault("notes", []).append("Adversarial rejection overridden: counterevidence was empty or non-specific.")
             else:
                 hypothesis.status = "rejected"
                 hypothesis.proof_status = "rejected_by_counterevidence"

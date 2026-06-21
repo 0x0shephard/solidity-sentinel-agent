@@ -1123,6 +1123,11 @@ def run_static_analysis(state: AuditState) -> AuditState:
         "static.detect_external_call_before_accounting",
         "static.detect_strategy_accounting_trust",
         "static.detect_public_vault_accounting_spoof",
+        "static.detect_chainlink_unbounded_price",
+        "static.detect_unsafe_approve",
+        "static.detect_pause_not_enforced",
+        "static.detect_oracle_cached_price_risks",
+        "static.detect_erc4626_convertto_includes_fees",
     ]
     for detector_name in detector_names:
         _run_tool(state, detector_name, {"repo_path": repo_path})

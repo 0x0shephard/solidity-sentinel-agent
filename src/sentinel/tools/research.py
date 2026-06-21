@@ -318,6 +318,10 @@ def _hypothesis_from_detection(index: int, detection: StaticDetection) -> Vulner
 def _dedupe_hypotheses(hypotheses: list[VulnerabilityHypothesis]) -> list[VulnerabilityHypothesis]:
     deduped: list[VulnerabilityHypothesis] = []
     seen: set[tuple[str, str, str, str]] = set()
+    # Agents like numerical_gap emit one candidate per function with an identical
+    # title; collapse same class+title into a single hypothesis (merging the
+    # functions/files so coverage is preserved) to avoid duplicate report noise.
+    by_title: dict[tuple[str, str], VulnerabilityHypothesis] = {}
     for item in sorted(hypotheses, key=_hypothesis_rank_key, reverse=True):
         file_key = item.affected_files[0] if item.affected_files else ""
         function_key = item.affected_functions[0] if item.affected_functions else item.affected_function or ""
@@ -326,9 +330,20 @@ def _dedupe_hypotheses(hypotheses: list[VulnerabilityHypothesis]) -> list[Vulner
         key = (item.vulnerability_class, invariant_key, file_key, function_key)
         if key in seen:
             continue
+        title_key = (item.vulnerability_class, " ".join(item.title.lower().split()))
+        kept = by_title.get(title_key)
+        if kept is not None:
+            for fn in item.affected_functions:
+                if fn not in kept.affected_functions:
+                    kept.affected_functions.append(fn)
+            for fp in item.affected_files:
+                if fp not in kept.affected_files:
+                    kept.affected_files.append(fp)
+            continue
         seen.add(key)
         item.id = f"hyp-{len(deduped) + 1}"
         deduped.append(item)
+        by_title[title_key] = item
     return deduped[:15]
 
 
@@ -1227,29 +1242,59 @@ def _high_value_function_names(state, repo_path: str) -> set[str]:
     return out
 
 
+_PROPOSER_CHAR_BUDGET = 24000
+_PROPOSER_MAX_BLOCKS = 28
+
+
 def _proposer_code_context(state, repo_path: str, boost: set[str] | None = None) -> str:
+    """Source the proposer reasons over, with guaranteed per-contract breadth.
+
+    A priority-only ordering let a few risky files eat the whole budget, leaving
+    entire production contracts invisible to the proposer (the dominant recall
+    gap). We run two passes: a breadth pass that admits the top-ranked function of
+    EVERY production contract first, then a depth pass that spends the remaining
+    budget on the highest-priority (funds/upgrade/loop) functions overall.
+    """
     ranges = _function_range_index(state.get("static_facts", {}))
     priority = _priority_function_names(state) | (boost or set())
     prioritized = sorted(ranges, key=lambda r: (r.get("function_name") not in priority, str(r.get("file_path"))))
+
     blocks: list[str] = []
     used = 0
     seen: set[tuple] = set()
-    for r in prioritized:
+
+    def _try_add(r: dict) -> bool:
+        nonlocal used
         fn, fp = r.get("function_name"), r.get("file_path")
         s, e = r.get("start_line"), r.get("end_line")
         if not isinstance(s, int) or not isinstance(e, int) or (fp, fn) in seen:
-            continue
+            return False
         body = _read_source_block(repo_path, fp, s, e)
         if not body.strip():
-            continue
-        seen.add((fp, fn))
+            return False
         block = f"// file: {fp} | contract: {r.get('contract_name')} | function: {fn} | lines {s}-{e}\n{body}"
-        if used + len(block) > 16000:
-            break
+        if used + len(block) > _PROPOSER_CHAR_BUDGET or len(blocks) >= _PROPOSER_MAX_BLOCKS:
+            return False
+        seen.add((fp, fn))
         used += len(block)
         blocks.append(block)
-        if len(blocks) >= 16:
+        return True
+
+    # Breadth pass: one function from every distinct production contract.
+    covered: set = set()
+    for r in prioritized:
+        key = r.get("contract_name") or r.get("file_path")
+        if key in covered:
+            continue
+        if _try_add(r):
+            covered.add(key)
+
+    # Depth pass: fill the remaining budget with the riskiest functions overall.
+    for r in prioritized:
+        if len(blocks) >= _PROPOSER_MAX_BLOCKS or used >= _PROPOSER_CHAR_BUDGET:
             break
+        _try_add(r)
+
     return "\n\n".join(blocks)
 
 
@@ -1297,10 +1342,13 @@ def _build_proposer_prompt(state, objective: str) -> str:
                 "Reason like a protocol auditor over the SOURCE CODE below. For EACH focus function, evaluate it "
                 "against EVERY item in analysis_checklist and emit a SEPARATE hypothesis for each distinct issue you "
                 "find — do not stop after one or two angles per function. A single risky function (e.g. one that pays "
-                "out, transfers, AND upgrades) often has multiple independent bugs; report each separately. Be "
-                "thorough: aim for 6-10 hypotheses overall. Set affected_file and affected_function to names that "
-                "appear verbatim in the source headers below. Explain the exploit precondition. Do not invent files "
-                "or functions."
+                "out, transfers, AND upgrades) often has multiple independent bugs; report each separately. "
+                "ALSO cover BREADTH: every distinct contract shown in the source below should be scanned — emit at "
+                "least one hypothesis for any contract that has risky logic, not only the focus_functions. Bugs in "
+                "secondary contracts (e.g. an upgraded/level-two contract, a queue, a hook, a subvault) are missed "
+                "most often, so look there explicitly. Be thorough: aim for 8-12 hypotheses spread across multiple "
+                "contracts. Set affected_file and affected_function to names that appear verbatim in the source "
+                "headers below. Explain the exploit precondition. Do not invent files or functions."
             ),
         },
         indent=2,

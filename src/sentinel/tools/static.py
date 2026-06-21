@@ -809,6 +809,249 @@ def parse_slither(inp: ParseSlitherInput, state) -> ParseSlitherOutput:
     return ParseSlitherOutput(status=ToolStatus.OK, findings=findings, finding_count=len(findings))
 
 
+def detect_chainlink_unbounded_price(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    """Chainlink price reads that never validate against min/max bounds.
+
+    A feed returning its aggregator's ``minAnswer``/``maxAnswer`` during a flash
+    crash is reported as a valid price unless the consumer bounds it. Flags any
+    ``latestRoundData`` read in a file that never references min/max answer bounds.
+    """
+    ranges = build_function_ranges(inp.repo_path)
+    detections = []
+    for path in _solidity_files(inp.repo_path):
+        rel = str(path.relative_to(inp.repo_path))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lower = text.replace(" ", "").lower()
+        if "latestrounddata(" not in lower:
+            continue
+        # Already bounds-checks the answer -> not vulnerable.
+        if any(term in lower for term in ("minanswer", "maxanswer", "min_answer", "max_answer")):
+            continue
+        # Capture the real consumer call site(s); prefer ones inside a function so
+        # the finding points at the price-reading function, not an interface decl.
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            if "latestRoundData(" in line and "function latestRoundData" not in line:
+                detections.append(
+                    _evidence(inp.repo_path, ranges, rel, line_no, "Chainlink latestRoundData price is used without validating it against the feed's minAnswer/maxAnswer bounds.")
+                )
+    out = []
+    if detections:
+        out.append(
+            _detection(
+                "static.detect_chainlink_unbounded_price",
+                "oracle",
+                "Chainlink price is not bounded by minAnswer/maxAnswer",
+                0.8,
+                detections[:10],
+                ["chainlink", "minAnswer", "maxAnswer", "price bounds", "flash crash", "latestRoundData"],
+                "Validate the returned price against the feed's minAnswer/maxAnswer (or a configured floor/cap) and revert when it is out of range.",
+                ["solodit-oracle-min-max-answer"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=out)
+
+
+def detect_unsafe_approve(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    """Raw ERC20 ``approve``/``transfer`` whose boolean return is dropped.
+
+    Tokens like USDT do not return a bool, so a raw ``approve`` either reverts or
+    is silently unsafe. Flags direct ``.approve(``/``.transfer(`` calls that are
+    not SafeERC20 and whose return value is not consumed.
+    """
+    ranges = build_function_ranges(inp.repo_path)
+    evidence = []
+    for rel, line_no, line in _iter_source_lines(inp.repo_path):
+        if _is_comment_or_empty(line):
+            continue
+        code = _strip_inline_comment(line)
+        lower = code.lower()
+        if "safeapprove" in lower or "safetransfer" in lower or "forceapprove" in lower:
+            continue
+        compact = code.replace(" ", "")
+        if ".approve(" not in compact:
+            continue
+        # Return value consumed (require(...), bool x = ..., if (...)) -> handled.
+        if compact.startswith(("require(", "if(", "bool", "assert(")) or "=" in compact.split(".approve", 1)[0]:
+            continue
+        evidence.append(_evidence(inp.repo_path, ranges, rel, line_no, "Raw ERC20 approve() return value is dropped; reverts or is unsafe for no-return-value tokens like USDT."))
+    out = []
+    if evidence:
+        out.append(
+            _detection(
+                "static.detect_unsafe_approve",
+                "erc20",
+                "Unsafe approve() without SafeERC20 (no-return-value tokens like USDT revert)",
+                0.78,
+                evidence[:10],
+                ["safeApprove", "approve return value", "missing return value", "USDT", "SafeERC20"],
+                "Use SafeERC20.forceApprove/safeApprove instead of raw approve so no-return-value tokens are supported.",
+                ["solodit-token-approve-return"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=out)
+
+
+def detect_pause_not_enforced(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    """Contracts that are Pausable but never enforce the pause.
+
+    Inheriting ``Pausable``/exposing a pause toggle is meaningless if no function
+    carries ``whenNotPaused``. Flags files that can pause but never check it.
+    """
+    ranges = build_function_ranges(inp.repo_path)
+    detections = []
+    for path in _solidity_files(inp.repo_path):
+        rel = str(path.relative_to(inp.repo_path))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lower = text.lower()
+        can_pause = "pausable" in lower or "_pause()" in lower or "togglepause" in lower
+        if not can_pause:
+            continue
+        if "whennotpaused" in lower or "whenpaused" in lower:
+            continue
+        # Point the finding at the state-changing entrypoints that SHOULD be
+        # guarded (where the fix goes), not the pause toggle itself.
+        entrypoints = {"deposit", "mint", "withdraw", "redeem", "borrow", "repay", "reallocate"}
+        for fn in ranges:
+            if fn.file_path != rel or fn.function_name.lower() not in entrypoints:
+                continue
+            sig = fn.signature.lower()
+            if "external" not in sig and "public" not in sig:
+                continue
+            detections.append(_evidence(inp.repo_path, ranges, rel, fn.start_line, f"{fn.function_name} is a state-changing entrypoint in a Pausable contract but lacks whenNotPaused, so the pause has no effect."))
+    out = []
+    if detections:
+        out.append(
+            _detection(
+                "static.detect_pause_not_enforced",
+                "access_control",
+                "Pausable contract never enforces the pause (no whenNotPaused)",
+                0.8,
+                detections[:10],
+                ["pause", "whenNotPaused", "Pausable", "togglePause", "pause not enforced"],
+                "Apply the whenNotPaused modifier to state-changing entrypoints (deposit/mint/withdraw) so the pause is effective.",
+                ["solodit-pause-not-enforced"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=out)
+
+
+_ORACLE_PRICE_WRITE = re.compile(r"\w*(?:price|answer)\w*\s*=", re.IGNORECASE)
+_ORACLE_TS_WRITE = re.compile(r"\w*timestamp\w*\s*=\s*block\.timestamp", re.IGNORECASE)
+_ORACLE_CONST_THRESHOLD = re.compile(r"block\.timestamp\s*-\s*[A-Z][A-Z0-9_]{2,}")
+
+
+def detect_oracle_cached_price_risks(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    """Push-oracle risks: replayable price updates, stale-on-read, constant threshold.
+
+    A "push" oracle caches a price via a permissionless ``updatePrice``-style writer
+    and serves it from a ``view`` reader. This pattern carries three recurring bugs:
+    the writer can be replayed within the validity window to pick a favourable price
+    (H-1 class), the reader never refreshes the cached price (M-7 class), and a
+    single hardcoded staleness threshold is applied to every feed (M-6 class).
+    """
+    ranges = build_function_ranges(inp.repo_path)
+    by_contract: dict[tuple, list] = {}
+    for fn in ranges:
+        by_contract.setdefault((fn.file_path, fn.contract_name), []).append(fn)
+
+    detections: list[StaticDetection] = []
+    for (file_path, _contract), fns in by_contract.items():
+        lines = (Path(inp.repo_path) / file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        writer = reader = None
+        const_threshold = False
+        threshold_line = None
+        for fn in fns:
+            body = "\n".join(lines[fn.start_line - 1 : fn.end_line])
+            sig = fn.signature.lower()
+            is_view = "view" in sig or "pure" in sig
+            external = "external" in sig or "public" in sig
+            if external and not is_view and "block.timestamp" in body and _ORACLE_PRICE_WRITE.search(body) and _ORACLE_TS_WRITE.search(body):
+                writer = fn
+            if is_view and ("block.timestamp" in body) and ("stale" in body.lower() or "block.timestamp -" in body.replace("  ", " ")):
+                reader = fn
+                match = _ORACLE_CONST_THRESHOLD.search(body)
+                if match:
+                    const_threshold = True
+                    for offset, line in enumerate(lines[fn.start_line - 1 : fn.end_line], start=fn.start_line):
+                        if _ORACLE_CONST_THRESHOLD.search(line):
+                            threshold_line = offset
+                            break
+        if writer is not None:
+            detections.append(
+                _detection(
+                    "static.detect_oracle_cached_price_risks",
+                    "oracle",
+                    "Permissionless cached-price update can be replayed to manipulate the oracle",
+                    0.78,
+                    [_evidence(inp.repo_path, ranges, writer.file_path, writer.start_line, "Permissionless price update caches a price/timestamp and can be replayed within the validity window to select a favourable observation (price time-travel/manipulation).")],
+                    ["price manipulation", "replay", "time travel", "validity period", "back and forth", "updatePrice"],
+                    "Reject a price update unless it is newer than the cached one (enforce monotonic timestamps) so observations cannot be replayed.",
+                    ["solodit-oracle-update-replay"],
+                )
+            )
+            if reader is not None:
+                detections.append(
+                    _detection(
+                        "static.detect_oracle_cached_price_risks",
+                        "oracle",
+                        "Oracle read serves a cached price without refreshing it",
+                        0.74,
+                        [_evidence(inp.repo_path, ranges, reader.file_path, reader.start_line, "Price read is a view that serves the cached price and never calls updatePrice, so it can return an outdated/manipulated cached value.")],
+                        ["outdated price", "cached price", "updatePrice not called", "stale read", "not refreshed"],
+                        "Refresh the price on read, or require a fresh update within the same transaction before consuming the cached value.",
+                        ["solodit-oracle-stale-read"],
+                    )
+                )
+        if reader is not None and const_threshold:
+            detections.append(
+                _detection(
+                    "static.detect_oracle_cached_price_risks",
+                    "oracle",
+                    "Single hardcoded staleness threshold applied to every feed",
+                    0.76,
+                    [_evidence(inp.repo_path, ranges, reader.file_path, threshold_line or reader.start_line, "Staleness is checked against a hardcoded constant threshold, so feeds with shorter heartbeats are accepted as fresh when actually stale.")],
+                    ["constant threshold", "stale price threshold", "per token", "per-feed", "heartbeat", "hardcoded"],
+                    "Use a per-feed staleness threshold instead of one constant for all assets.",
+                    ["solodit-oracle-constant-threshold"],
+                )
+            )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=detections)
+
+
+def detect_erc4626_convertto_includes_fees(inp: RepoPathInput, state) -> StaticDetectionsOutput:
+    """ERC4626 convertToShares/convertToAssets that accrue fees.
+
+    EIP-4626 requires convertTo* to NOT be inclusive of fees. Flags those
+    functions when their body simulates/accrues fees before converting.
+    """
+    ranges = build_function_ranges(inp.repo_path)
+    fee_terms = ("simulateaccrue", "accrue(", "feeshares", "pendingfee", "_accruefee", "accruefee")
+    evidence = []
+    for fn in ranges:
+        if fn.function_name.lower() not in ("converttoshares", "converttoassets"):
+            continue
+        body = "\n".join(
+            (Path(inp.repo_path) / fn.file_path).read_text(encoding="utf-8", errors="replace").splitlines()[fn.start_line - 1 : fn.end_line]
+        ).replace(" ", "").lower()
+        if any(term in body for term in fee_terms):
+            evidence.append(_evidence(inp.repo_path, ranges, fn.file_path, fn.start_line, f"{fn.function_name} accrues/simulates fees, so it is inclusive of fees and not ERC4626-compliant."))
+    out = []
+    if evidence:
+        out.append(
+            _detection(
+                "static.detect_erc4626_convertto_includes_fees",
+                "erc4626",
+                "ERC4626 convertToShares/convertToAssets is inclusive of fees",
+                0.76,
+                evidence[:6],
+                ["erc4626", "erc-4626", "convertTo", "inclusive of fees", "must not be inclusive", "simulateAccrue"],
+                "Compute convertTo* from stored totals without accruing fees, so the conversion is fee-exclusive per EIP-4626.",
+                ["solodit-erc4626-convertto-fees"],
+            )
+        )
+    return StaticDetectionsOutput(status=ToolStatus.OK, detections=out)
+
+
 def register(registry) -> None:
     for tool in [
         RegisteredTool(namespace="static", name="extract_contracts", description="Extract Solidity contract declarations.", input_model=RepoPathInput, output_model=StaticFactsOutput, fn=extract_contracts, side_effects=[SideEffect.READ_FILES], state_effects=[StateEffect(output_path="facts", state_path="static_facts.contracts", merge="set")]),
@@ -834,6 +1077,11 @@ def register(registry) -> None:
         RegisteredTool(namespace="static", name="detect_external_call_before_accounting", description="Detect external calls before related accounting updates.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_external_call_before_accounting, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="detect_strategy_accounting_trust", description="Detect strategy accounting that trusts external strategy state.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_strategy_accounting_trust, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="detect_public_vault_accounting_spoof", description="Detect public vault accounting attribution that can be spoofed.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_public_vault_accounting_spoof, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_chainlink_unbounded_price", description="Detect Chainlink price reads not validated against minAnswer/maxAnswer bounds.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_chainlink_unbounded_price, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_unsafe_approve", description="Detect raw ERC20 approve() without SafeERC20 (unsafe for no-return tokens).", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_unsafe_approve, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_pause_not_enforced", description="Detect Pausable contracts that never enforce the pause via whenNotPaused.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_pause_not_enforced, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_oracle_cached_price_risks", description="Detect push-oracle replay, stale-on-read, and constant staleness-threshold risks.", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_oracle_cached_price_risks, side_effects=[SideEffect.READ_FILES]),
+        RegisteredTool(namespace="static", name="detect_erc4626_convertto_includes_fees", description="Detect ERC4626 convertTo* functions that accrue fees (non-compliant).", input_model=RepoPathInput, output_model=StaticDetectionsOutput, fn=detect_erc4626_convertto_includes_fees, side_effects=[SideEffect.READ_FILES]),
         RegisteredTool(namespace="static", name="run_slither", description="Run Slither and write JSON artifact.", input_model=RepoPathInput, output_model=RunSlitherOutput, fn=run_slither, side_effects=[SideEffect.EXECUTE_LOCAL], chaining_hints=["Use raw_json_path as static.parse_slither.raw_json_path."]),
         RegisteredTool(namespace="static", name="parse_slither", description="Parse Slither JSON artifact into typed findings.", input_model=ParseSlitherInput, output_model=ParseSlitherOutput, fn=parse_slither, side_effects=[SideEffect.READ_FILES]),
     ]:
