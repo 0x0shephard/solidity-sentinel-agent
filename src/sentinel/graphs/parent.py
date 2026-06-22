@@ -415,6 +415,22 @@ _ENTRY_POINT_ENRICH_CLASSES = {
 }
 
 
+def _count_fallback_usage(state: AuditState) -> int:
+    """Count LLM calls that downgraded to the fallback model (for run integrity).
+
+    Scans accumulated notes across the state and research subgraph results for the
+    "Ollama fallback … applied" markers the provider paths emit on downgrade.
+    """
+    count = 0
+    note_pools: list = list(state.get("notes", []) or [])
+    for result in state.get("subgraph_results", []) or []:
+        note_pools.extend(getattr(result, "notes", None) or [])
+    for note in note_pools:
+        if isinstance(note, str) and "fallback" in note.lower() and "applied" in note.lower():
+            count += 1
+    return count
+
+
 def _add_entry_point_functions(hypothesis: VulnerabilityHypothesis, caller_functions: list[str], max_added: int = 2) -> None:
     """Anchor an accounting/economic hypothesis on the entry points that reach its
     affected function, so it points at where the bug is triggered (and is matched
@@ -1274,6 +1290,16 @@ def mine_invariants(state: AuditState) -> AuditState:
         populated; marks the ``invariants_mined`` milestone.
     """
     candidates = mine_invariant_candidates(state["repo_path"], state.get("static_facts", {}))
+    # Enrich the template-mined families with protocol-specific invariants the LLM
+    # infers from the actual code (real-LLM only) — these anchor the novel-bug
+    # violation reasoner with guarantees no fixed template encodes.
+    if state.get("use_llm_refiner", False):
+        from sentinel.tools.research import infer_protocol_invariants
+
+        inferred = infer_protocol_invariants(state)
+        if inferred:
+            candidates = [*candidates, *inferred]
+            emit_progress(f"  inferred {len(inferred)} protocol-specific invariants (LLM)…")
     proof_packets = build_invariant_proof_packets(candidates, state.get("static_facts", {}))
     state["invariant_candidates"] = candidates
     state["proof_packets"] = proof_packets
@@ -1382,6 +1408,7 @@ def rank_hypotheses(state: AuditState) -> AuditState:
         for hypothesis in state["last_outputs"].get("research.rank_hypotheses", {}).get("hypotheses", [])
     ]
     _merge_model_proposed_hypotheses(state)
+    _merge_invariant_violation_hypotheses(state)
     _attach_cross_contract_evidence(state)
     state["current_focus"] = "research_subgraph"
     return state
@@ -1430,6 +1457,53 @@ def _merge_model_proposed_hypotheses(state: AuditState) -> None:
         state,
         "research.propose_hypotheses",
         f"Merged {added} model-proposed hypotheses (grounded={getattr(proposed, 'grounded_count', 0)}, dropped={getattr(proposed, 'dropped_count', 0)})",
+    )
+
+
+def _merge_invariant_violation_hypotheses(state: AuditState) -> None:
+    """Run the invariant-violation reasoner (novel-bug engine) and merge survivors.
+
+    Reasons adversarially over the protocol's own mined invariants to construct
+    concrete violating sequences — the path to bugs no pattern detector encodes.
+    Real-LLM only; ungrounded proposals are dropped in the tool, survivors are
+    de-duplicated against existing hypotheses.
+
+    Args:
+        state: The audit state; appends to ``state['hypotheses']`` in place.
+    Returns:
+        None. No-op when the LLM refiner is disabled or no invariants were mined.
+    """
+    if not state.get("use_llm_refiner", False) or not state.get("invariant_candidates"):
+        return
+    emit_progress("  reasoning about invariant violations (LLM, novel-bug engine)…")
+    reasoned = _run_tool(
+        state,
+        "research.reason_invariant_violations",
+        {"repo_path": state["repo_path"], "objective": state["objective"], "max_hypotheses": 6},
+    )
+    violation_hypotheses = list(getattr(reasoned, "hypotheses", []) or [])
+    if not violation_hypotheses:
+        return
+    existing = {
+        (h.vulnerability_class, tuple(sorted(h.affected_files)), tuple(sorted(h.affected_functions)))
+        for h in state["hypotheses"]
+    }
+    added = 0
+    for hypothesis in violation_hypotheses:
+        signature = (
+            hypothesis.vulnerability_class,
+            tuple(sorted(hypothesis.affected_files)),
+            tuple(sorted(hypothesis.affected_functions)),
+        )
+        if signature in existing:
+            continue
+        existing.add(signature)
+        state["hypotheses"].append(hypothesis)
+        added += 1
+    _record_step(
+        state,
+        "research.reason_invariant_violations",
+        f"Merged {added} invariant-violation hypotheses (grounded={getattr(reasoned, 'grounded_count', 0)}, dropped={getattr(reasoned, 'dropped_count', 0)})",
     )
 
 
@@ -1678,6 +1752,18 @@ def finish(state: AuditState) -> AuditState:
     if getattr(compile_output, "status", None) == ToolStatus.ERROR and state.get("use_llm_refiner", False):
         _run_tool(state, "dynamic.repair_validation_artifacts", {"repo_path": repo_path})
     _run_tool(state, "dynamic.run_validation_artifacts", {"repo_path": repo_path})
+    # Execution-grounded reasoning loop (real-LLM only): for the top hypotheses,
+    # author a runnable test that asserts the invariant, run it, observe whether it
+    # breaks, and refine — proving multi-step economic bugs by running numbers.
+    if hypotheses and state.get("use_llm_refiner", False):
+        exploit_cap = get_settings().exploit_loop_max_hypotheses
+        for hypothesis in _select_hypotheses_for_deepening(hypotheses)[:exploit_cap]:
+            emit_progress(f"  exploit loop: authoring + running PoC for {hypothesis.id}…")
+            _run_tool(
+                state,
+                "dynamic.author_and_run_exploit",
+                {"repo_path": repo_path, "hypothesis": hypothesis.model_dump(mode="json")},
+            )
     run_dir = Path(state["run_dir"])
     if state.get("proof_packets"):
         write_json(run_dir / "proof_packets.json", [packet.model_dump(mode="json") for packet in state["proof_packets"]])
@@ -1722,6 +1808,15 @@ def finish(state: AuditState) -> AuditState:
         finding_count=len(state["findings"]),
     )
     state["current_focus"] = "done"
+    # Loudly flag if any reasoning fell back to the weaker model: a primary-model
+    # outage silently downgrades calls, which would invalidate the run's results.
+    if state.get("use_llm_refiner", False):
+        fallback_hits = _count_fallback_usage(state)
+        if fallback_hits:
+            emit_progress(
+                f"  ⚠ WARNING: {fallback_hits} LLM call(s) fell back to the fallback model "
+                f"({get_settings().ollama_fallback_model}) — primary-model results are partially contaminated."
+            )
     write_json(Path(state["run_dir"]) / "state.json", _state_for_persist(state))
     log_event(
         state["run_dir"],

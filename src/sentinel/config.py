@@ -22,7 +22,11 @@ class Settings(BaseModel):
     model: str = "Qwen/Qwen2.5-Coder-32B-Instruct"
     ollama_base_url: str = "http://localhost:11434"
     ollama_api_key: str | None = None
-    ollama_fallback_model: str = "qwen2.5-coder:7b"
+    # Fallback model used only when the primary LLM keeps failing. Keep it STRONG
+    # (a weak fallback silently corrupts results when the primary is flaky) — the
+    # cloud occasionally rejects the primary's tag, and a downgrade to a small
+    # model would invalidate the run.
+    ollama_fallback_model: str = "qwen3-coder-next"
     hf_token: str | None = None
     hf_base_url: str = "https://router.huggingface.co/v1"
     # Frontier model (Anthropic Claude) — the recommended provider for landing
@@ -36,11 +40,23 @@ class Settings(BaseModel):
     # Cold `forge build`/`forge test` on a real protocol (full src + test tree) can
     # take minutes; 120s was timing out and surfacing as a blank build error.
     forge_command_timeout: int = Field(default=300, ge=1)
+    # How much real source the LLM generative steps (proposer, invariant inference,
+    # violation reasoning) actually see. The old 24k/28-function caps showed the
+    # model ~12% of a mid-size protocol — and none of the bug-bearing functions.
+    # These large defaults use a fraction of modern context windows (120k chars
+    # ~= 30k tokens). Lower them only for small-context models.
+    proposer_char_budget: int = Field(default=120_000, ge=1000)
+    proposer_max_functions: int = Field(default=250, ge=1)
     # When a generated PoC test fails to compile, feed the solc error + real
     # target source back to the LLM to fix it, up to this many attempts. Default 1:
     # in practice the model repeats the same structural error on a 2nd pass, so a
     # retry mostly burns minutes for no gain (raise it if your model improves).
-    poc_repair_max_attempts: int = Field(default=1, ge=0)
+    poc_repair_max_attempts: int = Field(default=3, ge=0)
+    # Execution-grounded reasoning loop: for the top hypotheses, author a runnable
+    # test that asserts the invariant, run it, observe whether the invariant breaks,
+    # and refine. Bounded for cost (each iteration is an LLM author + a forge build/test).
+    exploit_loop_max_iterations: int = Field(default=3, ge=0)
+    exploit_loop_max_hypotheses: int = Field(default=3, ge=0)
     planner_max_rounds: int = Field(default=14, ge=1)
     # Safety: the real-LLM planner may only directly select read/analysis tools;
     # write/network/install/cleanup tools are blocked unless explicitly approved.
@@ -48,7 +64,7 @@ class Settings(BaseModel):
     # Dependency installs run untrusted postinstall scripts over the network; opt-in only.
     allow_installs: bool = False
     context_summary_interval: int = Field(default=6, ge=1)
-    llm_max_retries: int = Field(default=3, ge=1)
+    llm_max_retries: int = Field(default=6, ge=1)
     llm_backoff_base_seconds: float = Field(default=0.5, ge=0.0)
     llm_backoff_max_seconds: float = Field(default=8.0, ge=0.0)
     llm_max_calls_per_minute: int = Field(default=120, ge=1)
@@ -86,7 +102,7 @@ def get_settings() -> Settings:
         model=os.getenv("SENTINEL_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct"),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         ollama_api_key=os.getenv("OLLAMA_API_KEY") or None,
-        ollama_fallback_model=os.getenv("SENTINEL_OLLAMA_FALLBACK_MODEL", "qwen2.5-coder:7b"),
+        ollama_fallback_model=os.getenv("SENTINEL_OLLAMA_FALLBACK_MODEL", "qwen3-coder-next"),
         hf_token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN"),
         hf_base_url=os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1"),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or None,
@@ -96,12 +112,16 @@ def get_settings() -> Settings:
         anthropic_max_tokens=int(os.getenv("SENTINEL_ANTHROPIC_MAX_TOKENS", "16000")),
         max_tool_calls=int(os.getenv("SENTINEL_MAX_TOOL_CALLS", "200")),
         forge_command_timeout=int(os.getenv("SENTINEL_FORGE_COMMAND_TIMEOUT", "300")),
-        poc_repair_max_attempts=int(os.getenv("SENTINEL_POC_REPAIR_MAX_ATTEMPTS", "1")),
+        proposer_char_budget=int(os.getenv("SENTINEL_PROPOSER_CHAR_BUDGET", "120000")),
+        proposer_max_functions=int(os.getenv("SENTINEL_PROPOSER_MAX_FUNCTIONS", "250")),
+        poc_repair_max_attempts=int(os.getenv("SENTINEL_POC_REPAIR_MAX_ATTEMPTS", "3")),
+        exploit_loop_max_iterations=int(os.getenv("SENTINEL_EXPLOIT_LOOP_MAX_ITERATIONS", "3")),
+        exploit_loop_max_hypotheses=int(os.getenv("SENTINEL_EXPLOIT_LOOP_MAX_HYPOTHESES", "3")),
         planner_max_rounds=int(os.getenv("SENTINEL_PLANNER_MAX_ROUNDS", "14")),
         planner_allow_side_effects=os.getenv("SENTINEL_PLANNER_ALLOW_SIDE_EFFECTS", "false").lower() in {"1", "true", "yes", "on"},
         allow_installs=os.getenv("SENTINEL_ALLOW_INSTALLS", "false").lower() in {"1", "true", "yes", "on"},
         context_summary_interval=int(os.getenv("SENTINEL_CONTEXT_SUMMARY_INTERVAL", "6")),
-        llm_max_retries=int(os.getenv("SENTINEL_LLM_MAX_RETRIES", "3")),
+        llm_max_retries=int(os.getenv("SENTINEL_LLM_MAX_RETRIES", "6")),
         llm_backoff_base_seconds=float(os.getenv("SENTINEL_LLM_BACKOFF_BASE_SECONDS", "0.5")),
         llm_backoff_max_seconds=float(os.getenv("SENTINEL_LLM_BACKOFF_MAX_SECONDS", "8.0")),
         llm_max_calls_per_minute=int(os.getenv("SENTINEL_LLM_MAX_CALLS_PER_MINUTE", "120")),

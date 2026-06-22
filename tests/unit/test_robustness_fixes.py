@@ -232,3 +232,34 @@ def test_dedupe_collapses_same_title_merging_functions():
     assert len(same_title) == 1  # collapsed from 3 -> 1
     # coverage preserved: all three functions merged into the survivor
     assert set(same_title[0].affected_functions) >= {"borrow", "repay", "getValueInEth"}
+
+
+# --- model-integrity: intermittent cloud tag-rejection retries primary, not fallback ---
+
+def test_gateway_model_tag_rejection_is_retryable():
+    from sentinel.llm.resilience import is_retryable_error
+
+    # The exact intermittent Ollama Cloud error that was silently downgrading to gemma.
+    err = Exception("Bad request: {'message': \"the provider or policy you attempted to "
+                    "specify '480b' is not valid.\", 'code': 'model_not_supported'}")
+    assert is_retryable_error(err) is True
+    # A genuine, non-transient bad request must NOT be retried forever.
+    assert is_retryable_error(Exception("invalid json schema for field 'foo'")) is False
+
+
+def test_count_fallback_usage_flags_contamination():
+    from sentinel.graphs.parent import _count_fallback_usage
+
+    class _Result:
+        def __init__(self, notes):
+            self.notes = notes
+
+    state = {
+        "notes": ["Ollama fallback planner applied."],
+        "subgraph_results": [
+            _Result(["Ollama fallback adversarial reviewer applied.", "some other note"]),
+            _Result(["Ollama fallback research refinement applied."]),
+        ],
+    }
+    assert _count_fallback_usage(state) == 3
+    assert _count_fallback_usage({"notes": [], "subgraph_results": []}) == 0

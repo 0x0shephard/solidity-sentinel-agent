@@ -8,6 +8,8 @@ from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from sentinel.llm.base import (
     BaseAdversarialReviewer,
     BaseHypothesisProposer,
+    BaseInvariantInferencer,
+    BaseInvariantReasoner,
     BasePlanner,
     BasePocAuthor,
     BasePocRepairer,
@@ -15,6 +17,8 @@ from sentinel.llm.base import (
     ToolPlan,
 )
 from sentinel.llm.ollama import (
+    _INVARIANT_INFERENCE_SYSTEM,
+    _INVARIANT_VIOLATION_SYSTEM,
     _POC_AUTHOR_SYSTEM,
     _POC_REPAIR_SYSTEM,
     _PROPOSER_SYSTEM,
@@ -22,6 +26,7 @@ from sentinel.llm.ollama import (
     extract_json_object,
     extract_solidity_code,
     parse_adversarial_verdict,
+    parse_inferred_invariants,
     parse_proposed_hypotheses,
     parse_research_refinement,
 )
@@ -117,6 +122,42 @@ class HuggingFaceHypothesisProposer(BaseHypothesisProposer):
         response = invoke_chat(self.llm, 
             [SystemMessage(content=_PROPOSER_SYSTEM), HumanMessage(content=prompt)]
         )
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        self.last_raw = content
+        return parse_proposed_hypotheses(content)
+
+
+class HuggingFaceInvariantInferencer(BaseInvariantInferencer):
+    def __init__(self, model: str, token: str, base_url: str | None = None, llm: ChatHuggingFace | None = None) -> None:
+        endpoint = HuggingFaceEndpoint(
+            **_endpoint_kwargs(model, base_url),
+            huggingfacehub_api_token=token,
+            temperature=0.0,
+            max_new_tokens=2000,
+        )
+        self.llm = llm or ChatHuggingFace(llm=endpoint, model_id=model, temperature=0.0)
+
+    def infer(self, prompt: str):
+        self.last_raw = ""
+        response = invoke_chat(self.llm, [SystemMessage(content=_INVARIANT_INFERENCE_SYSTEM), HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        self.last_raw = content
+        return parse_inferred_invariants(content)
+
+
+class HuggingFaceInvariantReasoner(BaseInvariantReasoner):
+    def __init__(self, model: str, token: str, base_url: str | None = None, llm: ChatHuggingFace | None = None) -> None:
+        endpoint = HuggingFaceEndpoint(
+            **_endpoint_kwargs(model, base_url),
+            huggingfacehub_api_token=token,
+            temperature=0.0,
+            max_new_tokens=2000,
+        )
+        self.llm = llm or ChatHuggingFace(llm=endpoint, model_id=model, temperature=0.0)
+
+    def reason(self, prompt: str) -> ProposedHypothesisBatch:
+        self.last_raw = ""
+        response = invoke_chat(self.llm, [SystemMessage(content=_INVARIANT_VIOLATION_SYSTEM), HumanMessage(content=prompt)])
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
         self.last_raw = content
         return parse_proposed_hypotheses(content)

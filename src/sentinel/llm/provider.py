@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from sentinel.config import Settings, get_settings
 from sentinel.errors import ConfigurationError
-from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BasePlanner, BasePocAuthor, BasePocRepairer, BaseResearchRefiner
+from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BaseInvariantInferencer, BaseInvariantReasoner, BasePlanner, BasePocAuthor, BasePocRepairer, BaseResearchRefiner
 from sentinel.llm.huggingface import (
     HuggingFaceAdversarialReviewer,
     HuggingFaceHypothesisProposer,
+    HuggingFaceInvariantInferencer,
+    HuggingFaceInvariantReasoner,
     HuggingFacePlanner,
     HuggingFacePocAuthor,
     HuggingFacePocRepairer,
@@ -14,6 +16,8 @@ from sentinel.llm.huggingface import (
 from sentinel.llm.mock import (
     MockAdversarialReviewer,
     MockHypothesisProposer,
+    MockInvariantInferencer,
+    MockInvariantReasoner,
     MockPlanner,
     MockPocAuthor,
     MockPocRepairer,
@@ -22,6 +26,8 @@ from sentinel.llm.mock import (
 from sentinel.llm.ollama import (
     OllamaAdversarialReviewer,
     OllamaHypothesisProposer,
+    OllamaInvariantInferencer,
+    OllamaInvariantReasoner,
     OllamaPlanner,
     OllamaPocAuthor,
     OllamaPocRepairer,
@@ -159,3 +165,47 @@ def get_poc_author(settings: Settings | None = None, mock: bool = False) -> Base
 def get_ollama_fallback_poc_author(settings: Settings | None = None) -> BasePocAuthor:
     cfg = settings or get_settings()
     return OllamaPocAuthor(model=cfg.ollama_fallback_model, base_url=cfg.ollama_base_url, api_key=cfg.ollama_api_key)
+
+
+def get_invariant_reasoner(settings: Settings | None = None, mock: bool = False) -> BaseInvariantReasoner:
+    cfg = settings or get_settings()
+    if mock or cfg.llm_provider == "mock":
+        return MockInvariantReasoner()
+    if cfg.llm_provider == "ollama":
+        return OllamaInvariantReasoner(model=cfg.model, base_url=cfg.ollama_base_url, api_key=cfg.ollama_api_key)
+    if cfg.llm_provider == "huggingface":
+        if not cfg.hf_token:
+            raise ConfigurationError("HF_TOKEN is required when SENTINEL_LLM_PROVIDER=huggingface")
+        return HuggingFaceInvariantReasoner(model=cfg.model, token=cfg.hf_token, base_url=cfg.hf_base_url)
+    if cfg.llm_provider == "anthropic":
+        from sentinel.llm.anthropic_provider import AnthropicInvariantReasoner, _anthropic_kwargs
+
+        return AnthropicInvariantReasoner(**_anthropic_kwargs(cfg))
+    raise ConfigurationError(f"Unsupported LLM provider: {cfg.llm_provider}")
+
+
+def get_ollama_fallback_invariant_reasoner(settings: Settings | None = None) -> BaseInvariantReasoner:
+    cfg = settings or get_settings()
+    return OllamaInvariantReasoner(model=cfg.ollama_fallback_model, base_url=cfg.ollama_base_url, api_key=cfg.ollama_api_key)
+
+
+def get_invariant_inferencer(settings: Settings | None = None, mock: bool = False) -> BaseInvariantInferencer:
+    cfg = settings or get_settings()
+    if mock or cfg.llm_provider == "mock":
+        return MockInvariantInferencer()
+    if cfg.llm_provider == "ollama":
+        return OllamaInvariantInferencer(model=cfg.model, base_url=cfg.ollama_base_url, api_key=cfg.ollama_api_key)
+    if cfg.llm_provider == "huggingface":
+        if not cfg.hf_token:
+            raise ConfigurationError("HF_TOKEN is required when SENTINEL_LLM_PROVIDER=huggingface")
+        return HuggingFaceInvariantInferencer(model=cfg.model, token=cfg.hf_token, base_url=cfg.hf_base_url)
+    if cfg.llm_provider == "anthropic":
+        from sentinel.llm.anthropic_provider import AnthropicInvariantInferencer, _anthropic_kwargs
+
+        return AnthropicInvariantInferencer(**_anthropic_kwargs(cfg))
+    raise ConfigurationError(f"Unsupported LLM provider: {cfg.llm_provider}")
+
+
+def get_ollama_fallback_invariant_inferencer(settings: Settings | None = None) -> BaseInvariantInferencer:
+    cfg = settings or get_settings()
+    return OllamaInvariantInferencer(model=cfg.ollama_fallback_model, base_url=cfg.ollama_base_url, api_key=cfg.ollama_api_key)

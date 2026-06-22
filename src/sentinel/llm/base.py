@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from sentinel.schemas.research import AdversarialVerdict, ProposedHypothesisBatch, ResearchRefinement
+from sentinel.schemas.research import AdversarialVerdict, InferredInvariantBatch, ProposedHypothesisBatch, ResearchRefinement
 
 
 class ToolDecision(BaseModel):
@@ -34,6 +34,33 @@ class BaseHypothesisProposer:
 
 class BaseAdversarialReviewer:
     def review(self, prompt: str) -> AdversarialVerdict:
+        raise NotImplementedError
+
+
+class BaseInvariantInferencer:
+    """Infers this protocol's specific invariants from its source.
+
+    Produces protocol-specific guarantees (beyond the template miner's fixed
+    families) that anchor the invariant-violation reasoner. Returns an
+    ``InferredInvariantBatch``; names are grounded against real source downstream.
+    """
+
+    def infer(self, prompt: str) -> InferredInvariantBatch:
+        raise NotImplementedError
+
+
+class BaseInvariantReasoner:
+    """Invariant-violation reasoning — the novel-bug engine.
+
+    Unlike pattern detectors (which recall *known* bug shapes), this asks the
+    model to reason from the protocol's own invariants: given a deeply-assembled,
+    state-variable-centric context (the functions that read/write a core invariant
+    plus the call graph around them), construct a concrete multi-step sequence that
+    *breaks* that invariant. Output reuses the proposed-hypothesis schema so the
+    violations flow through the existing grounding/research/validation pipeline.
+    """
+
+    def reason(self, prompt: str) -> "ProposedHypothesisBatch":
         raise NotImplementedError
 
 

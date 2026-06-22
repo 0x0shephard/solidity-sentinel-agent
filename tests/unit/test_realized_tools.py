@@ -360,3 +360,55 @@ def test_memory_artifact_and_plan_tools():
     assert artifact.status == ToolStatus.OK
     assert artifact.data["artifact_count"] == 1
     assert plan.status == ToolStatus.OK
+
+
+def test_author_and_run_exploit_confirms_when_invariant_breaks(monkeypatch, tmp_path):
+    # Repo with a foundry fixture so the loop has something to inherit.
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "test").mkdir(parents=True)
+    (repo / "foundry.toml").write_text("[profile.default]\nsrc='src'\n", encoding="utf-8")
+    (repo / "src" / "Vault.sol").write_text("pragma solidity ^0.8.20; contract Vault { function withdraw() external {} }\n", encoding="utf-8")
+    (repo / "test" / "Base.t.sol").write_text("pragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\ncontract BaseTest is Test { function setUp() public {} }\n", encoding="utf-8")
+
+    state = initial_audit_state("ex", str(repo), "Find bugs", str(tmp_path / "runs" / "ex"))
+    state["use_llm_refiner"] = True
+    hyp = VulnerabilityHypothesis(
+        id="hyp-1", title="Withdraw breaks solvency", vulnerability_class="accounting",
+        affected_files=["src/Vault.sol"], affected_functions=["withdraw"],
+        evidence_summary="x", confidence=0.6, required_proof="total assets >= total debt",
+    )
+    state["hypotheses"] = [hyp]
+
+    monkeypatch.setattr("sentinel.tools.dynamic.shutil.which", lambda name: "/fake/forge")
+    monkeypatch.setattr("sentinel.tools.dynamic._detect_test_fixture", lambda repo_path, **k: {"name": "BaseTest", "import_path": "./Base.t.sol", "source": "contract BaseTest {}"})
+    monkeypatch.setattr("sentinel.tools.dynamic._copy_repo_for_validation", lambda repo_path, worktree: (worktree / "test").mkdir(parents=True, exist_ok=True))
+
+    class _Author:
+        def author(self, prompt):
+            return "```solidity\npragma solidity ^0.8.20;\ncontract SentinelwithdrawExploit { function test_x() public {} }\n```"
+
+    monkeypatch.setattr("sentinel.llm.provider.get_poc_author", lambda mock=False: _Author())
+
+    calls = {"n": 0}
+
+    def fake_run(command, cwd, timeout=60, env=None):
+        calls["n"] += 1
+        if command[:2] == ["forge", "build"]:
+            return CommandResult(command=command, cwd=str(cwd), return_code=0, stdout="Compiling", stderr="")
+        # forge test -> a failing assertion (invariant broke -> confirmed)
+        return CommandResult(command=command, cwd=str(cwd), return_code=1, stdout="[FAIL: assertion failed] test_x()\n1 failed", stderr="")
+
+    monkeypatch.setattr("sentinel.tools.dynamic.run_command", fake_run)
+
+    out = ToolExecutor(build_default_registry()).execute("dynamic.author_and_run_exploit", {"repo_path": str(repo), "hypothesis": hyp.model_dump(mode="json")}, state)
+    assert out.data["verdict"] == "confirmed"
+    assert out.data["classification"] == "security_invariant_violation_or_test_needs_review"
+
+
+def test_author_and_run_exploit_skips_without_llm(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    state = initial_audit_state("ex2", str(repo), "x", str(tmp_path / "runs" / "ex2"))
+    out = ToolExecutor(build_default_registry()).execute("dynamic.author_and_run_exploit", {"repo_path": str(repo)}, state)
+    assert out.status == ToolStatus.SKIPPED

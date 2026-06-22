@@ -1245,10 +1245,6 @@ def _high_value_function_names(state, repo_path: str) -> set[str]:
     return out
 
 
-_PROPOSER_CHAR_BUDGET = 24000
-_PROPOSER_MAX_BLOCKS = 28
-
-
 def _proposer_code_context(state, repo_path: str, boost: set[str] | None = None) -> str:
     """Source the proposer reasons over, with guaranteed per-contract breadth.
 
@@ -1257,7 +1253,14 @@ def _proposer_code_context(state, repo_path: str, boost: set[str] | None = None)
     gap). We run two passes: a breadth pass that admits the top-ranked function of
     EVERY production contract first, then a depth pass that spends the remaining
     budget on the highest-priority (funds/upgrade/loop) functions overall.
+
+    The budget is large and configurable: the old 28-function / 24k-char cap
+    showed the model ~12% of a mid-size protocol (and none of the bug-bearing
+    functions), which was the dominant limit on LLM-driven bug discovery.
     """
+    settings = get_settings()
+    char_budget = settings.proposer_char_budget
+    max_blocks = settings.proposer_max_functions
     ranges = _function_range_index(state.get("static_facts", {}))
     priority = _priority_function_names(state) | (boost or set())
     prioritized = sorted(ranges, key=lambda r: (r.get("function_name") not in priority, str(r.get("file_path"))))
@@ -1276,7 +1279,7 @@ def _proposer_code_context(state, repo_path: str, boost: set[str] | None = None)
         if not body.strip():
             return False
         block = f"// file: {fp} | contract: {r.get('contract_name')} | function: {fn} | lines {s}-{e}\n{body}"
-        if used + len(block) > _PROPOSER_CHAR_BUDGET or len(blocks) >= _PROPOSER_MAX_BLOCKS:
+        if used + len(block) > char_budget or len(blocks) >= max_blocks:
             return False
         seen.add((fp, fn))
         used += len(block)
@@ -1294,7 +1297,7 @@ def _proposer_code_context(state, repo_path: str, boost: set[str] | None = None)
 
     # Depth pass: fill the remaining budget with the riskiest functions overall.
     for r in prioritized:
-        if len(blocks) >= _PROPOSER_MAX_BLOCKS or used >= _PROPOSER_CHAR_BUDGET:
+        if len(blocks) >= max_blocks or used >= char_budget:
             break
         _try_add(r)
 
@@ -1356,7 +1359,9 @@ def _build_proposer_prompt(state, objective: str) -> str:
         },
         indent=2,
     )
-    return f"{header}\n\n=== SOURCE CODE ===\n{_proposer_code_context(state, repo_path, boost=set(high_value))}"
+    patterns = _historical_pattern_context(state, limit=6)
+    patterns_block = f"\n\n=== KNOWN BUG PATTERNS IN SIMILAR PROTOCOLS (from historical audits) ===\n{patterns}" if patterns else ""
+    return f"{header}{patterns_block}\n\n=== SOURCE CODE ===\n{_proposer_code_context(state, repo_path, boost=set(high_value))}"
 
 
 def _ground_proposal(index: int, proposal, ranges: list[dict], repo_path: str) -> VulnerabilityHypothesis | None:
@@ -1469,6 +1474,242 @@ def propose_hypotheses(inp: ProposeHypothesesInput, state) -> ProposeHypothesesO
     )
 
 
+def _protocol_pattern_query(state) -> str:
+    """A protocol-level retrieval query: objective + domain + top contract names."""
+    contracts = [
+        str(c.get("contract") or c.get("name") or "")
+        for c in state.get("static_facts", {}).get("contracts", [])[:8]
+        if isinstance(c, dict)
+    ]
+    targeted = state.get("targeted_rag") or {}
+    domain = (targeted.get("domain") if isinstance(targeted, dict) else getattr(targeted, "domain", "")) or ""
+    parts = [state.get("objective", ""), domain, *[c for c in contracts if c]]
+    return " ".join(part for part in parts if part)[:400]
+
+
+def _historical_pattern_context(state, limit: int = 6, extra: str = "") -> str:
+    """Pull the most relevant past bugs (Solodit + AuditVault brain) for THIS
+    protocol and format them as priors for the generative steps.
+
+    This is the key change to actually leverage the knowledge base: instead of only
+    enriching hypotheses after the fact, we prime invariant inference and violation
+    reasoning with how similar protocols have actually been broken — so the agent
+    looks for novel *instances* of known attack classes in unseen code.
+    """
+    query = f"{_protocol_pattern_query(state)} {extra}".strip()
+    if not query:
+        return ""
+    try:
+        output = retrieve_historical_findings(HistoricalFindingQuery(query=query, top_k=limit), state)
+    except Exception:
+        return ""
+    lines = []
+    for match in getattr(output, "matches", [])[:limit]:
+        finding = match.finding
+        blurb = (finding.summary or finding.content or "").replace("\n", " ").strip()[:200]
+        lines.append(f"- [{finding.vulnerability_class}] {finding.title[:100]} :: {blurb}")
+    return "\n".join(lines)
+
+
+def _build_invariant_inference_prompt(state, objective: str) -> str:
+    """Assemble the context for inferring this protocol's specific invariants."""
+    import json as _json
+
+    repo_path = state.get("repo_path", "")
+    contracts = [
+        {"name": c.get("contract") or c.get("name"), "file": c.get("file_path")}
+        for c in state.get("static_facts", {}).get("contracts", [])[:30]
+        if isinstance(c, dict)
+    ]
+    header = _json.dumps(
+        {
+            "objective": objective,
+            "contracts": contracts,
+            "instruction": (
+                "Infer the security-critical invariants THIS protocol relies on, grounded in the SOURCE CODE below. "
+                "Be specific to this code (cite real functions/state variables), not generic platitudes. Use the "
+                "KNOWN BUG PATTERNS as a prior for which guarantees tend to break in similar protocols."
+            ),
+        },
+        indent=2,
+    )
+    patterns = _historical_pattern_context(state, limit=8, extra="invariant accounting access oracle")
+    patterns_block = f"\n\n=== KNOWN BUG PATTERNS IN SIMILAR PROTOCOLS (from historical audits) ===\n{patterns}" if patterns else ""
+    return f"{header}{patterns_block}\n\n=== SOURCE CODE ===\n{_proposer_code_context(state, repo_path)}"
+
+
+def infer_protocol_invariants(state) -> list[InvariantCandidate]:
+    """LLM-infer protocol-specific invariants and ground them to real source.
+
+    Complements the template miner: produces guarantees specific to this protocol
+    (e.g. "fee accrues once per report") that anchor the violation reasoner.
+    Returns grounded ``InvariantCandidate``s, or [] when the LLM is disabled.
+    Invariants citing only non-existent functions are dropped as hallucinated.
+    """
+    if not state.get("use_llm_refiner", False):
+        return []
+    ranges = _function_range_index(state.get("static_facts", {}))
+    if not ranges:
+        return []
+    known_functions = {str(r.get("function_name")) for r in ranges if r.get("function_name")}
+
+    from sentinel.llm import provider as llm_provider
+
+    prompt = _build_invariant_inference_prompt(state, state.get("objective", ""))
+    try:
+        batch = llm_provider.get_invariant_inferencer(mock=False).infer(prompt)
+    except Exception:
+        try:
+            batch = llm_provider.get_ollama_fallback_invariant_inferencer().infer(prompt)
+        except Exception:
+            return []
+
+    candidates: list[InvariantCandidate] = []
+    for index, inv in enumerate(batch.invariants, start=1):
+        # Lenient grounding: accept exact names and contract-qualified ones
+        # (e.g. "ShareModule.handleReport" -> "handleReport"). The earlier strict
+        # exact-match dropped every inferred invariant because models commonly
+        # qualify names with the contract.
+        grounded_functions = []
+        for fn in inv.functions:
+            if fn in known_functions:
+                grounded_functions.append(fn)
+            elif fn.split(".")[-1] in known_functions:
+                grounded_functions.append(fn.split(".")[-1])
+        # Drop only when functions are named but NONE ground even leniently
+        # (hallucinated scope); a function-free invariant is kept as a general one.
+        if inv.functions and not grounded_functions:
+            continue
+        candidates.append(
+            InvariantCandidate(
+                id=f"llm-inv-{index}",
+                invariant_type=(inv.category or "accounting").strip() or "accounting",
+                invariant_family=f"llm-inferred {inv.category}".strip(),
+                description=inv.statement,
+                affected_contracts=inv.contracts[:4],
+                affected_functions=grounded_functions[:6],
+                affected_state_variables=inv.state_variables[:6],
+                local_facts=[inv.rationale] if inv.rationale else [],
+                required_proof=f"Show a concrete sequence that violates: {inv.statement}",
+                proof_status="setup_required",
+                detector_ids=["invariant_inferencer"],
+                recommended_validation_template="generic",
+                confidence=min(0.6, max(0.1, inv.confidence)),
+            )
+        )
+    return candidates
+
+
+def _build_invariant_reasoning_prompt(state, objective: str) -> str:
+    """Assemble the deep, invariant-centric context for novel-bug reasoning.
+
+    Unlike the proposer (which scans functions for known patterns), this anchors
+    the model on this protocol's own mined invariants and the real source of the
+    functions that read/write them, and asks for a concrete violating sequence.
+    """
+    import json as _json
+
+    repo_path = state.get("repo_path", "")
+    invariants = []
+    boost: set[str] = set()
+    for candidate in state.get("invariant_candidates", [])[:12]:
+        invariants.append(
+            {
+                "invariant": candidate.description or candidate.invariant_type,
+                "family": candidate.invariant_family,
+                "state_variables": candidate.affected_state_variables[:6],
+                "functions": candidate.affected_functions[:6],
+                "contracts": candidate.affected_contracts[:4],
+            }
+        )
+        boost.update(candidate.affected_functions)
+    graph = state.get("protocol_graph")
+    attack_paths = [
+        {"id": p.attack_path_id, "invariant_family": p.invariant_family, "summary": p.summary}
+        for p in (getattr(graph, "attack_paths", [])[:8] if graph is not None else [])
+    ]
+    header = _json.dumps(
+        {
+            "objective": objective,
+            "candidate_invariants": invariants,
+            "attack_path_candidates": attack_paths,
+            "instruction": (
+                "For EACH candidate invariant, try to construct a concrete sequence of calls that BREAKS it, grounded "
+                "in the SOURCE CODE below. Think multi-step, multi-contract, repeated, and boundary-value. Focus on: "
+                "value conservation (assets vs shares/debt), fee/interest counted once vs repeatedly, rounding that "
+                "compounds across iterations, state shared across pools/positions that should be isolated, and "
+                "external calls ordered before accounting. The KNOWN BUG PATTERNS show how similar invariants were "
+                "broken before — adapt those attack shapes to THIS code. Emit one hypothesis per distinct violation "
+                "with the exact breaking sequence; return [] if an invariant cannot be broken."
+            ),
+        },
+        indent=2,
+    )
+    invariant_terms = " ".join(inv.get("invariant", "") for inv in invariants[:6])[:200]
+    patterns = _historical_pattern_context(state, limit=8, extra=invariant_terms)
+    patterns_block = f"\n\n=== KNOWN BUG PATTERNS IN SIMILAR PROTOCOLS (how these invariants break) ===\n{patterns}" if patterns else ""
+    return f"{header}{patterns_block}\n\n=== SOURCE CODE ===\n{_proposer_code_context(state, repo_path, boost=boost)}"
+
+
+def reason_invariant_violations(inp: ProposeHypothesesInput, state) -> ProposeHypothesesOutput:
+    """Novel-bug engine: ask the LLM to break this protocol's own invariants.
+
+    Produces code-grounded violation hypotheses (ungrounded ones dropped), tagged
+    with the ``invariant_reasoner`` source so they flow through the existing
+    research/validation pipeline.
+    """
+    from sentinel.llm import provider as llm_provider
+
+    ranges = _function_range_index(state.get("static_facts", {}))
+    if not ranges:
+        return ProposeHypothesesOutput(status=ToolStatus.OK, notes=["No function ranges available; invariant reasoner skipped."])
+    if not state.get("use_llm_refiner", False):
+        return ProposeHypothesesOutput(status=ToolStatus.OK, notes=["LLM disabled; invariant reasoner skipped."])
+    if not state.get("invariant_candidates"):
+        return ProposeHypothesesOutput(status=ToolStatus.OK, notes=["No invariant candidates; invariant reasoner skipped."])
+
+    prompt = _build_invariant_reasoning_prompt(state, inp.objective or state.get("objective", ""))
+    notes: list[str] = []
+    reasoner = llm_provider.get_invariant_reasoner(mock=False)
+    try:
+        batch = reasoner.reason(prompt)
+    except Exception as exc:
+        notes.append(f"Primary invariant reasoner unavailable; trying Ollama fallback: {type(exc).__name__}: {exc}")
+        try:
+            reasoner = llm_provider.get_ollama_fallback_invariant_reasoner()
+            batch = reasoner.reason(prompt)
+            notes.append("Ollama fallback invariant reasoner applied.")
+        except Exception as fallback_exc:
+            return ProposeHypothesesOutput(
+                status=ToolStatus.OK,
+                notes=[*notes, f"Invariant reasoner unavailable: {type(fallback_exc).__name__}: {fallback_exc}"],
+                raw_preview=str(getattr(reasoner, "last_raw", "") or "")[:1200] or None,
+            )
+
+    raw_preview = str(getattr(reasoner, "last_raw", "") or "")[:1200] or None
+    proposed = batch.hypotheses[: inp.max_hypotheses]
+    grounded: list[VulnerabilityHypothesis] = []
+    for i, proposal in enumerate(proposed, start=1):
+        hypothesis = _ground_proposal(i, proposal, ranges, inp.repo_path)
+        if hypothesis is None:
+            continue
+        hypothesis.id = f"inv-hyp-{i}"
+        hypothesis.source_detection_ids = ["invariant_reasoner", *hypothesis.source_detection_ids]
+        grounded.append(hypothesis)
+    dropped = len(proposed) - len(grounded)
+    if dropped:
+        notes.append(f"Dropped {dropped} ungrounded invariant-violation proposal(s).")
+    return ProposeHypothesesOutput(
+        status=ToolStatus.OK,
+        hypotheses=grounded,
+        proposed_count=len(proposed),
+        grounded_count=len(grounded),
+        dropped_count=dropped,
+        notes=notes,
+        raw_preview=raw_preview,
+    )
+
+
 def register(registry) -> None:
     for tool in [
         RegisteredTool(namespace="research", name="search_local_vuln_db", description="Search local vulnerability class memory.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=search_local_vuln_db, side_effects=[SideEffect.NONE]),
@@ -1490,6 +1731,7 @@ def register(registry) -> None:
         RegisteredTool(namespace="research", name="map_to_vulnerability_class", description="Map evidence to vulnerability class.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=map_to_vulnerability_class, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="rank_hypotheses", description="Rank candidate vulnerability hypotheses.", input_model=RankHypothesesInput, output_model=RankHypothesesOutput, fn=rank_hypotheses, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="propose_hypotheses", description="Use the LLM to propose novel, code-specific vulnerability hypotheses grounded in real source; ungrounded proposals are dropped.", input_model=ProposeHypothesesInput, output_model=ProposeHypothesesOutput, fn=propose_hypotheses, side_effects=[SideEffect.EXTERNAL_NETWORK], requires_network=True, execution_kind="llm"),
+        RegisteredTool(namespace="research", name="reason_invariant_violations", description="Novel-bug engine: reason adversarially over this protocol's own invariants to construct concrete violating sequences; ungrounded proposals are dropped.", input_model=ProposeHypothesesInput, output_model=ProposeHypothesesOutput, fn=reason_invariant_violations, side_effects=[SideEffect.EXTERNAL_NETWORK], requires_network=True, execution_kind="llm"),
         RegisteredTool(namespace="research", name="summarize_known_pattern", description="Summarize a known vulnerability pattern.", input_model=ResearchNoteInput, output_model=ResearchNoteOutput, fn=summarize_known_pattern, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="summarize_prior_case", description="Summarize a prior vulnerability case.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=summarize_prior_case, side_effects=[SideEffect.NONE]),
         RegisteredTool(namespace="research", name="spawn_research_subgraph", description="Expose research subgraph spawning capability.", input_model=ResearchGenericInput, output_model=ResearchGenericOutput, fn=spawn_research_subgraph_tool, side_effects=[SideEffect.NONE]),

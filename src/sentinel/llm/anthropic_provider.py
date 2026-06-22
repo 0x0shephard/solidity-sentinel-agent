@@ -20,6 +20,8 @@ from sentinel.errors import ConfigurationError
 from sentinel.llm.base import (
     BaseAdversarialReviewer,
     BaseHypothesisProposer,
+    BaseInvariantInferencer,
+    BaseInvariantReasoner,
     BasePlanner,
     BasePocAuthor,
     BasePocRepairer,
@@ -27,6 +29,8 @@ from sentinel.llm.base import (
     ToolPlan,
 )
 from sentinel.llm.ollama import (
+    _INVARIANT_INFERENCE_SYSTEM,
+    _INVARIANT_VIOLATION_SYSTEM,
     _POC_AUTHOR_SYSTEM,
     _POC_REPAIR_SYSTEM,
     _PROPOSER_SYSTEM,
@@ -34,6 +38,7 @@ from sentinel.llm.ollama import (
     extract_json_object,
     extract_solidity_code,
     parse_adversarial_verdict,
+    parse_inferred_invariants,
     parse_proposed_hypotheses,
     parse_research_refinement,
 )
@@ -142,6 +147,22 @@ class AnthropicAdversarialReviewer(_AnthropicChat, BaseAdversarialReviewer):
     def review(self, prompt: str) -> AdversarialVerdict:
         content = self._chat(_REVIEWER_SYSTEM, prompt)
         return parse_adversarial_verdict(content)
+
+
+class AnthropicInvariantInferencer(_AnthropicChat, BaseInvariantInferencer):
+    def infer(self, prompt: str):
+        self.last_raw = ""
+        content = self._chat(_INVARIANT_INFERENCE_SYSTEM, prompt)
+        self.last_raw = content
+        return parse_inferred_invariants(content)
+
+
+class AnthropicInvariantReasoner(_AnthropicChat, BaseInvariantReasoner):
+    def reason(self, prompt: str) -> ProposedHypothesisBatch:
+        self.last_raw = ""
+        content = self._chat(_INVARIANT_VIOLATION_SYSTEM, prompt)
+        self.last_raw = content
+        return parse_proposed_hypotheses(content)
 
 
 class AnthropicPocRepairer(_AnthropicChat, BasePocRepairer):

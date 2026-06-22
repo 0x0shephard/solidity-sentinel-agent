@@ -129,7 +129,7 @@ def _has_validation_proof(hypothesis, state: AuditState) -> bool:
     executable validation artifact that demonstrated the issue — not LLM or
     heuristic reasoning alone.
     """
-    if getattr(hypothesis, "proof_status", "") == "static_proof_complete":
+    if getattr(hypothesis, "proof_status", "") in {"static_proof_complete", "executed_poc_confirmed"}:
         return True
     run_output = (state.get("last_outputs", {}) or {}).get("dynamic.run_validation_artifacts", {}) or {}
     classification = str((run_output.get("data") or {}).get("classification", ""))
@@ -143,6 +143,9 @@ def _has_executed_validation_proof(hypothesis, state: AuditState) -> bool:
     to *confirm* status, but only an executed PoC justifies near-certain
     confidence on what is otherwise a mined/heuristic candidate.
     """
+    # The execution-grounded loop sets this when a runnable PoC broke the invariant.
+    if getattr(hypothesis, "proof_status", "") == "executed_poc_confirmed":
+        return True
     run_output = (state.get("last_outputs", {}) or {}).get("dynamic.run_validation_artifacts", {}) or {}
     classification = str((run_output.get("data") or {}).get("classification", ""))
     return classification == "security_invariant_violation_or_test_needs_review"

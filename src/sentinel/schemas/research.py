@@ -97,6 +97,28 @@ class ProposedHypothesisBatch(BaseModel):
     hypotheses: list[ProposedHypothesis] = Field(default_factory=list)
 
 
+class InferredInvariant(BaseModel):
+    """A protocol-specific invariant the model inferred from the code.
+
+    Unlike the template miner's fixed families, these are guarantees derived from
+    *this* protocol's logic (e.g. "fee accrues once per report timestamp"). They
+    anchor the invariant-violation reasoner. ``functions``/``state_variables`` are
+    grounded against real source by the tool; ungrounded ones are dropped.
+    """
+
+    statement: str
+    category: str = "accounting"
+    contracts: list[str] = Field(default_factory=list)
+    functions: list[str] = Field(default_factory=list)
+    state_variables: list[str] = Field(default_factory=list)
+    rationale: str = ""
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class InferredInvariantBatch(BaseModel):
+    invariants: list[InferredInvariant] = Field(default_factory=list)
+
+
 class AdversarialVerdict(BaseModel):
     """Result of adversarially deepening a hypothesis against its callers.
 

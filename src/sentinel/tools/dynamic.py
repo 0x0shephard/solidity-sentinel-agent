@@ -582,6 +582,21 @@ def _classify_validation_run(return_code: int | None, stdout: str, stderr: str, 
     return "validation_execution_failed"
 
 
+def _extract_forge_result_summary(stdout: str, stderr: str = "") -> str:
+    """Pull the human-meaningful result from forge output: the FAIL/revert reason
+    or the pass line, so the verdict is grounded in what actually executed."""
+    text = f"{stdout}\n{stderr}"
+    for pattern in (
+        r"\[FAIL[^\]]*\][^\n]*",
+        r"\d+ (?:passed|failed)[^\n]*",
+        r"(?:revert|Revert|panic|Panic|Error|assertion failed)[^\n]*",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0).strip()[:240]
+    return (stdout.strip().splitlines()[-1][:240] if stdout.strip() else "no output")
+
+
 def create_poc_test(inp: PocInput, state) -> DynamicGenericOutput:
     hypothesis = inp.hypothesis or (state.get("hypotheses") or [None])[0]
     affected_function = getattr(hypothesis, "affected_functions", [])[:1]
@@ -1133,6 +1148,198 @@ def repair_validation_artifacts(inp: "ValidationCompileInput", state) -> Dynamic
     return DynamicGenericOutput(status=ToolStatus.ERROR, message="PoC repair attempted but compile still fails.", data=manifest)
 
 
+def _build_exploit_author_prompt(hypothesis: VulnerabilityHypothesis, target_source: str, fixture: dict, prior: dict | None) -> str:
+    target_file, target_contract, target_function = _target_details(hypothesis)
+    invariant = (getattr(hypothesis, "required_proof", "") or "").strip() or (
+        f"the protocol guarantee implied by: {hypothesis.title}"
+    )
+    lines = [
+        f"Hypothesis: {hypothesis.title}",
+        f"Vulnerability class: {hypothesis.vulnerability_class}",
+        f"Affected: {target_contract}.{target_function} ({target_file})",
+        f"Why it may be exploitable: {hypothesis.evidence_summary}",
+        f"INVARIANT TO BREAK: {invariant}",
+        "",
+        "Write a Foundry test that:",
+        "  1. sets up state using the fixture's existing setUp/deploy helpers (do NOT redeploy from scratch),",
+        "  2. executes the concrete attack sequence (multi-step / specific values as needed),",
+        "  3. ASSERTS the invariant with assertEq/assertTrue/assertLt etc.",
+        "If the bug is real, the ASSERTION MUST FAIL when the test runs — a failing test here means the "
+        "invariant is broken and the bug is CONFIRMED. Do not use vm.expectRevert to hide the break.",
+        "",
+        "MUST COMPILE — strict rules:",
+        "  - Match the repo's pragma; declare EVERY contract/interface/library at FILE SCOPE (never nested — solc 9582).",
+        "  - Call ONLY functions/members with signatures that appear verbatim in the fixture or target source below; "
+        "never invent methods, parameters, or return shapes.",
+        "  - Use the fixture's already-deployed instances/helpers; do not re-import or redeploy what it provides.",
+        "",
+        f"Inherit the fixture: contract Sentinel{target_function}Exploit is {fixture['name']}",
+        f'Import it as: import {{{fixture["name"]}}} from "{fixture["import_path"]}";',
+        "",
+        "=== fixture source (reuse its helpers) ===",
+        fixture["source"],
+        "",
+        "=== target contract source (use only real signatures) ===",
+        target_source or "(target source unavailable)",
+    ]
+    if prior is not None:
+        lines += [
+            "",
+            "=== YOUR PREVIOUS ATTEMPT ===",
+            (prior.get("code") or "")[:4000],
+            "=== WHAT HAPPENED WHEN IT RAN ===",
+            prior.get("observation", "")[:1800],
+            "Refine: if it failed to compile, fix the exact error. If the test PASSED (invariant held), your "
+            "sequence or values did not trigger the bug — try a materially different attack. If it errored at "
+            "runtime, fix the setup.",
+        ]
+    lines.append("Return ONLY the corrected Solidity test in a single ```solidity block.")
+    return "\n".join(lines)
+
+
+def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
+    """Execution-grounded reasoning loop for one hypothesis.
+
+    Authors a runnable Foundry test that asserts the hypothesis's invariant, runs
+    it in an isolated worktree, observes whether the invariant breaks (a failing
+    assertion = confirmed bug), and iterates — feeding the compile error or run
+    outcome back to the author to refine the exploit. This proves multi-step
+    economic bugs by *running numbers*, which prose reasoning alone cannot.
+    """
+    if not state.get("use_llm_refiner", False):
+        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="LLM disabled; exploit loop skipped.")
+    hypothesis = inp.hypothesis or (state.get("hypotheses") or [None])[0]
+    if hypothesis is None:
+        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="No hypothesis for exploit loop.")
+    if shutil.which("forge") is None:
+        return DynamicGenericOutput(status=ToolStatus.UNAVAILABLE, message="forge is not installed.")
+    from sentinel.config import get_settings
+
+    settings = get_settings()
+    max_iters = settings.exploit_loop_max_iterations
+    if max_iters <= 0:
+        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="Exploit loop disabled (max_iterations=0).")
+    fixture = _detect_test_fixture(inp.repo_path)
+    if not fixture:
+        return DynamicGenericOutput(status=ToolStatus.SKIPPED, message="No test fixture to inherit; exploit loop skipped.")
+
+    from sentinel.llm import provider as llm_provider
+    from sentinel.llm.ollama import extract_solidity_code
+
+    try:
+        author = llm_provider.get_poc_author(mock=False)
+    except Exception as exc:
+        return DynamicGenericOutput(status=ToolStatus.ERROR, message=f"PoC author unavailable: {type(exc).__name__}: {exc}")
+
+    run_dir = Path(state.get("run_dir", "runs/tmp"))
+    hyp_slug = re.sub(r"[^A-Za-z0-9_]", "_", hypothesis.id)[:24]
+    worktree = run_dir / "artifacts" / f"exploit-worktree-{hyp_slug}"
+    _copy_repo_for_validation(inp.repo_path, worktree)
+    test_dir = worktree / "test"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    _, _contract, target_function = _target_details(hypothesis)
+    test_path = test_dir / f"Sentinel{re.sub(r'[^A-Za-z0-9_]', '', target_function)[:24]}Exploit_{hyp_slug}.t.sol"
+    target_file = _target_details(hypothesis)[0]
+    target_path = Path(inp.repo_path) / target_file
+    target_source = target_path.read_text(encoding="utf-8", errors="replace")[:14000] if target_path.exists() else ""
+    timeout = settings.forge_command_timeout
+
+    try:
+        repairer = llm_provider.get_poc_repairer(mock=False)
+    except Exception:
+        repairer = None
+    max_compile_fixes = max(1, settings.poc_repair_max_attempts + 1)
+
+    def _compile_until_ok(code: str) -> tuple[bool, str, str]:
+        """Mechanical compile-repair sub-loop: fix solc errors until it builds.
+
+        Separating this from semantic refinement means a *near-correct* PoC is
+        driven to a compiling state (feeding solc errors + the real target source
+        back to the repairer) instead of being skipped on the first error.
+        """
+        last_err = ""
+        for fix in range(max_compile_fixes):
+            test_path.write_text(code, encoding="utf-8")
+            result = run_command(["forge", "build", "--offline"], cwd=str(worktree), timeout=timeout)
+            if result.return_code == 0:
+                return True, code, ""
+            last_err = _clean_output(result.stderr[-1800:] or result.stdout[-1800:])
+            history.append(f"  compile fix {fix + 1}/{max_compile_fixes}")
+            if repairer is None or fix == max_compile_fixes - 1:
+                break
+            repair_prompt = _build_poc_repair_prompt(code, _resolve_imported_sources(inp.repo_path, code), last_err)
+            try:
+                fixed = extract_solidity_code(repairer.repair(repair_prompt))
+            except Exception:
+                fixed = ""
+            if not fixed or fixed.strip() == code.strip():
+                break
+            code = fixed
+        return False, code, last_err
+
+    history: list[str] = []
+    verdict = "inconclusive"
+    classification = "not_run"
+    result_summary = ""
+    prior: dict | None = None
+    for attempt in range(1, max_iters + 1):
+        prompt = _build_exploit_author_prompt(hypothesis, target_source, fixture, prior)
+        try:
+            raw = author.author(prompt)
+        except Exception:
+            try:
+                raw = llm_provider.get_ollama_fallback_poc_author().author(prompt)
+            except Exception:
+                history.append(f"iter {attempt}: author unavailable")
+                break
+        code = extract_solidity_code(raw) or raw
+        if not code or "pragma solidity" not in code:
+            history.append(f"iter {attempt}: no test authored")
+            break
+        # 1) Drive it to a COMPILING state (mechanical, retried hard).
+        compiled, code, compile_err = _compile_until_ok(code)
+        if not compiled:
+            prior = {"code": code, "observation": f"STILL FAILS TO COMPILE after repair attempts:\n{compile_err}"}
+            history.append(f"iter {attempt}: not compiling")
+            continue
+        # 2) Run it and INFER the result from what actually executed.
+        run_result = run_command(["forge", "test", "--offline", "--match-contract", "Sentinel"], cwd=str(worktree), timeout=timeout)
+        classification = _classify_validation_run(run_result.return_code, run_result.stdout, run_result.stderr, run_result.timed_out)
+        result_summary = _extract_forge_result_summary(run_result.stdout, run_result.stderr)
+        history.append(f"iter {attempt}: ran -> {classification} | {result_summary}")
+        if classification == "security_invariant_violation_or_test_needs_review":
+            verdict = "confirmed"  # the asserted invariant broke when executed
+            break
+        if classification in _VALIDATION_FAILURE_CLASSIFICATIONS:
+            prior = {"code": code, "observation": f"RUNTIME ERROR when run: {result_summary}\n{_clean_output(run_result.stderr[-1200:] or run_result.stdout[-1200:])}"}
+            continue
+        # 3) Compiled + ran + passed -> invariant HELD. Refine the attack.
+        verdict = "refuted"
+        prior = {"code": code, "observation": f"TEST PASSED — invariant HELD ({result_summary}). Your attack did not trigger the bug; try a materially different sequence/values."}
+
+    manifest = {
+        "hypothesis_id": hypothesis.id,
+        "verdict": verdict,
+        "classification": classification,
+        "result_summary": result_summary,
+        "iterations": len(history),
+        "history": history,
+        "test_path": str(test_path) if test_path.exists() else None,
+    }
+    manifest_path = run_dir / "artifacts" / f"exploit-result-{hyp_slug}.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    state.setdefault("artifacts", []).append(
+        ArtifactRef(kind="exploit_loop_result", path=str(manifest_path), description=f"Execution-grounded exploit loop for {hypothesis.id}: {verdict}.")
+    )
+    if verdict == "confirmed":
+        # An executed PoC broke the invariant: this is real proof.
+        hypothesis.proof_status = "executed_poc_confirmed"
+        state.setdefault("artifacts", []).append(
+            ArtifactRef(kind="foundry_exploit_test", path=str(test_path), description=f"Executed PoC that breaks the invariant for {hypothesis.id}.")
+        )
+    return DynamicGenericOutput(status=ToolStatus.OK, message=f"Exploit loop verdict: {verdict} ({classification}).", data=manifest)
+
+
 def register(registry) -> None:
     specs = [
         ("create_poc_test", "Create a PoC test plan.", PocInput, create_poc_test),
@@ -1147,10 +1354,11 @@ def register(registry) -> None:
         ("generate_validation_artifacts", "Generate reviewable Foundry validation test artifacts under the run directory.", PocInput, generate_validation_artifacts),
         ("compile_validation_artifacts", "Compile generated validation tests in a non-mutating temporary worktree.", ValidationCompileInput, compile_validation_artifacts),
         ("repair_validation_artifacts", "Repair a non-compiling generated PoC by feeding the solc error and real target source back to the LLM.", ValidationCompileInput, repair_validation_artifacts),
+        ("author_and_run_exploit", "Execution-grounded loop: author a runnable test asserting the invariant, run it, observe if it breaks, and refine.", PocInput, author_and_run_exploit),
         ("run_validation_artifacts", "Run generated validation tests in a non-mutating temporary worktree and classify the result.", ValidationCompileInput, run_validation_artifacts),
     ]
     for name, description, input_model, fn in specs:
-        if name in {"compile_validation_artifacts", "run_validation_artifacts", "repair_validation_artifacts"}:
+        if name in {"compile_validation_artifacts", "run_validation_artifacts", "repair_validation_artifacts", "author_and_run_exploit"}:
             side_effects = [SideEffect.WRITE_FILES, SideEffect.EXECUTE_LOCAL]
         elif name in {"patch_poc_test", "generate_validation_artifacts", "run_semantic_validation"}:
             side_effects = [SideEffect.WRITE_FILES]

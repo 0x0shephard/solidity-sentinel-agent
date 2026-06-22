@@ -7,7 +7,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
 from sentinel.errors import NonRetryableExternalError
-from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BasePlanner, BasePocAuthor, BasePocRepairer, BaseResearchRefiner, ToolPlan
+from sentinel.llm.base import BaseAdversarialReviewer, BaseHypothesisProposer, BaseInvariantInferencer, BaseInvariantReasoner, BasePlanner, BasePocAuthor, BasePocRepairer, BaseResearchRefiner, ToolPlan
 from sentinel.llm.resilience import invoke_chat
 from sentinel.schemas.research import AdversarialVerdict, ProposedHypothesisBatch, ResearchRefinement
 
@@ -316,12 +316,137 @@ class OllamaHypothesisProposer(BaseHypothesisProposer):
 
     def propose(self, prompt: str) -> ProposedHypothesisBatch:
         self.last_raw = ""
-        response = invoke_chat(self.llm, 
+        response = invoke_chat(self.llm,
             [SystemMessage(content=_PROPOSER_SYSTEM), HumanMessage(content=prompt)]
         )
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
         self.last_raw = content
         return parse_proposed_hypotheses(content)
+
+
+def coerce_inferred_invariant(payload: dict) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    statement = str(payload.get("statement") or payload.get("invariant") or payload.get("title") or "").strip()
+    if not statement:
+        return None
+
+    def _as_list(*keys):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
+            if isinstance(value, list):
+                return [str(item).strip() for item in value if item is not None and str(item).strip()]
+        return []
+
+    try:
+        confidence = float(payload.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    return {
+        "statement": statement[:300],
+        "category": str(payload.get("category") or payload.get("class") or "accounting").strip()[:60],
+        "contracts": _as_list("contracts", "affected_contracts", "contract")[:6],
+        "functions": _as_list("functions", "affected_functions", "function")[:8],
+        "state_variables": _as_list("state_variables", "affected_state_variables", "variables", "state")[:8],
+        "rationale": str(payload.get("rationale") or payload.get("reasoning") or "")[:800],
+        "confidence": max(0.0, min(1.0, confidence)),
+    }
+
+
+_INVARIANT_LIST_KEYS = ("invariants", "candidates", "results", "items")
+
+
+def parse_inferred_invariants(content: str) -> "InferredInvariantBatch":
+    from sentinel.schemas.research import InferredInvariantBatch
+
+    payload = _extract_json_value(content)
+    raw_list: list = []
+    if isinstance(payload, list):
+        raw_list = payload
+    elif isinstance(payload, dict):
+        for key in _INVARIANT_LIST_KEYS:
+            value = payload.get(key)
+            if isinstance(value, list):
+                raw_list = value
+                break
+        else:
+            if payload.get("statement") or payload.get("invariant"):
+                raw_list = [payload]
+    coerced = [item for item in (coerce_inferred_invariant(entry) for entry in raw_list) if item]
+    return InferredInvariantBatch.model_validate({"invariants": coerced})
+
+
+_INVARIANT_INFERENCE_SYSTEM = (
+    "You are Solidity Sentinel's invariant inference engine. From the supplied protocol source, infer the 5 to 10 "
+    "most security-critical invariants THIS protocol relies on — the guarantees that, if broken, cause loss of funds "
+    "or insolvency. Be protocol-specific, not generic: e.g. 'total deposited assets equals the sum of user balances', "
+    "'a fee accrues exactly once per report timestamp', 'a position's debt in each pool is independently "
+    "collateralized', 'shares are monotonic in deposited assets'. Cover value conservation, fee/interest accrual, "
+    "share/asset accounting, access/lifecycle, and cross-contract/position isolation. "
+    "Return ONLY JSON: "
+    '{"invariants":[{"statement":"...","category":"accounting|access|lifecycle|oracle|isolation",'
+    '"contracts":["..."],"functions":["..."],"state_variables":["..."],"rationale":"why it must hold and what '
+    'breaks if it does not","confidence":0.0}]}. '
+    "Every function and contract name MUST appear verbatim in the supplied source; never invent names."
+)
+
+
+_INVARIANT_VIOLATION_SYSTEM = (
+    "You are Solidity Sentinel's invariant-violation engine, a senior protocol auditor hunting NOVEL bugs. You are "
+    "given this specific protocol's candidate invariants (guarantees the code relies on) and, for each, the real "
+    "source of the functions that read/write the involved state, plus cross-contract call paths. "
+    "For EACH invariant, think adversarially: can a concrete sequence of calls break it? Consider sequences that are "
+    "MULTI-STEP, MULTI-CONTRACT, REPEATED, or use boundary VALUES (e.g. type(uint).max, 1 wei, zero, first depositor). "
+    "Reason about value conservation (assets vs shares/debt), fee/interest accrual counted once vs repeatedly, "
+    "rounding that compounds, state that is shared across pools/positions when it should be isolated, and ordering "
+    "of external calls vs accounting. Do NOT report generic pattern bugs — only concrete violations of a stated "
+    "invariant with the exact breaking sequence. "
+    "Return ONLY JSON: "
+    '{"hypotheses":[{"title":"...","vulnerability_class":"...","affected_file":"...","affected_function":"...",'
+    '"affected_contract":"...","reasoning":"the invariant, and the ordered call sequence (with values) that breaks it",'
+    '"exploit_preconditions":["..."],"confidence":0.0}]}. '
+    "Every affected_file and affected_function MUST be copied verbatim from a '// file: ... | function: ...' header "
+    "in the supplied source; never invent files, functions, or line numbers. Prefer the entry-point function where "
+    "the violating sequence is triggered. Return [] if no invariant can be broken."
+)
+
+
+class OllamaInvariantReasoner(BaseInvariantReasoner):
+    def __init__(self, model: str, base_url: str, api_key: str | None = None, llm: ChatOllama | None = None) -> None:
+        self.llm = llm or ChatOllama(
+            model=model,
+            base_url=base_url,
+            temperature=0.0,
+            format="json",
+            client_kwargs=_ollama_client_kwargs(api_key),
+        )
+
+    def reason(self, prompt: str) -> ProposedHypothesisBatch:
+        self.last_raw = ""
+        response = invoke_chat(self.llm, [SystemMessage(content=_INVARIANT_VIOLATION_SYSTEM), HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        self.last_raw = content
+        return parse_proposed_hypotheses(content)
+
+
+class OllamaInvariantInferencer(BaseInvariantInferencer):
+    def __init__(self, model: str, base_url: str, api_key: str | None = None, llm: ChatOllama | None = None) -> None:
+        self.llm = llm or ChatOllama(
+            model=model,
+            base_url=base_url,
+            temperature=0.0,
+            format="json",
+            client_kwargs=_ollama_client_kwargs(api_key),
+        )
+
+    def infer(self, prompt: str):
+        self.last_raw = ""
+        response = invoke_chat(self.llm, [SystemMessage(content=_INVARIANT_INFERENCE_SYSTEM), HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        self.last_raw = content
+        return parse_inferred_invariants(content)
 
 
 class OllamaPlanner(BasePlanner):

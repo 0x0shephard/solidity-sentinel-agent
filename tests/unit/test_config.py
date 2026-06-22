@@ -11,7 +11,7 @@ def test_settings_read_huggingface_defaults(monkeypatch):
     assert settings.model == "Qwen/Qwen2.5-Coder-32B-Instruct"
     assert settings.ollama_base_url == "http://localhost:11434"
     assert settings.ollama_api_key is None
-    assert settings.ollama_fallback_model == "qwen2.5-coder:7b"
+    assert settings.ollama_fallback_model == "qwen3-coder-next"
     assert settings.rag_embed_model == "sentence-transformers/all-MiniLM-L6-v2"
 
 

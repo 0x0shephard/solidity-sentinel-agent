@@ -84,6 +84,11 @@ _RETRYABLE_MARKERS = (
     "502",
     "overloaded",
     "service unavailable",
+    # Ollama Cloud intermittently routes a tagged model (e.g. "qwen3-coder:480b")
+    # to a backend that rejects the tag with a transient 400; retry the SAME model
+    # rather than silently downgrading to the weaker fallback.
+    "model_not_supported",
+    "provider or policy you attempted to specify",
 )
 
 

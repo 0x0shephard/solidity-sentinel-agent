@@ -221,8 +221,126 @@ def test_proposer_context_covers_every_contract_breadth(tmp_path, monkeypatch):
     }
 
     # Tight budget: only 3 blocks. Breadth must still surface all 3 contracts.
-    monkeypatch.setattr(research, "_PROPOSER_MAX_BLOCKS", 3)
+    monkeypatch.setenv("SENTINEL_PROPOSER_MAX_FUNCTIONS", "3")
     context = _proposer_code_context(state, str(tmp_path))
     assert "ContractA" in context
     assert "ContractB" in context  # would be dropped without the breadth pass
     assert "ContractC" in context
+
+
+def test_reason_invariant_violations_grounds_and_tags(monkeypatch, tmp_path):
+    from sentinel.schemas.invariants import InvariantCandidate
+
+    repo = _vault_repo(tmp_path)
+    state = initial_audit_state("inv", str(repo), "Find invariant violations", "runs/inv")
+    state["use_llm_refiner"] = True
+    executor = ToolExecutor(build_default_registry())
+    executor.execute("audit.run_static_analysis", {"repo_path": str(repo)}, state)
+
+    # The reasoner needs candidate invariants to anchor on.
+    state["invariant_candidates"] = [
+        InvariantCandidate(
+            id="inv-1", invariant_type="ownership_integrity", description="owner can only be set once",
+            affected_contracts=["Vault"], affected_functions=["setOwner"], affected_state_variables=["owner"],
+            recommended_validation_template="generic", confidence=0.6,
+        )
+    ]
+
+    class FakeReasoner:
+        last_raw = ""
+
+        def reason(self, prompt):
+            return ProposedHypothesisBatch(
+                hypotheses=[
+                    ProposedHypothesis(
+                        title="owner can be overwritten by anyone, breaking ownership invariant",
+                        vulnerability_class="missing_access_control",
+                        affected_file="src/Vault.sol", affected_function="setOwner",
+                        reasoning="Call setOwner twice from different addresses; the invariant 'set once' breaks.",
+                        exploit_preconditions=["attacker calls setOwner after owner is set"],
+                        confidence=0.8,
+                    ),
+                    ProposedHypothesis(
+                        title="hallucinated", vulnerability_class="reentrancy",
+                        affected_file="src/Ghost.sol", affected_function="nope", confidence=0.9,
+                    ),
+                ]
+            )
+
+    monkeypatch.setattr(provider, "get_invariant_reasoner", lambda mock=False: FakeReasoner())
+
+    out = executor.execute(
+        "research.reason_invariant_violations",
+        {"repo_path": str(repo), "objective": "Find invariant violations"},
+        state,
+    )
+    assert out.proposed_count == 2
+    assert out.grounded_count == 1            # hallucinated Ghost.sol dropped
+    assert out.dropped_count == 1
+    h = out.hypotheses[0]
+    assert h.affected_functions == ["setOwner"]
+    assert h.id.startswith("inv-hyp-")
+    assert "invariant_reasoner" in h.source_detection_ids
+
+
+def test_reason_invariant_violations_skips_without_invariants(tmp_path):
+    repo = _vault_repo(tmp_path)
+    state = initial_audit_state("inv2", str(repo), "x", "runs/inv2")
+    state["use_llm_refiner"] = True
+    # no invariant_candidates set -> skip cleanly
+    out = ToolExecutor(build_default_registry()).execute(
+        "research.reason_invariant_violations", {"repo_path": str(repo)}, state
+    )
+    assert out.hypotheses == []
+    assert any("invariant" in n.lower() for n in out.notes)
+
+
+def test_infer_protocol_invariants_grounds_and_drops(monkeypatch, tmp_path):
+    from sentinel.schemas.research import InferredInvariant, InferredInvariantBatch
+
+    repo = _vault_repo(tmp_path)
+    state = initial_audit_state("infer", str(repo), "x", "runs/infer")
+    state["use_llm_refiner"] = True
+    executor = ToolExecutor(build_default_registry())
+    executor.execute("audit.run_static_analysis", {"repo_path": str(repo)}, state)
+
+    class FakeInferencer:
+        last_raw = ""
+
+        def infer(self, prompt):
+            return InferredInvariantBatch(
+                invariants=[
+                    InferredInvariant(statement="owner is set exactly once", category="access",
+                                      functions=["setOwner"], state_variables=["owner"], confidence=0.7),
+                    # contract-qualified name should still ground to setOwner
+                    InferredInvariant(statement="only owner mutates owner", category="access",
+                                      functions=["Vault.setOwner"], confidence=0.6),
+                    # references only a non-existent function -> dropped as hallucinated
+                    InferredInvariant(statement="ghost holds", category="accounting", functions=["doesNotExist"], confidence=0.9),
+                    # no functions named -> kept as a general invariant
+                    InferredInvariant(statement="protocol stays solvent", category="accounting", confidence=0.5),
+                ]
+            )
+
+    monkeypatch.setattr(provider, "get_invariant_inferencer", lambda mock=False: FakeInferencer())
+
+    from sentinel.tools.research import infer_protocol_invariants
+    out = infer_protocol_invariants(state)
+    statements = [c.description for c in out]
+    assert "owner is set exactly once" in statements      # grounded to real setOwner
+    assert "protocol stays solvent" in statements          # general invariant kept
+    assert all("ghost" not in s for s in statements)       # hallucinated dropped
+    grounded = next(c for c in out if c.description == "owner is set exactly once")
+    assert grounded.affected_functions == ["setOwner"]
+    assert grounded.detector_ids == ["invariant_inferencer"]
+    # contract-qualified name grounded to the bare function name
+    qualified = next(c for c in out if c.description == "only owner mutates owner")
+    assert qualified.affected_functions == ["setOwner"]
+
+
+def test_infer_protocol_invariants_skips_without_llm(tmp_path):
+    from sentinel.tools.research import infer_protocol_invariants
+    repo = _vault_repo(tmp_path)
+    state = initial_audit_state("infer2", str(repo), "x", "runs/infer2")
+    # use_llm_refiner defaults False
+    assert infer_protocol_invariants(state) == []
