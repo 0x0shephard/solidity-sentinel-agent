@@ -1432,7 +1432,7 @@ def _merge_model_proposed_hypotheses(state: AuditState) -> None:
     proposed = _run_tool(
         state,
         "research.propose_hypotheses",
-        {"repo_path": state["repo_path"], "objective": state["objective"], "max_hypotheses": 6},
+        {"repo_path": state["repo_path"], "objective": state["objective"], "max_hypotheses": get_settings().max_hypotheses_proposed},
     )
     model_hypotheses = list(getattr(proposed, "hypotheses", []) or [])
     if not model_hypotheses:
@@ -1479,7 +1479,7 @@ def _merge_invariant_violation_hypotheses(state: AuditState) -> None:
     reasoned = _run_tool(
         state,
         "research.reason_invariant_violations",
-        {"repo_path": state["repo_path"], "objective": state["objective"], "max_hypotheses": 6},
+        {"repo_path": state["repo_path"], "objective": state["objective"], "max_hypotheses": get_settings().max_hypotheses_proposed},
     )
     violation_hypotheses = list(getattr(reasoned, "hypotheses", []) or [])
     if not violation_hypotheses:
@@ -1507,7 +1507,34 @@ def _merge_invariant_violation_hypotheses(state: AuditState) -> None:
     )
 
 
-def _select_hypotheses_for_deepening(hypotheses: list[VulnerabilityHypothesis], max_items: int = 10) -> list[VulnerabilityHypothesis]:
+_EXPLOIT_ECONOMIC_CLASSES = {
+    "accounting", "accounting_invariant", "business_logic", "fee", "rounding",
+    "share_accounting", "incorrect_validation",
+}
+
+
+def _select_for_exploit_loop(hypotheses: list[VulnerabilityHypothesis], cap: int) -> list[VulnerabilityHypothesis]:
+    """Pick exploit-loop targets the loop is actually designed for.
+
+    The loop proves multi-step economic/accounting bugs by running an invariant
+    test. Ranking-by-score alone favoured already-found detector hypotheses
+    (oracle/approve), wasting the loop. Prioritise hypotheses that carry a concrete
+    invariant or an economic class, then fall back to the ranked set.
+    """
+    deepened = _select_hypotheses_for_deepening(hypotheses)
+
+    def is_invariant_testable(h: VulnerabilityHypothesis) -> bool:
+        has_invariant = bool((getattr(h, "required_proof", "") or "").strip())
+        is_economic = (h.vulnerability_class or "") in _EXPLOIT_ECONOMIC_CLASSES
+        from_engine = any("invariant" in str(s).lower() for s in (h.source_detection_ids or []))
+        return has_invariant or is_economic or from_engine
+
+    preferred = [h for h in deepened if is_invariant_testable(h)]
+    rest = [h for h in deepened if not is_invariant_testable(h)]
+    return (preferred + rest)[:cap]
+
+
+def _select_hypotheses_for_deepening(hypotheses: list[VulnerabilityHypothesis], max_items: int | None = None) -> list[VulnerabilityHypothesis]:
     """Choose a diversified evidence-backed set for expensive RAG/research/validation work.
 
     Scores hypotheses by confidence + proof status + evidence/graph signals (with
@@ -1517,10 +1544,12 @@ def _select_hypotheses_for_deepening(hypotheses: list[VulnerabilityHypothesis], 
 
     Args:
         hypotheses: All ranked hypotheses.
-        max_items: Maximum number to deepen (default 10).
+        max_items: Maximum number to deepen; defaults to settings.max_hypotheses_deepened.
     Returns:
         The selected, de-duplicated list of hypotheses to deepen.
     """
+    if max_items is None:
+        max_items = get_settings().max_hypotheses_deepened
     selected: list[VulnerabilityHypothesis] = []
     selected_ids: set[str] = set()
 
@@ -1729,21 +1758,25 @@ def finish(state: AuditState) -> AuditState:
     hypotheses = state.get("hypotheses", [])
     if hypotheses:
         for hypothesis in _select_hypotheses_for_deepening(hypotheses):
-            semantic_validation = _run_tool(
-                state,
-                "dynamic.run_semantic_validation",
-                {"repo_path": repo_path, "hypothesis": hypothesis.model_dump(mode="json")},
-            )
-            validation_data = getattr(semantic_validation, "data", {}) if semantic_validation else {}
-            if validation_data.get("validated"):
-                hypothesis.proof_status = validation_data.get("proof_status", "static_proof_complete")
-                if validation_data.get("counterevidence"):
-                    hypothesis.counterevidence.extend(validation_data["counterevidence"])
-            _run_tool(
-                state,
-                "dynamic.generate_validation_artifacts",
-                {"repo_path": repo_path, "hypothesis": hypothesis.model_dump(mode="json")},
-            )
+            # One bad hypothesis must never kill a multi-hour run; isolate failures.
+            try:
+                semantic_validation = _run_tool(
+                    state,
+                    "dynamic.run_semantic_validation",
+                    {"repo_path": repo_path, "hypothesis": hypothesis.model_dump(mode="json")},
+                )
+                validation_data = getattr(semantic_validation, "data", {}) if semantic_validation else {}
+                if validation_data.get("validated"):
+                    hypothesis.proof_status = validation_data.get("proof_status", "static_proof_complete")
+                    if validation_data.get("counterevidence"):
+                        hypothesis.counterevidence.extend(validation_data["counterevidence"])
+                _run_tool(
+                    state,
+                    "dynamic.generate_validation_artifacts",
+                    {"repo_path": repo_path, "hypothesis": hypothesis.model_dump(mode="json")},
+                )
+            except Exception as exc:
+                state.setdefault("warnings", []).append(f"Validation skipped for {hypothesis.id}: {type(exc).__name__}: {exc}")
     else:
         _run_tool(state, "dynamic.generate_validation_artifacts", {"repo_path": repo_path})
     compile_output = _run_tool(state, "dynamic.compile_validation_artifacts", {"repo_path": repo_path})
@@ -1757,13 +1790,23 @@ def finish(state: AuditState) -> AuditState:
     # breaks, and refine — proving multi-step economic bugs by running numbers.
     if hypotheses and state.get("use_llm_refiner", False):
         exploit_cap = get_settings().exploit_loop_max_hypotheses
-        for hypothesis in _select_hypotheses_for_deepening(hypotheses)[:exploit_cap]:
+        for hypothesis in _select_for_exploit_loop(hypotheses, exploit_cap):
             emit_progress(f"  exploit loop: authoring + running PoC for {hypothesis.id}…")
-            _run_tool(
-                state,
-                "dynamic.author_and_run_exploit",
-                {"repo_path": repo_path, "hypothesis": hypothesis.model_dump(mode="json")},
-            )
+            try:
+                exploit_out = _run_tool(
+                    state,
+                    "dynamic.author_and_run_exploit",
+                    {"repo_path": repo_path, "hypothesis": hypothesis.model_dump(mode="json")},
+                )
+                # The tool ran against a serialized copy; apply a CONFIRMED verdict to
+                # the live hypothesis so the executed PoC upgrades the finding
+                # (confirmed status + lifted confidence cap).
+                if getattr(exploit_out, "data", {}).get("verdict") == "confirmed":
+                    hypothesis.proof_status = "executed_poc_confirmed"
+                    hypothesis.status = "confirmed"
+                    emit_progress(f"  ✓ exploit CONFIRMED for {hypothesis.id} — executed PoC broke the invariant")
+            except Exception as exc:
+                state.setdefault("warnings", []).append(f"Exploit loop skipped for {hypothesis.id}: {type(exc).__name__}: {exc}")
     run_dir = Path(state["run_dir"])
     if state.get("proof_packets"):
         write_json(run_dir / "proof_packets.json", [packet.model_dump(mode="json") for packet in state["proof_packets"]])

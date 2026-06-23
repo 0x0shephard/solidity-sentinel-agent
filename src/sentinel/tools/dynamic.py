@@ -50,8 +50,11 @@ def _contract_name_from_file(file_path: str) -> str:
 def _artifact_test_name(hypothesis: VulnerabilityHypothesis) -> str:
     function_name = (hypothesis.affected_functions or ["target"])[0]
     cleaned = re.sub(r"[^A-Za-z0-9_]", "_", function_name)
-    class_name = hypothesis.vulnerability_class.title().replace("_", "")
-    return f"Sentinel{class_name}{cleaned[:32]}Test.t.sol"
+    # Strip ALL non-alphanumerics from the class: an LLM-inferred class can contain
+    # "/" or spaces (e.g. "External-Call/Accounting Ordering"), which would make the
+    # filename a bad path and crash write_text.
+    class_name = re.sub(r"[^A-Za-z0-9]", "", hypothesis.vulnerability_class.title())
+    return f"Sentinel{class_name[:40]}{cleaned[:32]}Test.t.sol"
 
 
 def _target_details(hypothesis: VulnerabilityHypothesis) -> tuple[str, str, str]:
@@ -529,6 +532,24 @@ def _validation_artifact_paths(inp: ValidationCompileInput, state) -> list[Path]
     return [Path(path) if Path(path).is_absolute() else Path(path).resolve() for path in raw_paths]
 
 
+def _relax_foundry_warnings(worktree: Path) -> None:
+    """Stop the repo's strict warning/lint policy from failing our generated tests.
+
+    Many repos set ``deny_warnings = true`` (or ``deny = ["warnings"]``), so a
+    benign warning in an authored PoC (e.g. "function can be view", a lint) fails
+    `forge build` even though the test is correct. This was the dominant cause of
+    the exploit loop never running. The worktree is a throwaway copy, so relaxing
+    its config is safe and changes nothing about the audited code.
+    """
+    toml = worktree / "foundry.toml"
+    if not toml.exists():
+        return
+    text = toml.read_text(encoding="utf-8", errors="replace")
+    text = re.sub(r"(?m)^(\s*)deny_warnings\s*=\s*true", r"\1deny_warnings = false", text)
+    text = re.sub(r"(?m)^(\s*)deny\s*=\s*.*warning.*$", r"\1deny = []", text)
+    toml.write_text(text, encoding="utf-8")
+
+
 def _copy_repo_for_validation(repo_path: str, worktree: Path) -> None:
     if worktree.exists():
         shutil.rmtree(worktree)
@@ -538,6 +559,7 @@ def _copy_repo_for_validation(repo_path: str, worktree: Path) -> None:
         return {name for name in names if name in ignored_names}
 
     shutil.copytree(repo_path, worktree, ignore=ignore)
+    _relax_foundry_warnings(worktree)
 
 
 def _prepare_validation_worktree(inp: ValidationCompileInput, state) -> tuple[DynamicGenericOutput | None, Path | None, list[str]]:
@@ -564,21 +586,61 @@ def _prepare_validation_worktree(inp: ValidationCompileInput, state) -> tuple[Dy
     return None, worktree, copied_tests
 
 
-# Classifications that mean the validation did NOT actually run to completion —
-# these are tool/runtime failures, not successful (passed/violated) results.
-_VALIDATION_FAILURE_CLASSIFICATIONS = {"validation_timeout", "validation_runtime_error", "validation_execution_failed"}
+# Classifications that mean the validation did NOT produce a sound result — these
+# are tool/runtime/test-soundness failures, NOT a passed (held) or violated result.
+# A revert that is not an assertion (broken mock, setup revert, failure before the
+# target call) and a skipped/empty run are explicitly here so they can never be
+# misread as "invariant held" or "invariant violated".
+_VALIDATION_FAILURE_CLASSIFICATIONS = {
+    "validation_timeout",
+    "validation_runtime_error",
+    "validation_execution_failed",
+    "validation_skipped_or_empty",
+    "validation_reverted_not_asserted",
+}
+
+
+def _is_assertion_failure(text_lower: str) -> bool:
+    """True only when a forge/forge-std ASSERTION failed (the invariant the test
+    asserts was actually violated) — not a plain revert from setup or a broken mock."""
+    return any(
+        marker in text_lower
+        for marker in ("assertion failed", "not satisfied", "panic: assertion", "panic: assert", "[assertion]")
+    )
 
 
 def _classify_validation_run(return_code: int | None, stdout: str, stderr: str, timed_out: bool) -> str:
     combined = f"{stdout}\n{stderr}"
+    low = combined.lower()
     if timed_out:
         return "validation_timeout"
     if "panicked (crashed)" in combined or "Attempted to create a NULL object" in combined:
         return "validation_runtime_error"
+
+    counts = re.search(r"(\d+)\s+passed[;,]\s*(\d+)\s+failed[;,]\s*(\d+)\s+skipped", low)
+    passed = int(counts.group(1)) if counts else None
+    failed = int(counts.group(2)) if counts else None
+    skipped = int(counts.group(3)) if counts else None
+
+    # Nothing meaningfully executed (vm.skip, all-skipped, or empty) is NOT a result.
+    if "[skip]" in low or (counts and passed == 0 and failed == 0):
+        return "validation_skipped_or_empty"
+
     if return_code == 0:
-        return "security_invariant_held_or_test_passed"
-    if re.search(r"(\d+)\s+failed", combined, flags=re.IGNORECASE) or "Failing tests" in combined or "[FAIL" in combined:
-        return "security_invariant_violation_or_test_needs_review"
+        if counts and passed is not None and passed >= 1 and (failed or 0) == 0:
+            return "security_invariant_held_or_test_passed"
+        if not counts and ("[pass" in low or " passed" in low):
+            return "security_invariant_held_or_test_passed"
+        # Exit 0 but no test actually passed (e.g. only skipped) — not a held result.
+        return "validation_skipped_or_empty"
+
+    # Non-zero exit: a real proof requires an ASSERTION failure (the invariant the
+    # test asserts broke). A bare revert is setup/mock/other failure, not a proof.
+    failed_present = (failed is not None and failed >= 1) or "[fail" in low or "failing tests" in low
+    if failed_present:
+        if _is_assertion_failure(low):
+            return "security_invariant_violation_or_test_needs_review"
+        return "validation_reverted_not_asserted"
     return "validation_execution_failed"
 
 
@@ -776,6 +838,94 @@ def _foundry_test_dir(repo_path: str) -> str:
     return "test"
 
 
+def _extract_pragma(text: str) -> str:
+    match = re.search(r"pragma solidity[^;]+;", text)
+    return match.group(0) if match else "pragma solidity ^0.8.20;"
+
+
+def _fixture_surface(source: str) -> str:
+    """What a test inheriting this fixture can use: its state variables (already
+    deployed instances + actors) and helper function signatures."""
+    body = source
+    # State variables declared at contract scope (deployed instances, actors).
+    state_vars = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        m = re.match(r"^([A-Za-z_][\w\.]*(?:\[\])?)\s+(?:public\s+|internal\s+|private\s+|immutable\s+|constant\s+)*([A-Za-z_]\w*)\s*(?:=|;)", stripped)
+        if m and m.group(1) not in {"function", "return", "emit", "require", "if", "for", "while", "using", "import", "pragma"}:
+            state_vars.append(f"  {m.group(1)} {m.group(2)}")
+    # Helper/exposed function signatures (skip setUp; keep public/internal).
+    helpers = []
+    for m in re.finditer(r"function\s+(\w+)\s*\(([^)]*)\)([^{;]*)", body):
+        name, params, quals = m.group(1), m.group(2).strip(), m.group(3)
+        if name == "setUp":
+            continue
+        vis = "public" if "public" in quals else "external" if "external" in quals else "internal" if "internal" in quals else ""
+        helpers.append(f"  function {name}({params}) {vis}".rstrip())
+    parts = []
+    if state_vars:
+        parts.append("State variables available (already deployed in setUp — USE THESE, do not redeploy):\n" + "\n".join(dict.fromkeys(state_vars))[:2000])
+    if helpers:
+        parts.append("Helper functions available:\n" + "\n".join(dict.fromkeys(helpers))[:1500])
+    return "\n\n".join(parts)
+
+
+def _extract_contract_interface(source: str, contract: str) -> str:
+    """The target contract's real ABI surface: function signatures, structs,
+    enums, custom errors — so the author uses only signatures that exist."""
+    start = source.find(f"contract {contract}")
+    if start == -1:
+        start = source.find(f"abstract contract {contract}")
+    body = source[start:] if start != -1 else source
+    funcs = [f"  function {m.group(1)}({m.group(2).strip()}){m.group(3).rstrip()}".rstrip() for m in re.finditer(r"function\s+(\w+)\s*\(([^)]*)\)([^{;]*)", body)][:60]
+    structs = re.findall(r"struct\s+\w+\s*\{[^}]*\}", body)[:15]
+    errors = re.findall(r"error\s+\w+\s*\([^)]*\)\s*;", body)[:20]
+    enums = re.findall(r"enum\s+\w+\s*\{[^}]*\}", body)[:10]
+    parts = []
+    if funcs:
+        parts.append("Functions:\n" + "\n".join(funcs))
+    if structs:
+        parts.append("Structs:\n" + "\n".join(structs))
+    if enums:
+        parts.append("Enums:\n" + "\n".join(enums))
+    if errors:
+        parts.append("Custom errors:\n" + "\n".join(errors))
+    return "\n".join(parts)
+
+
+def _find_example_test(repo_path: str, fixture_file: str) -> str:
+    """A real, compiling test function from the suite for the author to mimic."""
+    test_dir = Path(repo_path) / _foundry_test_dir(repo_path)
+    if not test_dir.exists():
+        return ""
+    fixture = Path(fixture_file)
+    for path in sorted(test_dir.rglob("*.sol")):
+        if path == fixture:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Grab the imports + the first test function body as a concrete pattern.
+        imports = "\n".join(re.findall(r"^import[^;]+;", text, flags=re.MULTILINE)[:8])
+        m = re.search(r"function\s+test\w*\s*\([^)]*\)[^{]*\{", text)
+        if not m:
+            continue
+        # balance braces to capture the function body
+        depth, end = 0, None
+        for i in range(m.start(), min(len(text), m.start() + 2500)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end:
+            return f"{imports}\n\n{text[m.start():end]}"
+    return ""
+
+
 def _detect_test_fixture(repo_path: str, max_source_chars: int = 16000) -> dict | None:
     """Find the protocol's own base test fixture for PoC inheritance.
 
@@ -816,30 +966,90 @@ def _detect_test_fixture(repo_path: str, max_source_chars: int = 16000) -> dict 
     if deploy_score(text) < 3 and inherit_counts.get(name, 0) == 0:
         return None
     rel = path.relative_to(test_dir).as_posix()
-    return {"name": name, "import_path": f"./{rel}", "file": str(path), "source": text[:max_source_chars]}
+    return {
+        "name": name,
+        # Generated tests are written at the test-dir root, so the relative import
+        # to the fixture is exactly its path under test/ (e.g. ./integration/Base.t.sol).
+        "import_path": f"./{rel}",
+        "file": str(path),
+        "rel": rel,
+        "pragma": _extract_pragma(text),
+        "surface": _fixture_surface(text),
+        "example_test": _find_example_test(repo_path, str(path)),
+        "source": text[:max_source_chars],
+    }
+
+
+def _compilable_test_prompt(hypothesis: VulnerabilityHypothesis, target_source: str, fixture: dict, task: str, skeleton: str = "") -> list[str]:
+    """Shared, heavily-grounded context so the authored test actually COMPILES."""
+    target_file, target_contract, target_function = _target_details(hypothesis)
+    interface = _extract_contract_interface(target_source, target_contract)
+    test_contract = f"Sentinel{re.sub(r'[^A-Za-z0-9]', '', target_function)[:24]}Test"
+    lines = [
+        f"Hypothesis: {hypothesis.title}",
+        f"Affected: {target_contract}.{target_function} ({target_file})",
+        f"Why it may be exploitable: {hypothesis.evidence_summary}",
+        "",
+        "Write a Foundry test that COMPILES and runs. Follow these rules EXACTLY:",
+        f"  - First line: {fixture.get('pragma', 'pragma solidity ^0.8.20;')}",
+        f"  - Import the fixture VERBATIM: import {{{fixture['name']}}} from \"{fixture['import_path']}\";",
+        f"  - Declare exactly: contract {test_contract} is {fixture['name']} {{ ... }}",
+        "  - The fixture's setUp() already deploys the whole system — DO NOT redeploy. Use the exposed state variables.",
+        "  - Call ONLY functions/structs/errors that appear in the interfaces below — never invent members.",
+        "  - Declare every contract/interface/library at FILE SCOPE; NEVER nest one inside another.",
+        "  - You inherit forge-std Test, so use vm.* cheatcodes (vm.prank, vm.deal, vm.expectRevert, etc.) directly.",
+        "",
+        f"=== WHAT THE FIXTURE {fixture['name']} EXPOSES ===",
+        fixture.get("surface") or "(parse fixture source below)",
+    ]
+    if fixture.get("example_test"):
+        lines += [
+            "",
+            "=== A REAL TEST FROM THIS REPO THAT COMPILES — mimic its setup/cheatcode/fixture-usage style "
+            "(but use the EXACT import line specified above, not this example's) ===",
+            fixture["example_test"][:2500],
+        ]
+    lines += [
+        "",
+        f"=== TARGET CONTRACT {target_contract} INTERFACE (use only these signatures) ===",
+        interface or "(interface unavailable)",
+        "",
+        "=== fixture source (for reference) ===",
+        (fixture.get("source") or "")[:9000],
+    ]
+    if skeleton:
+        lines += [
+            "",
+            "=== THIS MINIMAL TEST ALREADY COMPILES IN THIS REPO. Start from it verbatim (keep its pragma, import, "
+            "contract declaration and setUp usage) and ADD the attack + assertion inside the test function. Do not "
+            "change the imports or contract header. ===",
+            skeleton[:4000],
+        ]
+    lines += [
+        "",
+        task,
+        "Return ONLY the corrected Solidity test in a single ```solidity block, no prose.",
+    ]
+    return lines
+
+
+def _build_minimal_skeleton_prompt(hypothesis: VulnerabilityHypothesis, target_source: str, fixture: dict) -> str:
+    """Prompt for the SMALLEST test that compiles — locks in imports/fixture/pragma
+    before the model has to get the full attack right."""
+    task = (
+        "TASK: write the SMALLEST possible test that COMPILES — nothing else. The test body should make ONE simple "
+        "call to a real function on a fixture-exposed contract (or just read one value) and end with assertTrue(true). "
+        "No attack, no complex logic. The ONLY goal is a clean compile that establishes correct imports/fixture/pragma."
+    )
+    return "\n".join(_compilable_test_prompt(hypothesis, target_source, fixture, task))
 
 
 def _build_poc_author_prompt(hypothesis: VulnerabilityHypothesis, target_source: str, fixture: dict) -> str:
-    target_file, target_contract, target_function = _target_details(hypothesis)
     return "\n".join(
-        [
-            f"Hypothesis: {hypothesis.title}",
-            f"Vulnerability class: {hypothesis.vulnerability_class}",
-            f"Affected: {target_contract}.{target_function} ({target_file})",
-            f"Why it may be exploitable: {hypothesis.evidence_summary}",
-            "",
-            f"Inherit this fixture: contract Sentinel...Test is {fixture['name']}",
-            f'Import it as: import {{{fixture["name"]}}} from "{fixture["import_path"]}";',
-            "",
-            "=== fixture source (reuse its setUp/deploy helpers; do not redeploy from scratch) ===",
-            fixture["source"],
-            "",
-            "=== target contract source (use only real signatures) ===",
-            target_source or "(target source unavailable)",
-            "",
-            "Write a Foundry test that deploys via the fixture, drives the target, and asserts the invariant.",
-            "Return ONLY the Solidity test in a single ```solidity block.",
-        ]
+        _compilable_test_prompt(
+            hypothesis, target_source, fixture,
+            "TASK: drive the target via the fixture-deployed contracts and assert the security invariant.",
+        )
     )
 
 
@@ -1148,52 +1358,25 @@ def repair_validation_artifacts(inp: "ValidationCompileInput", state) -> Dynamic
     return DynamicGenericOutput(status=ToolStatus.ERROR, message="PoC repair attempted but compile still fails.", data=manifest)
 
 
-def _build_exploit_author_prompt(hypothesis: VulnerabilityHypothesis, target_source: str, fixture: dict, prior: dict | None) -> str:
-    target_file, target_contract, target_function = _target_details(hypothesis)
-    invariant = (getattr(hypothesis, "required_proof", "") or "").strip() or (
-        f"the protocol guarantee implied by: {hypothesis.title}"
+def _build_exploit_author_prompt(hypothesis: VulnerabilityHypothesis, target_source: str, fixture: dict, prior: dict | None, skeleton: str = "") -> str:
+    invariant = (getattr(hypothesis, "required_proof", "") or "").strip() or f"the protocol guarantee implied by: {hypothesis.title}"
+    task = (
+        f"TASK: execute the concrete attack sequence (multi-step / specific values), then ASSERT the invariant: "
+        f"{invariant}. If the bug is real the assertion MUST FAIL when the test runs — a failing test means the "
+        "invariant is broken and the bug is CONFIRMED. Do NOT use vm.expectRevert to hide the break."
     )
-    lines = [
-        f"Hypothesis: {hypothesis.title}",
-        f"Vulnerability class: {hypothesis.vulnerability_class}",
-        f"Affected: {target_contract}.{target_function} ({target_file})",
-        f"Why it may be exploitable: {hypothesis.evidence_summary}",
-        f"INVARIANT TO BREAK: {invariant}",
-        "",
-        "Write a Foundry test that:",
-        "  1. sets up state using the fixture's existing setUp/deploy helpers (do NOT redeploy from scratch),",
-        "  2. executes the concrete attack sequence (multi-step / specific values as needed),",
-        "  3. ASSERTS the invariant with assertEq/assertTrue/assertLt etc.",
-        "If the bug is real, the ASSERTION MUST FAIL when the test runs — a failing test here means the "
-        "invariant is broken and the bug is CONFIRMED. Do not use vm.expectRevert to hide the break.",
-        "",
-        "MUST COMPILE — strict rules:",
-        "  - Match the repo's pragma; declare EVERY contract/interface/library at FILE SCOPE (never nested — solc 9582).",
-        "  - Call ONLY functions/members with signatures that appear verbatim in the fixture or target source below; "
-        "never invent methods, parameters, or return shapes.",
-        "  - Use the fixture's already-deployed instances/helpers; do not re-import or redeploy what it provides.",
-        "",
-        f"Inherit the fixture: contract Sentinel{target_function}Exploit is {fixture['name']}",
-        f'Import it as: import {{{fixture["name"]}}} from "{fixture["import_path"]}";',
-        "",
-        "=== fixture source (reuse its helpers) ===",
-        fixture["source"],
-        "",
-        "=== target contract source (use only real signatures) ===",
-        target_source or "(target source unavailable)",
-    ]
+    lines = _compilable_test_prompt(hypothesis, target_source, fixture, task, skeleton=skeleton)
     if prior is not None:
-        lines += [
+        lines = lines[:-1] + [
             "",
             "=== YOUR PREVIOUS ATTEMPT ===",
             (prior.get("code") or "")[:4000],
             "=== WHAT HAPPENED WHEN IT RAN ===",
             prior.get("observation", "")[:1800],
-            "Refine: if it failed to compile, fix the exact error. If the test PASSED (invariant held), your "
-            "sequence or values did not trigger the bug — try a materially different attack. If it errored at "
-            "runtime, fix the setup.",
+            "Refine: if it failed to compile, fix the EXACT solc error (use only real signatures listed above). If the "
+            "test PASSED (invariant held), your sequence/values did not trigger the bug — try a materially different attack.",
+            "Return ONLY the corrected Solidity test in a single ```solidity block, no prose.",
         ]
-    lines.append("Return ONLY the corrected Solidity test in a single ```solidity block.")
     return "\n".join(lines)
 
 
@@ -1242,6 +1425,8 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
     target_file = _target_details(hypothesis)[0]
     target_path = Path(inp.repo_path) / target_file
     target_source = target_path.read_text(encoding="utf-8", errors="replace")[:14000] if target_path.exists() else ""
+    repair_contract = _target_details(hypothesis)[1]
+    repair_interface = _extract_contract_interface(target_source, repair_contract)
     timeout = settings.forge_command_timeout
 
     try:
@@ -1267,7 +1452,17 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
             history.append(f"  compile fix {fix + 1}/{max_compile_fixes}")
             if repairer is None or fix == max_compile_fixes - 1:
                 break
-            repair_prompt = _build_poc_repair_prompt(code, _resolve_imported_sources(inp.repo_path, code), last_err)
+            # Feed the repairer the REAL target ABI + what the fixture exposes — not
+            # the test's own imports. The dominant compile failure is a hallucinated
+            # member (e.g. Pool.setPaused), which is only fixable if the repairer can
+            # see the contract's actual signatures and the fixture's deployed members.
+            grounding = "\n\n".join(
+                section for section in [
+                    f"=== {repair_contract} real interface (use ONLY these member names) ===\n{repair_interface}" if repair_interface else "",
+                    f"=== fixture exposes (already-deployed members) ===\n{fixture.get('surface', '')}" if fixture.get("surface") else "",
+                ] if section
+            )
+            repair_prompt = _build_poc_repair_prompt(code, grounding, last_err)
             try:
                 fixed = extract_solidity_code(repairer.repair(repair_prompt))
             except Exception:
@@ -1282,8 +1477,77 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
     classification = "not_run"
     result_summary = ""
     prior: dict | None = None
+
+    # Phase 0 — minimal-test-first: get a TINY test compiling to lock in the correct
+    # imports/fixture/pragma, then hand that proven base to the full exploit author.
+    # The dominant compile failures come from the large surface of a full PoC; a
+    # compiling skeleton removes the imports/setup from the equation.
+    skeleton = ""
+    try:
+        raw0 = author.author(_build_minimal_skeleton_prompt(hypothesis, target_source, fixture))
+        skel_code = extract_solidity_code(raw0) or raw0
+        if skel_code and "pragma solidity" in skel_code:
+            ok0, skel_code, _ = _compile_until_ok(skel_code)
+            if ok0:
+                skeleton = skel_code
+                history.append("skeleton: compiled")
+            else:
+                history.append("skeleton: did not compile")
+    except Exception:
+        history.append("skeleton: author unavailable")
+
+    # Phase 1 — structured exploit DSL (preferred): the model fills a validated
+    # plan; we render the Solidity (so the before/after assertion is guaranteed)
+    # and reject hallucinated members BEFORE compiling. Free-form is the fallback
+    # below if the DSL never produces a runnable test.
+    if settings.exploit_dsl_enabled:
+        from sentinel.tools import exploit_dsl as _dsl
+
+        known_functions = _dsl.collect_known_functions(repair_interface, fixture.get("surface", ""))
+        plan_errors: list[str] | None = None
+        for attempt in range(1, max_iters + 1):
+            prompt = _dsl.build_plan_prompt(hypothesis, repair_interface, fixture, prior_errors=plan_errors)
+            try:
+                raw = author.author(prompt)
+            except Exception:
+                history.append(f"dsl iter {attempt}: author unavailable")
+                break
+            plan = _dsl.parse_plan(raw)
+            if plan is None:
+                history.append(f"dsl iter {attempt}: unparseable plan")
+                break  # fall back to free-form
+            plan_errors = _dsl.validate_plan(plan, known_functions)
+            if plan_errors:
+                history.append(f"dsl iter {attempt}: invalid plan ({len(plan_errors)} errors)")
+                continue
+            code = _dsl.render_plan(plan, fixture, fixture.get("pragma") or _extract_pragma(target_source) or "^0.8.20", test_path.stem)
+            compiled, code, compile_err = _compile_until_ok(code)
+            if not compiled:
+                plan_errors = [f"the rendered plan failed to compile — fix the exact solc error: {compile_err[-600:]}"]
+                history.append(f"dsl iter {attempt}: not compiling")
+                continue
+            run_result = run_command(["forge", "test", "--offline", "--match-contract", "Sentinel"], cwd=str(worktree), timeout=timeout)
+            classification = _classify_validation_run(run_result.return_code, run_result.stdout, run_result.stderr, run_result.timed_out)
+            result_summary = _extract_forge_result_summary(run_result.stdout, run_result.stderr)
+            history.append(f"dsl iter {attempt}: ran -> {classification} | {result_summary}")
+            if classification == "security_invariant_violation_or_test_needs_review":
+                verdict = "confirmed"  # the asserted invariant broke when executed
+                break
+            if classification == "security_invariant_held_or_test_passed":
+                verdict = "refuted"
+                plan_errors = ["the invariant HELD (test passed) — your sequence/values did not trigger the bug; try a materially different attack."]
+                continue
+            # reverted / skipped / runtime error: refine the plan with guidance.
+            plan_errors = [
+                f"the test did not produce a clean assertion ({classification}): {result_summary}. "
+                "Reach the target call without a setup revert and prove the bug via the before/after assertion."
+            ]
+        if verdict == "confirmed":
+            return _finalize_exploit(state, run_dir, hyp_slug, hypothesis, test_path, verdict, classification, result_summary, history)
+        history.append("dsl phase inconclusive -> free-form fallback")
+
     for attempt in range(1, max_iters + 1):
-        prompt = _build_exploit_author_prompt(hypothesis, target_source, fixture, prior)
+        prompt = _build_exploit_author_prompt(hypothesis, target_source, fixture, prior, skeleton=skeleton)
         try:
             raw = author.author(prompt)
         except Exception:
@@ -1311,12 +1575,29 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
             verdict = "confirmed"  # the asserted invariant broke when executed
             break
         if classification in _VALIDATION_FAILURE_CLASSIFICATIONS:
-            prior = {"code": code, "observation": f"RUNTIME ERROR when run: {result_summary}\n{_clean_output(run_result.stderr[-1200:] or run_result.stdout[-1200:])}"}
+            if classification == "validation_reverted_not_asserted":
+                guidance = (
+                    "The test FAILED on a plain revert, NOT a failed assertion — this is NOT a proof (it usually means "
+                    "a broken mock ABI or a setup revert BEFORE reaching the target). Use a complete, vetted ERC20/oracle "
+                    "mock (implement transfer/transferFrom/approve/balanceOf as the real flow needs), make setUp succeed, "
+                    "reach the target call, and prove the bug with an ASSERTION on before/after state — not by reverting."
+                )
+            elif classification == "validation_skipped_or_empty":
+                guidance = "The test was SKIPPED / nothing executed — remove any vm.skip and write a real test that runs and asserts."
+            else:
+                guidance = "Runtime error before a clean assertion."
+            prior = {"code": code, "observation": f"{guidance}\nResult: {result_summary}\n{_clean_output(run_result.stderr[-1000:] or run_result.stdout[-1000:])}"}
             continue
         # 3) Compiled + ran + passed -> invariant HELD. Refine the attack.
         verdict = "refuted"
         prior = {"code": code, "observation": f"TEST PASSED — invariant HELD ({result_summary}). Your attack did not trigger the bug; try a materially different sequence/values."}
 
+    return _finalize_exploit(state, run_dir, hyp_slug, hypothesis, test_path, verdict, classification, result_summary, history)
+
+
+def _finalize_exploit(state, run_dir, hyp_slug, hypothesis, test_path, verdict, classification, result_summary, history) -> DynamicGenericOutput:
+    """Persist the exploit-loop manifest and (on a real confirmation) mark the
+    hypothesis as executed-proof. Shared by the DSL and free-form paths."""
     manifest = {
         "hypothesis_id": hypothesis.id,
         "verdict": verdict,

@@ -199,8 +199,9 @@ def parse_proposed_hypotheses(content: str) -> ProposedHypothesisBatch:
 
 _PROPOSER_SYSTEM = (
     "You are Solidity Sentinel's hypothesis proposer, a senior smart-contract auditor. From the supplied "
-    "protocol source code, attack-path slices, and historical checklist, propose the 3 to 6 most "
-    "security-relevant, code-specific vulnerability hypotheses. Reason about access control, accounting and "
+    "protocol source code, attack-path slices, and historical checklist, propose the 8 to 12 most "
+    "security-relevant, code-specific vulnerability hypotheses (cover distinct functions/contracts — do not "
+    "cluster on one function). Reason about access control, accounting and "
     "share/asset math, reentrancy and external-call ordering, oracle and report trust, initialization and "
     "upgrade safety, and rounding. "
     "Return ONLY JSON of the form "
@@ -209,7 +210,7 @@ _PROPOSER_SYSTEM = (
     '"exploit_preconditions":["..."],"confidence":0.0}]}. '
     "Every affected_file and affected_function MUST be copied verbatim from a '// file: ... | function: ...' "
     "header in the supplied source; never invent files, functions, or line numbers. It is fine to be "
-    "uncertain — propose plausible candidates (they are validated downstream). Always return at least 3 "
+    "uncertain — propose plausible candidates (they are validated downstream). Always return at least 6 "
     "hypotheses when source code is provided."
 )
 

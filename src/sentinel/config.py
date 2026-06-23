@@ -47,6 +47,15 @@ class Settings(BaseModel):
     # ~= 30k tokens). Lower them only for small-context models.
     proposer_char_budget: int = Field(default=120_000, ge=1000)
     proposer_max_functions: int = Field(default=250, ge=1)
+    # Hypothesis pipeline caps. The old 15-candidate / 6-proposed / 10-deepened caps
+    # structurally limited recall on larger protocols (a 26-finding protocol can't
+    # exceed ~15 candidates). total = the post-dedup candidate ceiling (cheap to
+    # raise — extra candidates just become leads/manual-review); proposed = how many
+    # the proposer and the violation reasoner each emit; deepened = how many get the
+    # expensive per-hypothesis research+validation (cost-sensitive).
+    max_hypotheses_total: int = Field(default=40, ge=1)
+    max_hypotheses_proposed: int = Field(default=12, ge=1, le=20)
+    max_hypotheses_deepened: int = Field(default=14, ge=1)
     # When a generated PoC test fails to compile, feed the solc error + real
     # target source back to the LLM to fix it, up to this many attempts. Default 1:
     # in practice the model repeats the same structural error on a 2nd pass, so a
@@ -57,6 +66,16 @@ class Settings(BaseModel):
     # and refine. Bounded for cost (each iteration is an LLM author + a forge build/test).
     exploit_loop_max_iterations: int = Field(default=3, ge=0)
     exploit_loop_max_hypotheses: int = Field(default=3, ge=0)
+    # Prefer the structured exploit DSL (ABI-validated plan -> deterministic
+    # Solidity) over free-form generation; fall back to free-form on plan failure.
+    exploit_dsl_enabled: bool = Field(default=True)
+    # Invariant-violation reasoning: reason over ONE invariant at a time, each with
+    # its own read/write code slice and a pre-state->calls->deltas->broken-equation
+    # ->impact template, instead of one batched prompt over all invariants. More
+    # focused (better novel bugs) at the cost of more LLM calls; bounded below.
+    invariant_reasoning_one_at_a_time: bool = Field(default=True)
+    invariant_reasoning_max_invariants: int = Field(default=8, ge=0)
+    invariant_reasoning_per_invariant: int = Field(default=2, ge=1)
     planner_max_rounds: int = Field(default=14, ge=1)
     # Safety: the real-LLM planner may only directly select read/analysis tools;
     # write/network/install/cleanup tools are blocked unless explicitly approved.
@@ -114,9 +133,16 @@ def get_settings() -> Settings:
         forge_command_timeout=int(os.getenv("SENTINEL_FORGE_COMMAND_TIMEOUT", "300")),
         proposer_char_budget=int(os.getenv("SENTINEL_PROPOSER_CHAR_BUDGET", "120000")),
         proposer_max_functions=int(os.getenv("SENTINEL_PROPOSER_MAX_FUNCTIONS", "250")),
+        max_hypotheses_total=int(os.getenv("SENTINEL_MAX_HYPOTHESES_TOTAL", "40")),
+        max_hypotheses_proposed=int(os.getenv("SENTINEL_MAX_HYPOTHESES_PROPOSED", "12")),
+        max_hypotheses_deepened=int(os.getenv("SENTINEL_MAX_HYPOTHESES_DEEPENED", "14")),
         poc_repair_max_attempts=int(os.getenv("SENTINEL_POC_REPAIR_MAX_ATTEMPTS", "3")),
         exploit_loop_max_iterations=int(os.getenv("SENTINEL_EXPLOIT_LOOP_MAX_ITERATIONS", "3")),
         exploit_loop_max_hypotheses=int(os.getenv("SENTINEL_EXPLOIT_LOOP_MAX_HYPOTHESES", "3")),
+        exploit_dsl_enabled=os.getenv("SENTINEL_EXPLOIT_DSL_ENABLED", "1") not in {"0", "false", "False"},
+        invariant_reasoning_one_at_a_time=os.getenv("SENTINEL_INVARIANT_REASONING_ONE_AT_A_TIME", "1") not in {"0", "false", "False"},
+        invariant_reasoning_max_invariants=int(os.getenv("SENTINEL_INVARIANT_REASONING_MAX_INVARIANTS", "8")),
+        invariant_reasoning_per_invariant=int(os.getenv("SENTINEL_INVARIANT_REASONING_PER_INVARIANT", "2")),
         planner_max_rounds=int(os.getenv("SENTINEL_PLANNER_MAX_ROUNDS", "14")),
         planner_allow_side_effects=os.getenv("SENTINEL_PLANNER_ALLOW_SIDE_EFFECTS", "false").lower() in {"1", "true", "yes", "on"},
         allow_installs=os.getenv("SENTINEL_ALLOW_INSTALLS", "false").lower() in {"1", "true", "yes", "on"},

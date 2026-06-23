@@ -9,15 +9,45 @@ two-tier and deliberately honest:
 - ``recalled``: the agent touched the function AND its text matches a
   distinguishing keyword for that specific bug (it found the right issue) — this
   is necessary because several Highs can share one function.
+
+A single recall number is misleading because a bug "found" as one of 40 raw
+candidates and then rejected at review is not the same as a bug *delivered* in
+the report, which in turn is not the same as a bug backed by an *executed*
+proof. So recall is reported as a funnel:
+
+- ``candidate``: recalled by any proposed hypothesis (widest net, inflated).
+- ``reviewed``: survived adversarial review into a triage bucket.
+- ``delivered``: actually reported as a finding (what a user receives).
+- ``executed_proof``: backed by an executed PoC that broke the invariant.
+
+Two orthogonal cuts are also reported: ``mechanism`` recall (the candidate's
+vulnerability class aligns with the bug's real root cause, not just a keyword
+hit) and ``novel`` recall (found by a candidate that did *not* lean on a RAG /
+historical match — i.e. discovered rather than recalled from the brain).
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+# Pipeline stage a candidate represents, ordered widest -> narrowest. A bug
+# recalled at a later stage implicitly counts for all earlier ones.
+_STAGE_RANK = {"candidate": 0, "reviewed": 1, "delivered": 2}
+
+# Which report bucket / trace source maps to which stage. A rejected hypothesis
+# was still *proposed*, so it counts at candidate stage but not reviewed.
+_SOURCE_STAGE = {
+    "hypothesis": "candidate",
+    "rejected_hypotheses": "candidate",
+    "suspicious_hypotheses": "reviewed",
+    "needs_manual_review": "reviewed",
+    "leads": "reviewed",
+    "findings": "delivered",
+}
 
 
 class GroundTruthFinding(BaseModel):
@@ -36,8 +66,12 @@ class FindingMatch(BaseModel):
     title: str
     touched: bool
     recalled: bool
+    stage: str | None = None  # furthest stage the bug reached (candidate/reviewed/delivered)
     matched_by: str | None = None
     matched_keyword: str | None = None
+    executed_proof: bool = False  # backed by an executed PoC
+    mechanism_match: bool = False  # candidate's vuln class aligns with the real root cause
+    novel: bool = False  # recalled by a candidate that did not rely on a RAG/historical match
 
 
 class RecallReport(BaseModel):
@@ -45,6 +79,11 @@ class RecallReport(BaseModel):
     total: int
     recalled: int
     touched: int
+    # Cumulative recall funnel: candidate >= reviewed >= delivered, plus the
+    # executed_proof subset. Keyed by stage name (+ "executed_proof").
+    by_stage: dict[str, int] = Field(default_factory=dict)
+    mechanism_recalled: int = 0
+    novel_recalled: int = 0
     by_severity: dict[str, dict[str, int]] = Field(default_factory=dict)
     matches: list[FindingMatch] = Field(default_factory=list)
 
@@ -59,10 +98,60 @@ class Candidate(BaseModel):
     files: list[str] = Field(default_factory=list)
     text: str = ""
     source: str = "hypothesis"
+    stage: str = "candidate"
+    vulnerability_class: str = ""
+    executed_proof: bool = False
+    rag_assisted: bool = False
+
+    @model_validator(mode="after")
+    def _derive_stage(self) -> "Candidate":
+        # The pipeline stage is a function of where the candidate came from, so it
+        # is always derived from ``source`` — callers never have to keep them in sync.
+        self.stage = _SOURCE_STAGE.get(self.source, "candidate")
+        return self
 
 
 def _norm(value: str | None) -> str:
     return (value or "").strip().lower()
+
+
+# --- root-cause (mechanism) alignment -------------------------------------
+# Curated class groups so "accounting_invariant" aligns with "fee accrual" but
+# not with "reentrancy". Deliberately specific — mechanism recall is meant to be
+# stricter than keyword recall (which overcounts shared functions).
+_CLASS_GROUPS: dict[str, set[str]] = {
+    "reentrancy": {"reentrancy", "reentrant", "callback", "hook"},
+    "access_control": {"access", "control", "authorization", "auth", "permission", "onlyowner", "privilege", "unauthorized", "role"},
+    "accounting": {"accounting", "fee", "share", "rounding", "inflation", "donation", "solvency", "debt", "interest", "yield", "redemption"},
+    "oracle": {"oracle", "price", "chainlink", "twap", "stale", "feed"},
+    "initialization": {"initialization", "initialize", "frontrun", "frontrunning", "uninitialized", "proxy"},
+    "dos": {"denial", "unbounded", "griefing"},
+    "slippage": {"slippage", "sandwich", "minamount", "deadline"},
+    "signature": {"signature", "replay", "permit", "ecrecover", "nonce"},
+}
+
+_STOPWORDS = {"the", "and", "via", "with", "missing", "incorrect", "wrong", "bad", "issue", "bug", "invariant", "unknown", "error"}
+
+
+def _tokens(name: str) -> set[str]:
+    return {t for t in re.split(r"[^a-z0-9]+", _norm(name)) if len(t) >= 4 and t not in _STOPWORDS}
+
+
+def _class_groups(name: str) -> set[str]:
+    toks = _tokens(name)
+    return {group for group, members in _CLASS_GROUPS.items() if toks & members}
+
+
+def _class_aligned(a: str, b: str) -> bool:
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb or na == "unknown" or nb == "unknown":
+        return False
+    if na == nb:
+        return True
+    ta, tb = _tokens(na), _tokens(nb)
+    if ta & tb:  # a shared meaningful token (e.g. both mention "oracle")
+        return True
+    return bool(_class_groups(na) & _class_groups(nb))
 
 
 def candidate_matches_function(candidate: Candidate, gt: GroundTruthFinding) -> bool:
@@ -76,34 +165,78 @@ def candidate_matches_function(candidate: Candidate, gt: GroundTruthFinding) -> 
     return False
 
 
+def _recalls_keyword(candidate: Candidate, gt: GroundTruthFinding) -> tuple[bool, str | None]:
+    if not gt.match_any:
+        return True, None
+    text = _norm(candidate.text)
+    for keyword in gt.match_any:
+        if _norm(keyword) and _norm(keyword) in text:
+            return True, keyword
+    return False, None
+
+
 def evaluate_finding(gt: GroundTruthFinding, candidates: list[Candidate]) -> FindingMatch:
     touched = False
+    best_rank = -1
+    best_stage: str | None = None
+    matched_by: str | None = None
+    matched_keyword: str | None = None
+    executed = False
+    mechanism = False
+    novel = False
     for cand in candidates:
         if not candidate_matches_function(cand, gt):
             continue
         touched = True
-        text = _norm(cand.text)
-        if not gt.match_any:
-            return FindingMatch(id=gt.id, severity=gt.severity, title=gt.title, touched=True, recalled=True, matched_by=cand.source)
-        for keyword in gt.match_any:
-            if _norm(keyword) and _norm(keyword) in text:
-                return FindingMatch(id=gt.id, severity=gt.severity, title=gt.title, touched=True, recalled=True, matched_by=cand.source, matched_keyword=keyword)
-    return FindingMatch(id=gt.id, severity=gt.severity, title=gt.title, touched=touched, recalled=False)
+        recalled_here, keyword = _recalls_keyword(cand, gt)
+        if not recalled_here:
+            continue
+        rank = _STAGE_RANK.get(cand.stage, 0)
+        if rank > best_rank:
+            best_rank, best_stage, matched_by, matched_keyword = rank, cand.stage, cand.source, keyword
+        executed = executed or cand.executed_proof
+        mechanism = mechanism or _class_aligned(cand.vulnerability_class, gt.vulnerability_class)
+        novel = novel or (not cand.rag_assisted)
+    recalled = best_rank >= 0
+    return FindingMatch(
+        id=gt.id,
+        severity=gt.severity,
+        title=gt.title,
+        touched=touched,
+        recalled=recalled,
+        stage=best_stage,
+        matched_by=matched_by,
+        matched_keyword=matched_keyword,
+        executed_proof=executed and recalled,
+        mechanism_match=mechanism and recalled,
+        novel=novel and recalled,
+    )
 
 
 def score_recall(ground_truth: list[GroundTruthFinding], candidates: list[Candidate], contest: str = "") -> RecallReport:
     matches = [evaluate_finding(gt, candidates) for gt in ground_truth]
     by_severity: dict[str, dict[str, int]] = {}
+    by_stage = {"candidate": 0, "reviewed": 0, "delivered": 0, "executed_proof": 0}
     for match in matches:
         bucket = by_severity.setdefault(match.severity, {"total": 0, "recalled": 0, "touched": 0})
         bucket["total"] += 1
         bucket["recalled"] += int(match.recalled)
         bucket["touched"] += int(match.touched)
+        if match.recalled and match.stage is not None:
+            reached = _STAGE_RANK[match.stage]
+            for stage, rank in _STAGE_RANK.items():
+                if rank <= reached:  # cumulative: delivered implies reviewed implies candidate
+                    by_stage[stage] += 1
+            if match.executed_proof:
+                by_stage["executed_proof"] += 1
     return RecallReport(
         contest=contest,
         total=len(matches),
         recalled=sum(m.recalled for m in matches),
         touched=sum(m.touched for m in matches),
+        by_stage=by_stage,
+        mechanism_recalled=sum(m.mechanism_match for m in matches),
+        novel_recalled=sum(m.novel for m in matches),
         by_severity=by_severity,
         matches=matches,
     )
@@ -135,7 +268,15 @@ def _candidate_from_hypothesis(raw: dict, source: str) -> Candidate:
         " ".join(str(t) for t in raw.get("root_cause_terms", []) or []),
         " ".join(str(t) for t in raw.get("exploit_precondition_terms", []) or []),
     ]
-    return Candidate(functions=functions, files=files, text=" ".join(text_parts), source=source)
+    return Candidate(
+        functions=functions,
+        files=files,
+        text=" ".join(text_parts),
+        source=source,
+        vulnerability_class=str(raw.get("vulnerability_class", "")),
+        executed_proof=_norm(raw.get("proof_status")) == "executed_poc_confirmed",
+        rag_assisted=bool(raw.get("historical_matches")),
+    )
 
 
 def candidates_from_run(run_dir: str | Path) -> list[Candidate]:
@@ -161,11 +302,24 @@ def candidates_from_run(run_dir: str | Path) -> list[Candidate]:
 
 
 def render_recall_markdown(report: RecallReport) -> str:
+    total = report.total
+
+    def pct(n: int) -> str:
+        return f"{n}/{total} = {n / total:.0%}" if total else "—"
+
+    stage = report.by_stage
     lines = [
         f"# Recall benchmark — {report.contest}",
         "",
-        f"- **Recall (found the bug): {report.recalled}/{report.total} = {report.recall():.0%}**",
-        f"- Touched (looked at the function): {report.touched}/{report.total} = {report.touched / report.total:.0%}" if report.total else "- no findings",
+        "## Recall funnel (cumulative)",
+        f"- **candidate** (any proposed hypothesis): {pct(stage.get('candidate', 0))}",
+        f"- **reviewed** (survived adversarial review): {pct(stage.get('reviewed', 0))}",
+        f"- **delivered** (reported as a finding): {pct(stage.get('delivered', 0))}",
+        f"- **executed-proof** (PoC broke the invariant): {pct(stage.get('executed_proof', 0))}",
+        "",
+        f"- Touched (looked at the function): {pct(report.touched)}",
+        f"- **Mechanism-correct** (root cause aligned, not just keyword): {pct(report.mechanism_recalled)}",
+        f"- **Novel** (found without a RAG/historical match): {pct(report.novel_recalled)}",
         "",
         "| severity | recalled | touched | total |",
         "|---|---|---|---|",
@@ -174,8 +328,13 @@ def render_recall_markdown(report: RecallReport) -> str:
         bucket = report.by_severity.get(severity)
         if bucket:
             lines.append(f"| {severity} | {bucket['recalled']} | {bucket['touched']} | {bucket['total']} |")
-    lines += ["", "| id | severity | result | matched by | title |", "|---|---|---|---|---|"]
+    lines += ["", "| id | severity | stage | proof | mechanism | novel | matched by | title |", "|---|---|---|---|---|---|---|---|"]
     for match in report.matches:
-        result = "recalled" if match.recalled else ("touched" if match.touched else "missed")
-        lines.append(f"| {match.id} | {match.severity} | {result} | {match.matched_by or '—'} | {match.title[:60]} |")
+        stage_label = match.stage if match.recalled else ("touched" if match.touched else "missed")
+        proof = "✓" if match.executed_proof else "—"
+        mech = "✓" if match.mechanism_match else "—"
+        nov = "✓" if match.novel else "—"
+        lines.append(
+            f"| {match.id} | {match.severity} | {stage_label} | {proof} | {mech} | {nov} | {match.matched_by or '—'} | {match.title[:50]} |"
+        )
     return "\n".join(lines) + "\n"

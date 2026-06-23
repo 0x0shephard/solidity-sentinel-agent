@@ -347,7 +347,7 @@ def _dedupe_hypotheses(hypotheses: list[VulnerabilityHypothesis]) -> list[Vulner
         item.id = f"hyp-{len(deduped) + 1}"
         deduped.append(item)
         by_title[title_key] = item
-    return deduped[:15]
+    return deduped[: get_settings().max_hypotheses_total]
 
 
 def _hypothesis_rank_key(hypothesis: VulnerabilityHypothesis) -> tuple[float, float, float, float, float]:
@@ -1580,10 +1580,13 @@ def infer_protocol_invariants(state) -> list[InvariantCandidate]:
         # (hallucinated scope); a function-free invariant is kept as a general one.
         if inv.functions and not grounded_functions:
             continue
+        # Sanitize the model-supplied category to a safe token: it flows into the
+        # vulnerability_class and downstream filenames, where "/" or spaces crash.
+        safe_category = re.sub(r"[^a-z0-9_]", "_", (inv.category or "accounting").strip().lower()).strip("_") or "accounting"
         candidates.append(
             InvariantCandidate(
                 id=f"llm-inv-{index}",
-                invariant_type=(inv.category or "accounting").strip() or "accounting",
+                invariant_type=safe_category[:40],
                 invariant_family=f"llm-inferred {inv.category}".strip(),
                 description=inv.statement,
                 affected_contracts=inv.contracts[:4],
@@ -1598,6 +1601,92 @@ def infer_protocol_invariants(state) -> list[InvariantCandidate]:
             )
         )
     return candidates
+
+
+def _invariant_code_slice(state, repo_path: str, invariant, char_budget: int | None = None, max_blocks: int = 40) -> str:
+    """The read/write slice for ONE invariant: only the functions that name it or
+    touch its state variables, richest-first.
+
+    Reasoning one invariant at a time works only if the model sees the *focused*
+    code that reads/writes that invariant's state — not the whole protocol. A
+    function scores higher when it is an affected function, lives in an affected
+    contract, or references an affected state variable in its body.
+    """
+    settings = get_settings()
+    char_budget = char_budget or min(48000, settings.proposer_char_budget)
+    fns = {f.split(".")[-1] for f in (invariant.affected_functions or []) if f}
+    svars = [v for v in (invariant.affected_state_variables or []) if v]
+    contracts = {c.split(".")[-1] for c in (invariant.affected_contracts or []) if c}
+
+    scored: list[tuple[int, dict, str]] = []
+    for r in _function_range_index(state.get("static_facts", {})):
+        s, e = r.get("start_line"), r.get("end_line")
+        if not isinstance(s, int) or not isinstance(e, int):
+            continue
+        body = _read_source_block(repo_path, r.get("file_path"), s, e)
+        if not body.strip():
+            continue
+        score = 0
+        if r.get("function_name") in fns:
+            score += 3
+        if r.get("contract_name") in contracts:
+            score += 1
+        score += sum(1 for v in svars if re.search(rf"\b{re.escape(v)}\b", body))
+        if score > 0:
+            scored.append((score, r, body))
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    blocks: list[str] = []
+    used = 0
+    for _score, r, body in scored:
+        block = f"// file: {r.get('file_path')} | contract: {r.get('contract_name')} | function: {r.get('function_name')} | lines {r.get('start_line')}-{r.get('end_line')}\n{body}"
+        if used + len(block) > char_budget or len(blocks) >= max_blocks:
+            break
+        used += len(block)
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+_ONE_INVARIANT_INSTRUCTION = (
+    "Try to BREAK this ONE invariant, grounded in the read/write slice below. Work this exact structure and emit a "
+    "hypothesis ONLY if you can complete all five steps with concrete code-grounded values:\n"
+    "1. PRE-STATE: the state variables this invariant constrains and their starting values/relationship.\n"
+    "2. CALLS: the concrete ordered sequence (actor, function, args, msg.value) that manipulates that state.\n"
+    "3. DELTAS: how each call changes the relevant state variables — track the actual numbers.\n"
+    "4. BROKEN EQUATION: the exact equality/inequality the invariant requires, written as before/after terms, that your "
+    "sequence makes FALSE.\n"
+    "5. IMPACT: who profits / what is lost, and the resulting severity.\n"
+    "Probe BOUNDARY OPERATORS explicitly: zero, one wei, first depositor (empty pool/totalSupply==0), max/min, rounding "
+    "direction (floor vs ceil), repeated calls, <= vs < (off-by-one), and self-referential args (from==to, receiver==caller). "
+    "Put the breaking sequence in evidence/reasoning. If the invariant genuinely holds under all of these, return [] — do "
+    "NOT fabricate a violation."
+)
+
+
+def _build_single_invariant_prompt(state, objective: str, invariant) -> str:
+    """Focused prompt to break ONE invariant, with its own read/write slice and
+    the structured pre-state->calls->deltas->broken-equation->impact template."""
+    import json as _json
+
+    repo_path = state.get("repo_path", "")
+    target = {
+        "invariant": invariant.description or invariant.invariant_type,
+        "family": invariant.invariant_family,
+        "state_variables": invariant.affected_state_variables[:8],
+        "functions": invariant.affected_functions[:8],
+        "contracts": invariant.affected_contracts[:4],
+    }
+    header = _json.dumps(
+        {"objective": objective, "target_invariant": target, "instruction": _ONE_INVARIANT_INSTRUCTION},
+        indent=2,
+    )
+    terms = f"{invariant.description or ''} {invariant.invariant_family or ''}".strip()
+    patterns = _historical_pattern_context(state, limit=6, extra=terms[:200])
+    patterns_block = f"\n\n=== KNOWN BUG PATTERNS (how this kind of invariant breaks) ===\n{patterns}" if patterns else ""
+    slice_src = _invariant_code_slice(state, repo_path, invariant)
+    if not slice_src:
+        slice_src = _proposer_code_context(state, repo_path, boost=set(invariant.affected_functions or []))
+    return f"{header}{patterns_block}\n\n=== READ/WRITE SLICE FOR THIS INVARIANT ===\n{slice_src}"
 
 
 def _build_invariant_reasoning_prompt(state, objective: str) -> str:
@@ -1668,8 +1757,13 @@ def reason_invariant_violations(inp: ProposeHypothesesInput, state) -> ProposeHy
     if not state.get("invariant_candidates"):
         return ProposeHypothesesOutput(status=ToolStatus.OK, notes=["No invariant candidates; invariant reasoner skipped."])
 
-    prompt = _build_invariant_reasoning_prompt(state, inp.objective or state.get("objective", ""))
+    objective = inp.objective or state.get("objective", "")
     notes: list[str] = []
+    settings = get_settings()
+    if settings.invariant_reasoning_one_at_a_time:
+        return _reason_invariants_one_at_a_time(inp, state, ranges, objective, notes)
+
+    prompt = _build_invariant_reasoning_prompt(state, objective)
     reasoner = llm_provider.get_invariant_reasoner(mock=False)
     try:
         batch = reasoner.reason(prompt)
@@ -1705,6 +1799,81 @@ def reason_invariant_violations(inp: ProposeHypothesesInput, state) -> ProposeHy
         proposed_count=len(proposed),
         grounded_count=len(grounded),
         dropped_count=dropped,
+        notes=notes,
+        raw_preview=raw_preview,
+    )
+
+
+def _reason_invariants_one_at_a_time(inp, state, ranges, objective: str, notes: list[str]) -> ProposeHypothesesOutput:
+    """Reason over each invariant in its own focused pass (the novel-bug core).
+
+    One invariant + its read/write slice + the structured pre-state->calls->deltas
+    ->broken-equation->impact template per LLM call. Bounded by config; resilient
+    per-invariant (a failed pass is skipped, not fatal). Hypotheses are deduped
+    across overlapping invariants by (primary function, title).
+    """
+    from sentinel.llm import provider as llm_provider
+
+    settings = get_settings()
+    invariants = list(state.get("invariant_candidates", []))[: settings.invariant_reasoning_max_invariants]
+    per_invariant = settings.invariant_reasoning_per_invariant
+
+    reasoner = llm_provider.get_invariant_reasoner(mock=False)
+    fallback_reasoner = None  # lazily constructed on first primary failure
+
+    grounded: list[VulnerabilityHypothesis] = []
+    seen: set[tuple[str, str]] = set()
+    proposed_total = 0
+    idx = 0
+    raw_preview: str | None = None
+
+    for inv in invariants:
+        prompt = _build_single_invariant_prompt(state, objective, inv)
+        try:
+            batch = reasoner.reason(prompt)
+        except Exception as exc:
+            if fallback_reasoner is None:
+                try:
+                    fallback_reasoner = llm_provider.get_ollama_fallback_invariant_reasoner()
+                    notes.append("Ollama fallback invariant reasoner applied.")
+                except Exception:
+                    fallback_reasoner = None
+            if fallback_reasoner is None:
+                notes.append(f"Invariant {inv.id} reasoner unavailable: {type(exc).__name__}.")
+                continue
+            try:
+                batch = fallback_reasoner.reason(prompt)
+            except Exception as fallback_exc:
+                notes.append(f"Invariant {inv.id} reasoner unavailable (fallback): {type(fallback_exc).__name__}.")
+                continue
+        raw_preview = raw_preview or (str(getattr(reasoner, "last_raw", "") or "")[:1200] or None)
+        proposals = batch.hypotheses[:per_invariant]
+        proposed_total += len(proposals)
+        for proposal in proposals:
+            idx += 1
+            hypothesis = _ground_proposal(idx, proposal, ranges, inp.repo_path)
+            if hypothesis is None:
+                continue
+            primary_fn = (hypothesis.affected_functions[0] if hypothesis.affected_functions else "").lower()
+            key = (primary_fn, hypothesis.title.strip().lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            hypothesis.id = f"inv-hyp-{idx}"
+            hypothesis.source_detection_ids = ["invariant_reasoner", f"invariant:{inv.id}", *hypothesis.source_detection_ids]
+            grounded.append(hypothesis)
+        if len(grounded) >= inp.max_hypotheses:
+            break
+
+    grounded = grounded[: inp.max_hypotheses]
+    dropped = proposed_total - len(grounded)
+    notes.append(f"Reasoned {len(invariants)} invariant(s) one-at-a-time; {len(grounded)} grounded, {max(0, dropped)} dropped/deduped.")
+    return ProposeHypothesesOutput(
+        status=ToolStatus.OK,
+        hypotheses=grounded,
+        proposed_count=proposed_total,
+        grounded_count=len(grounded),
+        dropped_count=max(0, dropped),
         notes=notes,
         raw_preview=raw_preview,
     )

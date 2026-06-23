@@ -344,3 +344,118 @@ def test_infer_protocol_invariants_skips_without_llm(tmp_path):
     state = initial_audit_state("infer2", str(repo), "x", "runs/infer2")
     # use_llm_refiner defaults False
     assert infer_protocol_invariants(state) == []
+
+
+def _two_fn_repo(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "foundry.toml").write_text("[profile.default]\n", encoding="utf-8")
+    (tmp_path / "src" / "Vault.sol").write_text(
+        "pragma solidity ^0.8.20;\n"
+        "contract Vault {\n"
+        "    address owner;\n"
+        "    uint256 totalAssets;\n"
+        "    function setOwner(address o) external { owner = o; }\n"
+        "    function deposit(uint256 a) external { totalAssets += a; }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def _two_invariants():
+    from sentinel.schemas.invariants import InvariantCandidate
+
+    return [
+        InvariantCandidate(
+            id="inv-1", invariant_type="ownership", description="owner set once",
+            affected_contracts=["Vault"], affected_functions=["setOwner"], affected_state_variables=["owner"],
+            recommended_validation_template="generic", confidence=0.6,
+        ),
+        InvariantCandidate(
+            id="inv-2", invariant_type="accounting", description="totalAssets conserved",
+            affected_contracts=["Vault"], affected_functions=["deposit"], affected_state_variables=["totalAssets"],
+            recommended_validation_template="generic", confidence=0.6,
+        ),
+    ]
+
+
+def test_reason_invariants_one_at_a_time_per_invariant(monkeypatch, tmp_path):
+    repo = _two_fn_repo(tmp_path)
+    state = initial_audit_state("inv3", str(repo), "Find invariant violations", "runs/inv3")
+    state["use_llm_refiner"] = True
+    executor = ToolExecutor(build_default_registry())
+    executor.execute("audit.run_static_analysis", {"repo_path": str(repo)}, state)
+    state["invariant_candidates"] = _two_invariants()
+
+    calls: list[str] = []
+
+    class FakeReasoner:
+        last_raw = ""
+
+        def reason(self, prompt):
+            calls.append(prompt)
+            if "owner set once" in prompt:
+                fn, cls = "setOwner", "missing_access_control"
+            else:
+                fn, cls = "deposit", "accounting_invariant"
+            return ProposedHypothesisBatch(hypotheses=[ProposedHypothesis(
+                title=f"break invariant via {fn}", vulnerability_class=cls,
+                affected_file="src/Vault.sol", affected_function=fn,
+                reasoning="pre-state, calls, deltas, broken equation, impact", confidence=0.8)])
+
+    monkeypatch.setattr(provider, "get_invariant_reasoner", lambda mock=False: FakeReasoner())
+
+    out = executor.execute(
+        "research.reason_invariant_violations",
+        {"repo_path": str(repo), "objective": "Find invariant violations"}, state,
+    )
+    # one focused LLM call per invariant, each carrying the structured template
+    assert len(calls) == 2
+    assert all("PRE-STATE" in p and "BROKEN EQUATION" in p and "BOUNDARY OPERATORS" in p for p in calls)
+    assert all("READ/WRITE SLICE FOR THIS INVARIANT" in p for p in calls)
+    # each grounded hypothesis is tagged with its source invariant id
+    tags = {t for h in out.hypotheses for t in h.source_detection_ids}
+    assert "invariant:inv-1" in tags and "invariant:inv-2" in tags
+    assert out.grounded_count == 2
+
+
+def test_reason_invariants_one_at_a_time_dedupes_across_invariants(monkeypatch, tmp_path):
+    repo = _two_fn_repo(tmp_path)
+    state = initial_audit_state("inv4", str(repo), "x", "runs/inv4")
+    state["use_llm_refiner"] = True
+    executor = ToolExecutor(build_default_registry())
+    executor.execute("audit.run_static_analysis", {"repo_path": str(repo)}, state)
+    state["invariant_candidates"] = _two_invariants()
+
+    class FakeReasoner:
+        last_raw = ""
+
+        def reason(self, prompt):
+            # both invariants yield the SAME (function, title) -> must dedupe to one
+            return ProposedHypothesisBatch(hypotheses=[ProposedHypothesis(
+                title="same bug", vulnerability_class="missing_access_control",
+                affected_file="src/Vault.sol", affected_function="setOwner", confidence=0.7)])
+
+    monkeypatch.setattr(provider, "get_invariant_reasoner", lambda mock=False: FakeReasoner())
+
+    out = executor.execute("research.reason_invariant_violations", {"repo_path": str(repo)}, state)
+    assert out.grounded_count == 1
+    assert out.proposed_count == 2  # both invariants were reasoned over
+
+
+def test_invariant_code_slice_focuses_on_relevant_functions(tmp_path):
+    from sentinel.tools.research import _invariant_code_slice
+    from sentinel.schemas.invariants import InvariantCandidate
+
+    repo = _two_fn_repo(tmp_path)
+    state = initial_audit_state("inv5", str(repo), "x", "runs/inv5")
+    executor = ToolExecutor(build_default_registry())
+    executor.execute("audit.run_static_analysis", {"repo_path": str(repo)}, state)
+    inv = InvariantCandidate(
+        id="inv-1", invariant_type="accounting", description="totalAssets conserved",
+        affected_contracts=["Vault"], affected_functions=["deposit"], affected_state_variables=["totalAssets"],
+        recommended_validation_template="generic", confidence=0.6,
+    )
+    slice_src = _invariant_code_slice(state, str(repo), inv)
+    # the deposit function (names the state var + is the affected fn) ranks in
+    assert "function: deposit" in slice_src

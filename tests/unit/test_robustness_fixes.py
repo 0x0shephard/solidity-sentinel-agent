@@ -263,3 +263,98 @@ def test_count_fallback_usage_flags_contamination():
     }
     assert _count_fallback_usage(state) == 3
     assert _count_fallback_usage({"notes": [], "subgraph_results": []}) == 0
+
+
+# --- path-injection: a model-supplied class with "/" must not crash filename build ---
+
+def test_artifact_test_name_sanitizes_unsafe_class():
+    from sentinel.schemas.research import VulnerabilityHypothesis
+    from sentinel.tools.dynamic import _artifact_test_name
+
+    h = VulnerabilityHypothesis(
+        id="h", title="x", vulnerability_class="External-Call/Accounting Ordering",
+        affected_files=["src/V.sol"], affected_functions=["liquidate"], evidence_summary="x", confidence=0.5,
+    )
+    name = _artifact_test_name(h)
+    assert "/" not in name and " " not in name
+    assert name.endswith("Test.t.sol")
+
+
+def test_inferred_invariant_category_sanitized(monkeypatch, tmp_path):
+    from sentinel.schemas.research import InferredInvariant, InferredInvariantBatch
+    import sentinel.llm.provider as provider
+    from sentinel.state import initial_audit_state
+    from sentinel.tools import build_default_registry
+    from sentinel.tools.executor import ToolExecutor
+    from sentinel.tools.research import infer_protocol_invariants
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "foundry.toml").write_text("[profile.default]\n", encoding="utf-8")
+    (tmp_path / "src" / "V.sol").write_text(
+        "pragma solidity ^0.8.20;\ncontract V {\n    function liquidate() external {\n        uint256 x = 1;\n    }\n}\n",
+        encoding="utf-8",
+    )
+    state = initial_audit_state("inv", str(tmp_path), "x", "runs/inv")
+    state["use_llm_refiner"] = True
+    ToolExecutor(build_default_registry()).execute("audit.run_static_analysis", {"repo_path": str(tmp_path)}, state)
+
+    class _Inf:
+        last_raw = ""
+        def infer(self, prompt):
+            return InferredInvariantBatch(invariants=[InferredInvariant(statement="x", category="External-Call/Accounting Ordering", functions=["liquidate"], confidence=0.6)])
+
+    monkeypatch.setattr(provider, "get_invariant_inferencer", lambda mock=False: _Inf())
+    out = infer_protocol_invariants(state)
+    assert out and "/" not in out[0].invariant_type and " " not in out[0].invariant_type
+
+
+# --- exploit/validation worktrees must not fail on the repo's strict warning policy ---
+
+def test_relax_foundry_warnings_disables_deny(tmp_path):
+    from sentinel.tools.dynamic import _relax_foundry_warnings
+
+    (tmp_path / "foundry.toml").write_text("[profile.default]\ndeny_warnings = true\nsrc = 'src'\n", encoding="utf-8")
+    _relax_foundry_warnings(tmp_path)
+    out = (tmp_path / "foundry.toml").read_text()
+    assert "deny_warnings = false" in out
+    assert "deny_warnings = true" not in out
+
+    (tmp_path / "foundry.toml").write_text('[profile.default]\ndeny = ["warnings"]\n', encoding="utf-8")
+    _relax_foundry_warnings(tmp_path)
+    import re as _re
+    assert not _re.search(r"(?m)^\s*deny\s*=\s*.*warning", (tmp_path / "foundry.toml").read_text())
+
+
+# --- executed PoC: a confirmed exploit is the strongest proof (promotes + lifts cap) ---
+
+def test_executed_poc_counts_as_proof_and_lifts_confidence():
+    from sentinel.reporting import _has_validation_proof, _has_executed_validation_proof, _calibrated_confidence
+
+    class _Hyp:
+        proof_status = "executed_poc_confirmed"
+
+    assert _has_validation_proof(_Hyp(), {}) is True
+    assert _has_executed_validation_proof(_Hyp(), {}) is True
+    # an executed PoC lifts the 0.85 cap (raw confidence kept)
+    assert _calibrated_confidence(0.95, _Hyp(), {}) == 0.95
+
+
+# --- proof soundness: revert/skip/setup-fail must NOT be read as held/violated ---
+
+def test_classify_validation_run_is_sound():
+    from sentinel.tools.dynamic import _classify_validation_run, _VALIDATION_FAILURE_CLASSIFICATIONS
+
+    # A real ASSERTION failure = the asserted invariant broke = violation.
+    assert _classify_validation_run(1, "[FAIL: assertion failed: 2 != 1] t()\n0 passed; 1 failed; 0 skipped", "", False) == "security_invariant_violation_or_test_needs_review"
+    # A plain revert (broken mock / setup revert) is NOT a proof.
+    assert _classify_validation_run(1, "[FAIL: SafeERC20: low-level call failed] t()\n0 passed; 1 failed; 0 skipped", "", False) == "validation_reverted_not_asserted"
+    assert _classify_validation_run(1, "[FAIL: USDT: approve not allowed] t()", "", False) == "validation_reverted_not_asserted"
+    # A skipped / empty run is NOT "invariant held".
+    assert _classify_validation_run(0, "0 passed; 0 failed; 1 skipped", "", False) == "validation_skipped_or_empty"
+    assert _classify_validation_run(0, "[SKIP] t()", "", False) == "validation_skipped_or_empty"
+    # A genuine pass = invariant held.
+    assert _classify_validation_run(0, "1 passed; 0 failed; 0 skipped", "", False) == "security_invariant_held_or_test_passed"
+
+    # Reverts and skips are failure classifications (never confirmed/refuted).
+    assert "validation_reverted_not_asserted" in _VALIDATION_FAILURE_CLASSIFICATIONS
+    assert "validation_skipped_or_empty" in _VALIDATION_FAILURE_CLASSIFICATIONS

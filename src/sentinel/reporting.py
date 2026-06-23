@@ -277,6 +277,12 @@ def create_findings_from_state(state: AuditState) -> list[Finding]:
         severity = SEVERITY_BY_CLASS.get(hypothesis.vulnerability_class, "info")
         status = research.finding_status if research else hypothesis.status
         gated_status, gating_limitations = _status_with_evidence_gate(status, local_evidence)
+        # An executed PoC whose ASSERTION broke is strong proof, so promote to
+        # confirmed BEFORE the counterevidence gate — but deliberately not after it:
+        # if there is concrete counterevidence the bug is mitigated, that must still
+        # be able to demote the finding (an executed PoC never auto-overrides it).
+        if getattr(hypothesis, "proof_status", "") == "executed_poc_confirmed":
+            gated_status = "confirmed"
         gated_status, proof_limitations = _status_with_proof_gate(gated_status, hypothesis, state)
         gated_status, counterevidence_limitations = _status_with_counterevidence_gate(gated_status, hypothesis, research)
         limitations = [

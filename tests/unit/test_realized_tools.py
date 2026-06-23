@@ -141,7 +141,8 @@ def test_dynamic_run_validation_artifact_classifies_failure(monkeypatch, tmp_pat
         return "/fake/forge" if name == "forge" else None
 
     def fake_run(command, cwd, timeout=60, env=None):
-        return CommandResult(command=command, cwd=str(cwd), return_code=1, stdout="[FAIL: invariant violated] test_check()", stderr="1 failed")
+        # A genuine ASSERTION failure (not a bare revert) is what counts as a violation.
+        return CommandResult(command=command, cwd=str(cwd), return_code=1, stdout="[FAIL: assertion failed: 2 != 1] test_check()\n0 passed; 1 failed; 0 skipped", stderr="")
 
     monkeypatch.setattr("sentinel.tools.dynamic.shutil.which", fake_which)
     monkeypatch.setattr("sentinel.tools.dynamic.run_command", fake_run)
