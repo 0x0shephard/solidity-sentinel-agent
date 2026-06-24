@@ -221,6 +221,79 @@ def benchmark(
     typer.echo(f"Run scored: {run_dir}")
 
 
+@app.command("exploit-replay")
+def exploit_replay(
+    run: str = typer.Option(..., "--run", help="Prior run dir containing candidate_rank_trace.json (+ state.json)."),
+    hyp_id: str | None = typer.Option(None, "--hyp", help="Hypothesis id to replay (default: the first 3)."),
+    repo: str | None = typer.Option(None, "--repo", help="Repo path (default: repo_path from the prior run's state.json)."),
+    iterations: int = typer.Option(3, "--iterations", help="Exploit-loop max iterations."),
+) -> None:
+    """Fast-iterate the execution-grounded exploit loop on a saved hypothesis.
+
+    Loads a hypothesis from a prior run and runs ONLY dynamic.author_and_run_exploit
+    (author -> validate -> render -> compile -> run), so plan/render/compile bugs can
+    be debugged in minutes instead of re-running the full ~2h audit pipeline.
+    """
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
+
+    from sentinel.schemas.research import VulnerabilityHypothesis
+    from sentinel.state import initial_audit_state
+    from sentinel.tools import build_default_registry
+    from sentinel.tools.executor import ToolExecutor
+
+    run_path = _Path(run)
+    trace_path = run_path / "candidate_rank_trace.json"
+    if not trace_path.exists():
+        typer.echo(f"No candidate_rank_trace.json in {run}")
+        raise typer.Exit(1)
+    hyps = _json.loads(trace_path.read_text(encoding="utf-8")).get("hypotheses") or []
+    if not hyps:
+        typer.echo("No hypotheses found in the prior run.")
+        raise typer.Exit(1)
+
+    target_repo = repo
+    if not target_repo and (run_path / "state.json").exists():
+        target_repo = _json.loads((run_path / "state.json").read_text(encoding="utf-8")).get("repo_path")
+    if not target_repo:
+        typer.echo("Provide --repo (no repo_path in the prior run's state.json).")
+        raise typer.Exit(1)
+
+    if hyp_id:
+        selected = [h for h in hyps if h.get("id") == hyp_id]
+        if not selected:
+            typer.echo(f"Hypothesis {hyp_id} not found. Available: {[h.get('id') for h in hyps][:25]}")
+            raise typer.Exit(1)
+    else:
+        selected = hyps[:3]
+
+    _os.environ["SENTINEL_EXPLOIT_LOOP_MAX_ITERATIONS"] = str(iterations)
+    replay_dir = run_path / "exploit-replay"
+    state = initial_audit_state("exploit-replay", target_repo, "Replay exploit loop", str(replay_dir))
+    state["use_llm_refiner"] = True
+
+    executor = ToolExecutor(build_default_registry())
+    # Rebuild only function_ranges (fast, no slither) so the DSL knows the whole
+    # protocol's function names for cross-contract call validation.
+    executor.execute("static.map_function_ranges", {"repo_path": target_repo}, state)
+    state["static_facts"]["function_ranges"] = state["last_outputs"].get("static.map_function_ranges", {}).get("ranges", [])
+
+    for raw in selected:
+        hyp = VulnerabilityHypothesis.model_validate(raw)
+        typer.echo(f"\n=== {hyp.id}: {hyp.title[:80]} ({hyp.vulnerability_class}) ===")
+        out = executor.execute(
+            "dynamic.author_and_run_exploit",
+            {"repo_path": target_repo, "hypothesis": hyp.model_dump(mode="json")},
+            state,
+        )
+        data = out.data or {}
+        typer.echo(f"verdict: {data.get('verdict')} | classification: {data.get('classification')}")
+        for line in data.get("history", []):
+            typer.echo(f"  {line}")
+    typer.echo(f"\nArtifacts (renders + manifests): {replay_dir / 'artifacts'}")
+
+
 @eval_app.callback(invoke_without_command=True)
 def eval_main(
     all_fixtures: bool = typer.Option(False, "--all", help="Run all fixtures."),

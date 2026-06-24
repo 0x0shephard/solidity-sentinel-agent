@@ -85,3 +85,12 @@ class BasePocAuthor:
 
     def author(self, prompt: str) -> str:
         raise NotImplementedError
+
+    def author_plan(self, prompt: str) -> str:
+        """Author a structured exploit-plan JSON (the exploit DSL).
+
+        Returns the raw JSON string (no Solidity extraction). The default is
+        unsupported -> "" so the exploit loop cleanly falls back to free-form
+        authoring for providers that do not implement plan authoring.
+        """
+        return ""

@@ -602,10 +602,17 @@ _VALIDATION_FAILURE_CLASSIFICATIONS = {
 
 def _is_assertion_failure(text_lower: str) -> bool:
     """True only when a forge/forge-std ASSERTION failed (the invariant the test
-    asserts was actually violated) — not a plain revert from setup or a broken mock."""
+    asserts was actually violated) — not a plain revert from setup or a broken mock.
+
+    ``sentinel_invariant_violated`` is the token the exploit DSL embeds in its
+    ``assertTrue`` message: forge prints a custom assert message as ``[FAIL: <msg>]``
+    WITHOUT the literal "assertion failed", so without this token our own sound
+    DSL proofs were misread as plain reverts. The token appears only in that one
+    assertion's message, so a setup revert (which prints a different reason) can
+    never trip it."""
     return any(
         marker in text_lower
-        for marker in ("assertion failed", "not satisfied", "panic: assertion", "panic: assert", "[assertion]")
+        for marker in ("assertion failed", "not satisfied", "panic: assertion", "panic: assert", "[assertion]", "sentinel_invariant_violated")
     )
 
 
@@ -870,6 +877,65 @@ def _fixture_surface(source: str) -> str:
     return "\n\n".join(parts)
 
 
+_TYPE_LINE_RE = re.compile(r"^\s+([A-Z]\w*)\s+([A-Za-z_]\w*)\s*$", re.MULTILINE)
+
+
+def _contract_public_members(body: str) -> list[str]:
+    """Public/external function names + public state-variable getters of a contract
+    body. The getters (e.g. ``SuperPoolFactory public superPoolFactory;``) are the
+    members the model needs to navigate (``protocol.superPoolFactory()``) and which
+    the plain function-signature extractor misses."""
+    fns = re.findall(r"function\s+(\w+)\s*\([^)]*\)[^;{]*\b(?:public|external)\b", body)
+    getters = re.findall(r"\b[A-Za-z_][\w\.\[\]]*\s+public\s+(?:immutable\s+|constant\s+)?([A-Za-z_]\w*)\s*[;=]", body)
+    return list(dict.fromkeys(fns + getters))
+
+
+def _instance_interfaces(repo_path: str, surface: str, max_types: int = 14) -> tuple[str, set[str]]:
+    """Map each fixture instance to the public members of its contract type.
+
+    The dominant exploit-loop failure is the model calling a function on the wrong
+    instance (``protocol.deploySuperPool`` where ``protocol`` is the ``Deploy``
+    harness that merely *exposes* ``superPoolFactory``). Giving the model
+    "instance <name> (type T) exposes: ..." — and admitting those member names —
+    lets it navigate ``protocol.superPoolFactory().deploySuperPool(...)``.
+    Returns (prompt_block, member_name_set)."""
+    pairs = _TYPE_LINE_RE.findall(surface or "")
+    if not pairs:
+        return "", set()
+    wanted = {t for t, _ in pairs}
+    # Scan the protocol's own source (not lib deps) once for each needed type body.
+    bodies: dict[str, str] = {}
+    root = Path(repo_path)
+    for sol in list(root.rglob("*.sol")):
+        rel = sol.as_posix()
+        if "/lib/" in rel or "/node_modules/" in rel:
+            continue
+        try:
+            text = sol.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"(?:abstract\s+)?(?:contract|interface)\s+(\w+)", text):
+            name = m.group(1)
+            if name in wanted and name not in bodies:
+                bodies[name] = text[m.start(): m.start() + 6000]
+        if len(bodies) >= len(wanted):
+            break
+    lines: list[str] = []
+    members: set[str] = set()
+    for typ, name in pairs:
+        if typ not in bodies:
+            continue
+        mem = _contract_public_members(bodies[typ])
+        if not mem:
+            continue
+        members.update(mem)
+        lines.append(f"  {name} (type {typ}) exposes: {', '.join(mem[:18])}")
+        if len(lines) >= max_types:
+            break
+    block = "\n".join(lines)
+    return block, members
+
+
 def _extract_contract_interface(source: str, contract: str) -> str:
     """The target contract's real ABI surface: function signatures, structs,
     enums, custom errors — so the author uses only signatures that exist."""
@@ -924,6 +990,57 @@ def _find_example_test(repo_path: str, fixture_file: str) -> str:
         if end:
             return f"{imports}\n\n{text[m.start():end]}"
     return ""
+
+
+def _resolve_reachable_instances(repo_path: str, fixture: dict) -> str:
+    """Map fixture orchestrator instances to the core contracts they expose via
+    public getters, e.g. ``Deploy protocol`` -> ``protocol.pool()``,
+    ``protocol.riskEngine()``.
+
+    Foundry suites commonly deploy through a script/harness that holds every core
+    contract as a ``public`` var (auto-getter). The real call path is then
+    ``protocol.<getter>()``, not a bare ``pool`` instance — which is exactly the
+    name the model keeps inventing. Surfacing this map is what lets a cross-contract
+    exploit reach the contract under test.
+    """
+    src = fixture.get("source", "") or ""
+    # Fixture state vars: `Type name;` (Type uppercase-led, name lowercase-led).
+    state_vars: dict[str, str] = {}
+    for m in re.finditer(r"^\s+([A-Z]\w*)\s+(?:public\s+|internal\s+)?([a-z]\w*)\s*;", src, flags=re.MULTILINE):
+        state_vars[m.group(2)] = m.group(1)
+    wanted = set(state_vars.values())
+    if not wanted:
+        return ""
+    # Index each wanted orchestrator type -> its public state vars (the getters).
+    members: dict[str, list[tuple[str, str]]] = {}
+    for path in Path(repo_path).rglob("*.sol"):
+        if len(members) >= len(wanted):
+            break
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for cm in re.finditer(r"\bcontract\s+(\w+)", text):
+            tname = cm.group(1)
+            if tname not in wanted or tname in members:
+                continue
+            body = text[cm.end(): cm.end() + 6000]
+            pubs = re.findall(r"\b([A-Z]\w*)\s+public\s+([a-z]\w*)\s*;", body)
+            if pubs:
+                members[tname] = pubs[:20]
+    lines = [
+        f"  {name}.{subname}() -> {subtype}"
+        for name, typ in state_vars.items()
+        for subtype, subname in members.get(typ, [])
+    ]
+    if not lines:
+        return ""
+    return (
+        "Core contracts reachable via getters (use these chains as the call \"target\"):\n"
+        + "\n".join(lines[:40])
+        + "\n(These getters return CONTRACT types. When passing one where an ADDRESS is expected — e.g. an "
+        "approve/transfer spender or a function's address arg — wrap it: address(protocol.pool()).)"
+    )
 
 
 def _detect_test_fixture(repo_path: str, max_source_chars: int = 16000) -> dict | None:
@@ -1363,7 +1480,11 @@ def _build_exploit_author_prompt(hypothesis: VulnerabilityHypothesis, target_sou
     task = (
         f"TASK: execute the concrete attack sequence (multi-step / specific values), then ASSERT the invariant: "
         f"{invariant}. If the bug is real the assertion MUST FAIL when the test runs — a failing test means the "
-        "invariant is broken and the bug is CONFIRMED. Do NOT use vm.expectRevert to hide the break."
+        "invariant is broken and the bug is CONFIRMED. Do NOT use vm.expectRevert to hide the break. "
+        "The FINAL assertion that proves the bug MUST be a state assertion (assertEq/assertGt/assertLt/assertTrue "
+        "comparing before/after values) whose message BEGINS with the exact token 'SENTINEL_INVARIANT_VIOLATED: ' "
+        "followed by a one-line description — this is how the harness recognizes a genuine invariant break (a plain "
+        "revert is NOT a proof). Snapshot the relevant state before and after the attack and assert on the delta."
     )
     lines = _compilable_test_prompt(hypothesis, target_source, fixture, task, skeleton=skeleton)
     if prior is not None:
@@ -1427,6 +1548,10 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
     target_source = target_path.read_text(encoding="utf-8", errors="replace")[:14000] if target_path.exists() else ""
     repair_contract = _target_details(hypothesis)[1]
     repair_interface = _extract_contract_interface(target_source, repair_contract)
+    # Resolve orchestrator getters (protocol.pool() -> Pool) once, so the plan
+    # author knows the real cross-contract call paths instead of inventing names.
+    if "reachable" not in fixture:
+        fixture["reachable"] = _resolve_reachable_instances(inp.repo_path, fixture)
     timeout = settings.forge_command_timeout
 
     try:
@@ -1500,31 +1625,69 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
     # plan; we render the Solidity (so the before/after assertion is guaranteed)
     # and reject hallucinated members BEFORE compiling. Free-form is the fallback
     # below if the DSL never produces a runnable test.
-    if settings.exploit_dsl_enabled:
+    author_plan_fn = getattr(author, "author_plan", None)
+    if settings.exploit_dsl_enabled and callable(author_plan_fn):
         from sentinel.tools import exploit_dsl as _dsl
 
-        known_functions = _dsl.collect_known_functions(repair_interface, fixture.get("surface", ""))
+        # Admit the whole protocol's function names (not just the target's), so a
+        # legitimate cross-contract call is not mistaken for a hallucination.
+        protocol_functions = {
+            str(r.get("function_name"))
+            for r in (state.get("static_facts", {}) or {}).get("function_ranges", [])
+            if isinstance(r, dict) and r.get("function_name")
+        }
+        known_targets = _dsl.extract_instance_names(fixture.get("surface", ""))
+        # Map each instance to its type's public members so the model can navigate
+        # getters (protocol.superPoolFactory().deploySuperPool(...)) instead of
+        # calling protocol functions that live on a different contract.
+        instance_iface_text, instance_members = _instance_interfaces(inp.repo_path, fixture.get("surface", ""))
+        fixture = {**fixture, "instance_interfaces": instance_iface_text}
+        protocol_functions |= instance_members
+        known_functions = _dsl.collect_known_functions(repair_interface, fixture.get("surface", ""), extra_function_names=protocol_functions)
         plan_errors: list[str] | None = None
         for attempt in range(1, max_iters + 1):
             prompt = _dsl.build_plan_prompt(hypothesis, repair_interface, fixture, prior_errors=plan_errors)
             try:
-                raw = author.author(prompt)
+                raw = author_plan_fn(prompt)
             except Exception:
                 history.append(f"dsl iter {attempt}: author unavailable")
                 break
+            if not raw:
+                history.append("dsl: plan authoring unsupported -> free-form")
+                break
             plan = _dsl.parse_plan(raw)
             if plan is None:
-                history.append(f"dsl iter {attempt}: unparseable plan")
-                break  # fall back to free-form
-            plan_errors = _dsl.validate_plan(plan, known_functions)
+                history.append(f"dsl iter {attempt}: unparseable plan (preview: {raw[:120]!r})")
+                plan_errors = [
+                    "Your previous response was not a valid JSON object matching the plan schema. Return ONLY a JSON "
+                    "object with keys actors, setup_calls, attack_calls, before, after, and invariant (with description "
+                    "and assertion). No prose, no code fence, no Solidity."
+                ]
+                continue
+            plan_errors = _dsl.validate_plan(plan, known_functions, known_targets=known_targets)
             if plan_errors:
-                history.append(f"dsl iter {attempt}: invalid plan ({len(plan_errors)} errors)")
+                history.append(f"dsl iter {attempt}: invalid plan ({len(plan_errors)} errors): {'; '.join(plan_errors)[:300]}")
                 continue
             code = _dsl.render_plan(plan, fixture, fixture.get("pragma") or _extract_pragma(target_source) or "^0.8.20", test_path.stem)
-            compiled, code, compile_err = _compile_until_ok(code)
-            if not compiled:
-                plan_errors = [f"the rendered plan failed to compile — fix the exact solc error: {compile_err[-600:]}"]
-                history.append(f"dsl iter {attempt}: not compiling")
+            # Compile the render directly — do NOT run the free-form Solidity repairer
+            # here: it restructures our deterministic, sound test (it has rewritten
+            # renders into try/catch + bogus imports). Instead, feed the solc error
+            # back to the PLAN author, which knows the intent and preserves structure.
+            test_path.write_text(code, encoding="utf-8")
+            build = run_command(["forge", "build", "--offline"], cwd=str(worktree), timeout=timeout)
+            if build.return_code != 0:
+                compile_err = _clean_output(build.stderr[-1800:] or build.stdout[-1800:])
+                plan_errors = [
+                    "the rendered plan failed to compile — adjust the plan (targets, args, and state-read expressions) so "
+                    f"the generated Solidity compiles. solc error:\n{compile_err[-700:]}"
+                ]
+                history.append(f"dsl iter {attempt}: not compiling | {compile_err[-240:]}")
+                # Persist the exact failing render so the compile failure is diagnosable
+                # post-hoc (test_path is later overwritten by the free-form fallback).
+                try:
+                    (run_dir / "artifacts" / f"exploit-dsl-render-{hyp_slug}-iter{attempt}.t.sol").write_text(code, encoding="utf-8")
+                except OSError:
+                    pass
                 continue
             run_result = run_command(["forge", "test", "--offline", "--match-contract", "Sentinel"], cwd=str(worktree), timeout=timeout)
             classification = _classify_validation_run(run_result.return_code, run_result.stdout, run_result.stderr, run_result.timed_out)
@@ -1564,7 +1727,7 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
         compiled, code, compile_err = _compile_until_ok(code)
         if not compiled:
             prior = {"code": code, "observation": f"STILL FAILS TO COMPILE after repair attempts:\n{compile_err}"}
-            history.append(f"iter {attempt}: not compiling")
+            history.append(f"iter {attempt}: not compiling | {_clean_output(compile_err)[-240:]}")
             continue
         # 2) Run it and INFER the result from what actually executed.
         run_result = run_command(["forge", "test", "--offline", "--match-contract", "Sentinel"], cwd=str(worktree), timeout=timeout)

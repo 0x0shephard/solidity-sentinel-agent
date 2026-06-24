@@ -358,3 +358,16 @@ def test_classify_validation_run_is_sound():
     # Reverts and skips are failure classifications (never confirmed/refuted).
     assert "validation_reverted_not_asserted" in _VALIDATION_FAILURE_CLASSIFICATIONS
     assert "validation_skipped_or_empty" in _VALIDATION_FAILURE_CLASSIFICATIONS
+
+
+def test_classify_recognizes_dsl_invariant_token():
+    # A DSL assertTrue(cond, "SENTINEL_INVARIANT_VIOLATED: ...") failure prints as
+    # [FAIL: SENTINEL_INVARIANT_VIOLATED: ...] WITHOUT the literal "assertion failed".
+    # Without the token it was misread as a plain revert; with it, it is a violation.
+    from sentinel.tools.dynamic import _classify_validation_run
+
+    out = "[FAIL: SENTINEL_INVARIANT_VIOLATED: owner balance must decrease] test_exploit()\n0 passed; 1 failed; 0 skipped"
+    assert _classify_validation_run(1, out, "", False) == "security_invariant_violation_or_test_needs_review"
+    # a genuine setup revert (no token) is still NOT a proof
+    revert = "[FAIL: Ownable: caller is not the owner] test_exploit()\n0 passed; 1 failed; 0 skipped"
+    assert _classify_validation_run(1, revert, "", False) == "validation_reverted_not_asserted"

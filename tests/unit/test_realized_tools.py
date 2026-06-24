@@ -413,3 +413,62 @@ def test_author_and_run_exploit_skips_without_llm(tmp_path):
     state = initial_audit_state("ex2", str(repo), "x", str(tmp_path / "runs" / "ex2"))
     out = ToolExecutor(build_default_registry()).execute("dynamic.author_and_run_exploit", {"repo_path": str(repo)}, state)
     assert out.status == ToolStatus.SKIPPED
+
+
+def test_author_and_run_exploit_uses_dsl_plan_when_available(monkeypatch, tmp_path):
+    # Regression for the smoke-run finding: the DSL path was never taken because
+    # the PoC author emitted Solidity (its system prompt) instead of a plan, so
+    # parse_plan always failed. With an author that implements author_plan and
+    # returns valid plan JSON, the loop must confirm THROUGH the DSL.
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "test").mkdir(parents=True)
+    (repo / "foundry.toml").write_text("[profile.default]\nsrc='src'\n", encoding="utf-8")
+    (repo / "src" / "Vault.sol").write_text(
+        "pragma solidity ^0.8.20; contract Vault { function withdraw() external {} }\n", encoding="utf-8")
+    (repo / "test" / "Base.t.sol").write_text(
+        "pragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\ncontract BaseTest is Test { function setUp() public {} }\n", encoding="utf-8")
+
+    state = initial_audit_state("exd", str(repo), "Find bugs", str(tmp_path / "runs" / "exd"))
+    state["use_llm_refiner"] = True
+    hyp = VulnerabilityHypothesis(
+        id="hyp-1", title="Withdraw breaks solvency", vulnerability_class="accounting",
+        affected_files=["src/Vault.sol"], affected_functions=["withdraw"],
+        evidence_summary="x", confidence=0.6, required_proof="total assets >= total debt",
+    )
+    state["hypotheses"] = [hyp]
+
+    monkeypatch.setattr("sentinel.tools.dynamic.shutil.which", lambda name: "/fake/forge")
+    monkeypatch.setattr("sentinel.tools.dynamic._detect_test_fixture", lambda repo_path, **k: {"name": "BaseTest", "import_path": "./Base.t.sol", "surface": "", "source": "contract BaseTest {}"})
+    monkeypatch.setattr("sentinel.tools.dynamic._copy_repo_for_validation", lambda repo_path, worktree: (worktree / "test").mkdir(parents=True, exist_ok=True))
+
+    plan_json = (
+        '{"actors":[{"name":"attacker","funds_wei":1000000000000000000}],'
+        '"attack_calls":[{"actor":"attacker","target":"","function":"withdraw","args":[]}],'
+        '"before":[{"name":"bal","expr":"address(this).balance"}],'
+        '"after":[{"name":"bal","expr":"address(this).balance"}],'
+        '"invariant":{"description":"solvency","assertion":"after_bal >= before_bal"}}'
+    )
+
+    class _PlanAuthor:
+        def author(self, prompt):  # free-form path must NOT be used
+            raise AssertionError("free-form author should not be called when the DSL plan is valid")
+
+        def author_plan(self, prompt):
+            return plan_json
+
+    monkeypatch.setattr("sentinel.llm.provider.get_poc_author", lambda mock=False: _PlanAuthor())
+
+    def fake_run(command, cwd, timeout=60, env=None):
+        if command[:2] == ["forge", "build"]:
+            return CommandResult(command=command, cwd=str(cwd), return_code=0, stdout="Compiling", stderr="")
+        return CommandResult(command=command, cwd=str(cwd), return_code=1, stdout="[FAIL: assertion failed] test_exploit()\n0 passed; 1 failed; 0 skipped", stderr="")
+
+    monkeypatch.setattr("sentinel.tools.dynamic.run_command", fake_run)
+
+    out = ToolExecutor(build_default_registry()).execute("dynamic.author_and_run_exploit", {"repo_path": str(repo), "hypothesis": hyp.model_dump(mode="json")}, state)
+    assert out.data["verdict"] == "confirmed"
+    assert out.data["classification"] == "security_invariant_violation_or_test_needs_review"
+    # confirmed via the DSL phase, before any free-form fallback
+    assert any("dsl iter 1: ran ->" in h for h in out.data["history"])
+    assert not any("unparseable" in h for h in out.data["history"])

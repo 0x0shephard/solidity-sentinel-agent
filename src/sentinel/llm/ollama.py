@@ -86,6 +86,17 @@ class OllamaPocRepairer(BasePocRepairer):
         return extract_solidity_code(content)
 
 
+_POC_PLAN_SYSTEM = (
+    "You are Solidity Sentinel's exploit-plan author. You do NOT write Solidity. You output a SINGLE JSON object "
+    "describing a structured exploit plan with keys: actors, setup_calls, attack_calls, before, after, invariant. "
+    "When executed the plan must BREAK exactly one invariant. Use ONLY function names that appear in the supplied "
+    "target interface or fixture surface — never invent members. 'before' and 'after' are state reads (name, expr, "
+    "solidity_type) snapshotted around the attack; 'invariant' has a 'description' and an 'assertion' that is TRUE "
+    "when the system is SAFE and references at least one after_<name> local, so the exploit makes it FALSE. Do NOT "
+    "use vm.expectRevert. Return ONLY the JSON object — no prose, no code fence, no Solidity."
+)
+
+
 class OllamaPocAuthor(BasePocAuthor):
     def __init__(self, model: str, base_url: str, api_key: str | None = None, llm: ChatOllama | None = None) -> None:
         self.llm = llm or ChatOllama(
@@ -94,11 +105,25 @@ class OllamaPocAuthor(BasePocAuthor):
             temperature=0.0,
             client_kwargs=_ollama_client_kwargs(api_key),
         )
+        # A separate JSON-mode instance for exploit-plan (DSL) authoring: the
+        # Solidity-forcing author system prompt + free-text mode cannot emit a
+        # parseable plan, so plan authoring needs format="json".
+        self.json_llm = ChatOllama(
+            model=model,
+            base_url=base_url,
+            temperature=0.0,
+            format="json",
+            client_kwargs=_ollama_client_kwargs(api_key),
+        )
 
     def author(self, prompt: str) -> str:
         response = invoke_chat(self.llm, [SystemMessage(content=_POC_AUTHOR_SYSTEM), HumanMessage(content=prompt)])
         content = response.content if isinstance(response.content, str) else json.dumps(response.content)
         return extract_solidity_code(content)
+
+    def author_plan(self, prompt: str) -> str:
+        response = invoke_chat(self.json_llm, [SystemMessage(content=_POC_PLAN_SYSTEM), HumanMessage(content=prompt)])
+        return response.content if isinstance(response.content, str) else json.dumps(response.content)
 
 
 def coerce_research_refinement_payload(payload: dict) -> dict:
