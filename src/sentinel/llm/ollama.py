@@ -188,6 +188,11 @@ def coerce_proposed_hypothesis(payload: dict) -> dict | None:
         confidence = float(payload.get("confidence", 0.5))
     except (TypeError, ValueError):
         confidence = 0.5
+    def _as_list(value) -> list[str]:
+        if isinstance(value, str):
+            value = [value]
+        return [str(item) for item in (value or []) if item is not None][:10]
+
     return {
         "title": title[:200],
         "vulnerability_class": vulnerability_class[:80],
@@ -197,6 +202,13 @@ def coerce_proposed_hypothesis(payload: dict) -> dict | None:
         "reasoning": str(payload.get("reasoning") or payload.get("explanation") or "")[:1500],
         "exploit_preconditions": preconditions,
         "confidence": max(0.0, min(1.0, confidence)),
+        # Structured proof obligation (invariant reasoner emits these; proposer omits).
+        "required_proof": str(payload.get("required_proof") or "")[:600],
+        "pre_state": str(payload.get("pre_state") or "")[:600],
+        "attack_sequence": _as_list(payload.get("attack_sequence") or payload.get("calls")),
+        "deltas": _as_list(payload.get("deltas")),
+        "broken_equation": str(payload.get("broken_equation") or "")[:400],
+        "impact": str(payload.get("impact") or "")[:400],
     }
 
 
@@ -431,8 +443,13 @@ _INVARIANT_VIOLATION_SYSTEM = (
     "invariant with the exact breaking sequence. "
     "Return ONLY JSON: "
     '{"hypotheses":[{"title":"...","vulnerability_class":"...","affected_file":"...","affected_function":"...",'
-    '"affected_contract":"...","reasoning":"the invariant, and the ordered call sequence (with values) that breaks it",'
-    '"exploit_preconditions":["..."],"confidence":0.0}]}. '
+    '"affected_contract":"...","reasoning":"the invariant and the breaking sequence",'
+    '"required_proof":"the exact guarantee a PoC must violate","pre_state":"state vars + starting relationship",'
+    '"attack_sequence":["actor calls fn(args)","..."],"deltas":["how each call changes state"],'
+    '"broken_equation":"equality/inequality true when SAFE that the attack makes false",'
+    '"impact":"who profits / what is lost","exploit_preconditions":["..."],"confidence":0.0}]}. '
+    "Fill pre_state, attack_sequence, deltas, broken_equation, and impact concretely — they become the machine-checkable "
+    "proof obligation handed to the PoC author. "
     "Every affected_file and affected_function MUST be copied verbatim from a '// file: ... | function: ...' header "
     "in the supplied source; never invent files, functions, or line numbers. Prefer the entry-point function where "
     "the violating sequence is triggered. Return [] if no invariant can be broken."

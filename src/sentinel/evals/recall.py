@@ -58,6 +58,10 @@ class GroundTruthFinding(BaseModel):
     function: str
     vulnerability_class: str = "unknown"
     match_any: list[str] = Field(default_factory=list)
+    # Optional: the essential root-cause concepts a candidate must mention to count
+    # as mechanism-correct. When set, mechanism is concept-based (root cause), not
+    # just vulnerability-class alignment.
+    mechanism_concepts: list[str] = Field(default_factory=list)
 
 
 class FindingMatch(BaseModel):
@@ -69,9 +73,10 @@ class FindingMatch(BaseModel):
     stage: str | None = None  # furthest stage the bug reached (candidate/reviewed/delivered)
     matched_by: str | None = None
     matched_keyword: str | None = None
-    executed_proof: bool = False  # backed by an executed PoC
-    mechanism_match: bool = False  # candidate's vuln class aligns with the real root cause
-    novel: bool = False  # recalled by a candidate that did not rely on a RAG/historical match
+    executed_proof: bool = False  # backed by an executed PoC (sound proof)
+    mechanism_match: bool = False  # root-cause concepts present (or class-aligned fallback)
+    novel: bool = False  # first source is llm_proposer/invariant_reasoner, no detector equivalent
+    novel_proof: bool = False  # novel AND backed by an executed proof
 
 
 class RecallReport(BaseModel):
@@ -80,15 +85,30 @@ class RecallReport(BaseModel):
     recalled: int
     touched: int
     # Cumulative recall funnel: candidate >= reviewed >= delivered, plus the
-    # executed_proof subset. Keyed by stage name (+ "executed_proof").
+    # executed_proof (sound-proof) subset. Keyed by stage name (+ "executed_proof").
     by_stage: dict[str, int] = Field(default_factory=dict)
     mechanism_recalled: int = 0
     novel_recalled: int = 0
+    novel_proof_recalled: int = 0
     by_severity: dict[str, dict[str, int]] = Field(default_factory=dict)
     matches: list[FindingMatch] = Field(default_factory=list)
 
     def recall(self) -> float:
         return self.recalled / self.total if self.total else 0.0
+
+
+# Discovery origin of a candidate, derived from its source_detection_ids. "novel"
+# means the agent reasoned the bug out (llm_proposer / invariant_reasoner) rather
+# than a static detector pattern-matching it.
+def _origin_from_sources(source_ids: list[str]) -> str:
+    blob = " ".join(str(s) for s in (source_ids or [])).lower()
+    if "invariant_reasoner" in blob or "invariant_inferencer" in blob:
+        return "invariant_reasoner"
+    if "llm_proposer" in blob:
+        return "llm_proposer"
+    if source_ids:  # any other detection id is a static/heuristic detector
+        return "detector"
+    return "other"
 
 
 class Candidate(BaseModel):
@@ -102,6 +122,7 @@ class Candidate(BaseModel):
     vulnerability_class: str = ""
     executed_proof: bool = False
     rag_assisted: bool = False
+    origin: str = "other"  # detector | llm_proposer | invariant_reasoner | other
 
     @model_validator(mode="after")
     def _derive_stage(self) -> "Candidate":
@@ -175,6 +196,16 @@ def _recalls_keyword(candidate: Candidate, gt: GroundTruthFinding) -> tuple[bool
     return False, None
 
 
+def _mechanism_correct(candidate: Candidate, gt: GroundTruthFinding) -> bool:
+    """Root-cause agreement. When the ground truth lists ``mechanism_concepts``,
+    require ALL of them to appear in the candidate text (true root cause); else
+    fall back to vulnerability-class alignment (coarser)."""
+    if gt.mechanism_concepts:
+        text = _norm(candidate.text)
+        return all(_norm(concept) in text for concept in gt.mechanism_concepts if _norm(concept))
+    return _class_aligned(candidate.vulnerability_class, gt.vulnerability_class)
+
+
 def evaluate_finding(gt: GroundTruthFinding, candidates: list[Candidate]) -> FindingMatch:
     touched = False
     best_rank = -1
@@ -183,7 +214,7 @@ def evaluate_finding(gt: GroundTruthFinding, candidates: list[Candidate]) -> Fin
     matched_keyword: str | None = None
     executed = False
     mechanism = False
-    novel = False
+    origins: set[str] = set()
     for cand in candidates:
         if not candidate_matches_function(cand, gt):
             continue
@@ -195,9 +226,12 @@ def evaluate_finding(gt: GroundTruthFinding, candidates: list[Candidate]) -> Fin
         if rank > best_rank:
             best_rank, best_stage, matched_by, matched_keyword = rank, cand.stage, cand.source, keyword
         executed = executed or cand.executed_proof
-        mechanism = mechanism or _class_aligned(cand.vulnerability_class, gt.vulnerability_class)
-        novel = novel or (not cand.rag_assisted)
+        mechanism = mechanism or _mechanism_correct(cand, gt)
+        origins.add(cand.origin)
     recalled = best_rank >= 0
+    # Novel = the agent reasoned it out (llm_proposer / invariant_reasoner) and NO
+    # static detector found the same thing. A detector hit disqualifies novelty.
+    novel = recalled and bool(origins & {"llm_proposer", "invariant_reasoner"}) and "detector" not in origins
     return FindingMatch(
         id=gt.id,
         severity=gt.severity,
@@ -209,7 +243,8 @@ def evaluate_finding(gt: GroundTruthFinding, candidates: list[Candidate]) -> Fin
         matched_keyword=matched_keyword,
         executed_proof=executed and recalled,
         mechanism_match=mechanism and recalled,
-        novel=novel and recalled,
+        novel=novel,
+        novel_proof=novel and executed,
     )
 
 
@@ -237,6 +272,7 @@ def score_recall(ground_truth: list[GroundTruthFinding], candidates: list[Candid
         by_stage=by_stage,
         mechanism_recalled=sum(m.mechanism_match for m in matches),
         novel_recalled=sum(m.novel for m in matches),
+        novel_proof_recalled=sum(m.novel_proof for m in matches),
         by_severity=by_severity,
         matches=matches,
     )
@@ -276,6 +312,7 @@ def _candidate_from_hypothesis(raw: dict, source: str) -> Candidate:
         vulnerability_class=str(raw.get("vulnerability_class", "")),
         executed_proof=_norm(raw.get("proof_status")) == "executed_poc_confirmed",
         rag_assisted=bool(raw.get("historical_matches")),
+        origin=_origin_from_sources(raw.get("source_detection_ids", []) or []),
     )
 
 
@@ -315,11 +352,12 @@ def render_recall_markdown(report: RecallReport) -> str:
         f"- **candidate** (any proposed hypothesis): {pct(stage.get('candidate', 0))}",
         f"- **reviewed** (survived adversarial review): {pct(stage.get('reviewed', 0))}",
         f"- **delivered** (reported as a finding): {pct(stage.get('delivered', 0))}",
-        f"- **executed-proof** (PoC broke the invariant): {pct(stage.get('executed_proof', 0))}",
+        f"- **sound-proof** (PoC broke the invariant, control-validated): {pct(stage.get('executed_proof', 0))}",
         "",
         f"- Touched (looked at the function): {pct(report.touched)}",
-        f"- **Mechanism-correct** (root cause aligned, not just keyword): {pct(report.mechanism_recalled)}",
-        f"- **Novel** (found without a RAG/historical match): {pct(report.novel_recalled)}",
+        f"- **Mechanism-correct** (root-cause concepts when defined, else class-aligned): {pct(report.mechanism_recalled)}",
+        f"- **Novel** (reasoned by llm_proposer/invariant_reasoner, no detector found it): {pct(report.novel_recalled)}",
+        f"- **Novel-proof** (novel AND control-validated PoC): {pct(report.novel_proof_recalled)}",
         "",
         "| severity | recalled | touched | total |",
         "|---|---|---|---|",

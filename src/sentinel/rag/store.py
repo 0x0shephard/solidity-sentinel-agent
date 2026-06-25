@@ -12,6 +12,20 @@ from sentinel.rag.embeddings import LangChainEmbeddingAdapter, SentenceTransform
 from sentinel.schemas.rag import HistoricalFinding, HistoricalFindingQuery, RAGIndexMetadata
 
 
+def _finding_matches_terms(finding: HistoricalFinding, terms: list[str]) -> bool:
+    """True if a finding's protocol/source identifies it with an excluded project.
+
+    Matches on protocol_name, source/github links, slug, and title (lowercased) —
+    enough to drop a target project's own published findings without nuking
+    unrelated findings that merely mention the term in prose.
+    """
+    haystack = " ".join(
+        str(getattr(finding, attr, "") or "")
+        for attr in ("protocol_name", "source_link", "github_link", "slug", "title")
+    ).lower()
+    return any(term in haystack for term in terms)
+
+
 def rag_paths(settings: Settings, root: Path | None = None) -> dict[str, Path]:
     root = root or settings.rag_dir
     return {
@@ -140,6 +154,14 @@ class HistoricalFindingStore:
 
     def search_documents(self, query: HistoricalFindingQuery, candidate_k: int = 25) -> list[dict]:
         findings_by_id = {finding.id: finding for finding in load_findings(self.settings, self.root)}
+        # Blind RAG: drop the target project's own published findings so the eval
+        # measures discovery, not retrieval of the answer. A dropped finding's id is
+        # absent from the map, so any candidate referencing it is skipped below.
+        exclude_terms = [t.lower() for t in getattr(self.settings, "rag_exclude_terms", []) if t]
+        if exclude_terms:
+            findings_by_id = {
+                fid: f for fid, f in findings_by_id.items() if not _finding_matches_terms(f, exclude_terms)
+            }
         if not findings_by_id:
             return []
         try:

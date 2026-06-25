@@ -9,6 +9,36 @@ from sentinel.schemas.rag import RAGContextBundle
 from sentinel.schemas.static import SourceEvidence
 
 
+class ProofObligation(BaseModel):
+    """A machine-checkable obligation for breaking one invariant, carried from the
+    reasoner all the way to the exploit author so the PoC reasons from a concrete
+    pre-state -> calls -> deltas -> broken-equation -> impact structure rather than
+    a flattened title."""
+
+    pre_state: str = ""  # the state vars + starting relationship the invariant assumes
+    attack_sequence: list[str] = Field(default_factory=list)  # ordered concrete calls (actor, fn, args)
+    deltas: list[str] = Field(default_factory=list)  # how each call changes the relevant state
+    broken_equation: str = ""  # the exact equality/inequality made false (before/after terms)
+    impact: str = ""  # who profits / what is lost, and severity
+
+    def is_empty(self) -> bool:
+        return not (self.pre_state or self.attack_sequence or self.deltas or self.broken_equation or self.impact)
+
+    def to_prompt(self) -> str:
+        parts = []
+        if self.pre_state:
+            parts.append(f"PRE-STATE: {self.pre_state}")
+        if self.attack_sequence:
+            parts.append("CALLS:\n" + "\n".join(f"  {i+1}. {c}" for i, c in enumerate(self.attack_sequence)))
+        if self.deltas:
+            parts.append("DELTAS:\n" + "\n".join(f"  - {d}" for d in self.deltas))
+        if self.broken_equation:
+            parts.append(f"BROKEN EQUATION (true when safe, your attack makes it false): {self.broken_equation}")
+        if self.impact:
+            parts.append(f"IMPACT: {self.impact}")
+        return "\n".join(parts)
+
+
 class SlitherFinding(BaseModel):
     check: str
     impact: str | None = None
@@ -37,6 +67,11 @@ class VulnerabilityHypothesis(BaseModel):
     graph_slice_ids: list[str] = Field(default_factory=list)
     proof_packet_id: str | None = None
     proof_obligations: list[str] = Field(default_factory=list)
+    # The concrete proof obligation this hypothesis must demonstrate, propagated
+    # from the invariant candidate / reasoner so the exploit author reasons from it
+    # rather than re-deriving from the title.
+    required_proof: str | None = None
+    proof_obligation: ProofObligation | None = None
     counterevidence: list[str] = Field(default_factory=list)
     proof_status: str = "setup_required"
     exploit_precondition_terms: list[str] = Field(default_factory=list)
@@ -91,6 +126,14 @@ class ProposedHypothesis(BaseModel):
     reasoning: str = ""
     exploit_preconditions: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Structured proof obligation (the invariant reasoner fills these; the proposer
+    # may leave them empty). Carried onto the hypothesis for the exploit author.
+    required_proof: str = ""
+    pre_state: str = ""
+    attack_sequence: list[str] = Field(default_factory=list)
+    deltas: list[str] = Field(default_factory=list)
+    broken_equation: str = ""
+    impact: str = ""
 
 
 class ProposedHypothesisBatch(BaseModel):

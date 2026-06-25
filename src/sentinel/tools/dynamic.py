@@ -890,6 +890,124 @@ def _contract_public_members(body: str) -> list[str]:
     return list(dict.fromkeys(fns + getters))
 
 
+def _find_contract_bodies(repo_path: str, wanted: set[str]) -> dict[str, str]:
+    """Capped source bodies for the named contract/interface types (protocol source
+    only, never lib deps)."""
+    bodies: dict[str, str] = {}
+    if not wanted:
+        return bodies
+    for sol in Path(repo_path).rglob("*.sol"):
+        rel = sol.as_posix()
+        if "/lib/" in rel or "/node_modules/" in rel:
+            continue
+        try:
+            text = sol.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"(?:abstract\s+)?(?:contract|interface)\s+(\w+)", text):
+            name = m.group(1)
+            if name in wanted and name not in bodies:
+                bodies[name] = text[m.start(): m.start() + 8000]
+        if len(bodies) >= len(wanted):
+            break
+    return bodies
+
+
+def _contract_signatures(body: str) -> dict[str, set[int]]:
+    """``function name -> {param counts}`` for a contract's public/external functions,
+    plus public state-var getters (arity 0). Lets the DSL validator check that the
+    chosen receiver actually exposes the function at the given arity."""
+    sigs: dict[str, set[int]] = {}
+    for m in re.finditer(r"function\s+(\w+)\s*\(([^)]*)\)([^;{]*)", body):
+        quals = m.group(3)
+        if "public" not in quals and "external" not in quals:
+            continue
+        params = m.group(2).strip()
+        arity = 0 if not params else len([p for p in params.split(",") if p.strip()])
+        sigs.setdefault(m.group(1), set()).add(arity)
+    for m in re.finditer(r"\b[A-Za-z_][\w\.\[\]]*\s+public\s+(?:immutable\s+|constant\s+)?([A-Za-z_]\w*)\s*[;=]", body):
+        sigs.setdefault(m.group(1), set()).add(0)
+    return sigs
+
+
+def _artifact_signatures(repo_path: str, wanted: set[str]) -> dict[str, dict[str, set[int]]]:
+    """Function signatures from Foundry artifacts, including inherited ABI entries.
+
+    Source regexes are useful before a project is built, but the compiled ABI is the
+    ground truth for receiver typing when ``out/**/*.json`` exists: it includes
+    inherited ERC20/ERC4626-style functions and generated getters that may not be
+    present in the concrete contract's source body.
+    """
+    out_dir = Path(repo_path) / "out"
+    if not wanted or not out_dir.exists():
+        return {}
+    signatures: dict[str, dict[str, set[int]]] = {}
+    for artifact in out_dir.rglob("*.json"):
+        typ = artifact.stem
+        if typ not in wanted or "build-info" in artifact.parts:
+            continue
+        try:
+            data = json.loads(artifact.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        abi = data.get("abi")
+        if not isinstance(abi, list):
+            continue
+        sigs = signatures.setdefault(typ, {})
+        for item in abi:
+            if not isinstance(item, dict) or item.get("type") != "function" or not item.get("name"):
+                continue
+            inputs = item.get("inputs") or []
+            arity = len(inputs) if isinstance(inputs, list) else 0
+            sigs.setdefault(str(item["name"]), set()).add(arity)
+    return signatures
+
+
+def _merge_signature_maps(*maps: dict[str, set[int]]) -> dict[str, set[int]]:
+    merged: dict[str, set[int]] = {}
+    for sigs in maps:
+        for name, arities in sigs.items():
+            merged.setdefault(name, set()).update(arities)
+    return merged
+
+
+def _build_receiver_typing(repo_path: str, fixture: dict) -> tuple[dict[str, str], dict[str, dict[str, set[int]]]]:
+    """Resolve every plan receiver to a concrete contract type and that type's
+    function signatures, so a call can be validated against the RECEIVER's real ABI
+    (not the global protocol-wide union).
+
+    Returns ``(receiver_types, type_signatures)`` where ``receiver_types`` maps a
+    bare instance (``pool``) AND each orchestrator getter chain (``protocol.pool()``)
+    to its type, and ``type_signatures`` maps a type to ``{fn -> {arities}}``.
+    """
+    surface = fixture.get("surface", "") or ""
+    src = fixture.get("source", "") or ""
+    inst_type: dict[str, str] = {name: typ for typ, name in _TYPE_LINE_RE.findall(surface)}
+    for m in re.finditer(r"^\s+([A-Z]\w*)\s+(?:public\s+|internal\s+)?([a-z]\w*)\s*;", src, flags=re.MULTILINE):
+        inst_type.setdefault(m.group(2), m.group(1))
+    if not inst_type:
+        return {}, {}
+
+    bodies = _find_contract_bodies(repo_path, set(inst_type.values()))
+    receiver_types: dict[str, str] = dict(inst_type)
+    # Orchestrator getters: protocol.pool() -> Pool, etc.
+    extra_types: set[str] = set()
+    for name, typ in list(inst_type.items()):
+        for gm in re.finditer(r"\b([A-Z]\w*)\s+public\s+(?:immutable\s+|constant\s+)?([a-z]\w*)\s*[;=]", bodies.get(typ, "")):
+            sub_type, getter = gm.group(1), gm.group(2)
+            receiver_types[f"{name}.{getter}()"] = sub_type
+            extra_types.add(sub_type)
+    bodies.update(_find_contract_bodies(repo_path, extra_types - set(bodies)))
+    all_types = set(inst_type.values()) | extra_types
+    artifact_sigs = _artifact_signatures(repo_path, all_types)
+    type_signatures = {}
+    for typ in all_types:
+        merged = _merge_signature_maps(_contract_signatures(bodies.get(typ, "")), artifact_sigs.get(typ, {}))
+        if merged:
+            type_signatures[typ] = merged
+    return receiver_types, type_signatures
+
+
 def _instance_interfaces(repo_path: str, surface: str, max_types: int = 14) -> tuple[str, set[str]]:
     """Map each fixture instance to the public members of its contract type.
 
@@ -903,23 +1021,7 @@ def _instance_interfaces(repo_path: str, surface: str, max_types: int = 14) -> t
     if not pairs:
         return "", set()
     wanted = {t for t, _ in pairs}
-    # Scan the protocol's own source (not lib deps) once for each needed type body.
-    bodies: dict[str, str] = {}
-    root = Path(repo_path)
-    for sol in list(root.rglob("*.sol")):
-        rel = sol.as_posix()
-        if "/lib/" in rel or "/node_modules/" in rel:
-            continue
-        try:
-            text = sol.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for m in re.finditer(r"(?:abstract\s+)?(?:contract|interface)\s+(\w+)", text):
-            name = m.group(1)
-            if name in wanted and name not in bodies:
-                bodies[name] = text[m.start(): m.start() + 6000]
-        if len(bodies) >= len(wanted):
-            break
+    bodies = _find_contract_bodies(repo_path, wanted)
     lines: list[str] = []
     members: set[str] = set()
     for typ, name in pairs:
@@ -1644,6 +1746,10 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
         fixture = {**fixture, "instance_interfaces": instance_iface_text}
         protocol_functions |= instance_members
         known_functions = _dsl.collect_known_functions(repair_interface, fixture.get("surface", ""), extra_function_names=protocol_functions)
+        # Receiver-typed validation: resolve each receiver to its contract type +
+        # signatures so a call is checked against the RECEIVER's real ABI (precise
+        # arity), not the global protocol-wide union (which used ANY_ARITY).
+        receiver_types, type_signatures = _build_receiver_typing(inp.repo_path, fixture)
         plan_errors: list[str] | None = None
         for attempt in range(1, max_iters + 1):
             prompt = _dsl.build_plan_prompt(hypothesis, repair_interface, fixture, prior_errors=plan_errors)
@@ -1664,7 +1770,7 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
                     "and assertion). No prose, no code fence, no Solidity."
                 ]
                 continue
-            plan_errors = _dsl.validate_plan(plan, known_functions, known_targets=known_targets)
+            plan_errors = _dsl.validate_plan(plan, known_functions, known_targets=known_targets, receiver_types=receiver_types, type_signatures=type_signatures)
             if plan_errors:
                 history.append(f"dsl iter {attempt}: invalid plan ({len(plan_errors)} errors): {'; '.join(plan_errors)[:300]}")
                 continue
@@ -1689,13 +1795,35 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
                 except OSError:
                     pass
                 continue
-            run_result = run_command(["forge", "test", "--offline", "--match-contract", "Sentinel"], cwd=str(worktree), timeout=timeout)
+            treatment_contract = re.sub(r"[^A-Za-z0-9_]", "", test_path.stem)
+            run_result = run_command(["forge", "test", "--offline", "--match-contract", f"^{treatment_contract}$"], cwd=str(worktree), timeout=timeout)
             classification = _classify_validation_run(run_result.return_code, run_result.stdout, run_result.stderr, run_result.timed_out)
             result_summary = _extract_forge_result_summary(run_result.stdout, run_result.stderr)
             history.append(f"dsl iter {attempt}: ran -> {classification} | {result_summary}")
             if classification == "security_invariant_violation_or_test_needs_review":
-                verdict = "confirmed"  # the asserted invariant broke when executed
-                break
+                # DIFFERENTIAL CONTROL — a failing assertion is a PROOF only if it is
+                # *caused by the attack*. Require (a) the attack actually calls the
+                # affected function and (b) the SAME test PASSES with the attack
+                # removed. Otherwise the assertion is vacuous / setup-dependent.
+                if not _dsl.attack_calls_hit_function(plan, hypothesis.affected_functions):
+                    history.append(f"dsl iter {attempt}: violation but attack never calls affected fn -> not a proof")
+                    plan_errors = [
+                        f"the attack_calls must invoke the affected function ({', '.join((hypothesis.affected_functions or [])[:3])}) — "
+                        "they did not, so the failure is about an unrelated path. Call the affected function in the attack."
+                    ]
+                    continue
+                ctrl_ok, ctrl_class = _run_differential_control(
+                    _dsl, plan, fixture, target_source, target_function, hyp_slug, test_dir, worktree, timeout, history, attempt
+                )
+                if ctrl_ok:
+                    verdict = "confirmed"  # holds without attack, breaks with it -> causal proof
+                    break
+                plan_errors = [
+                    f"VACUOUS: the invariant assertion also fails WITHOUT the attack (control -> {ctrl_class}). Your "
+                    "before-state already violates it or the assertion is mis-stated. Choose an invariant that HOLDS at "
+                    "baseline and is broken ONLY by the attack."
+                ]
+                continue
             if classification == "security_invariant_held_or_test_passed":
                 verdict = "refuted"
                 plan_errors = ["the invariant HELD (test passed) — your sequence/values did not trigger the bug; try a materially different attack."]
@@ -1735,7 +1863,12 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
         result_summary = _extract_forge_result_summary(run_result.stdout, run_result.stderr)
         history.append(f"iter {attempt}: ran -> {classification} | {result_summary}")
         if classification == "security_invariant_violation_or_test_needs_review":
-            verdict = "confirmed"  # the asserted invariant broke when executed
+            # Free-form has no structured attack/control split, so we cannot build a
+            # differential control to prove causality. A failing assertion here is a
+            # strong LEAD, not a confirmed proof — only a control-validated DSL plan
+            # promotes to executed_poc_confirmed.
+            verdict = "needs_review"
+            history.append(f"iter {attempt}: free-form assertion failed -> needs_review (no differential control)")
             break
         if classification in _VALIDATION_FAILURE_CLASSIFICATIONS:
             if classification == "validation_reverted_not_asserted":
@@ -1756,6 +1889,34 @@ def author_and_run_exploit(inp: PocInput, state) -> DynamicGenericOutput:
         prior = {"code": code, "observation": f"TEST PASSED — invariant HELD ({result_summary}). Your attack did not trigger the bug; try a materially different sequence/values."}
 
     return _finalize_exploit(state, run_dir, hyp_slug, hypothesis, test_path, verdict, classification, result_summary, history)
+
+
+def _run_differential_control(_dsl, plan, fixture, target_source, target_function, hyp_slug, test_dir, worktree, timeout, history, attempt) -> tuple[bool, str]:
+    """Render and run the CONTROL (attack removed) for a plan whose full version
+    broke the invariant. Returns (control_passed, control_classification).
+
+    A causal proof requires the control to PASS: same setup + assertion, no attack,
+    invariant holds. If the control also fails (or won't compile), the failure was
+    not caused by the attack — the assertion is vacuous or setup-dependent.
+    """
+    control_contract = f"SentinelControl{re.sub(r'[^A-Za-z0-9_]', '', target_function)[:16]}_{hyp_slug}"
+    pragma = fixture.get("pragma") or _extract_pragma(target_source) or "^0.8.20"
+    control_code = _dsl.render_plan(plan, fixture, pragma, control_contract, include_attack=False)
+    control_path = test_dir / f"{control_contract}.t.sol"
+    control_path.write_text(control_code, encoding="utf-8")
+    try:
+        cbuild = run_command(["forge", "build", "--offline"], cwd=str(worktree), timeout=timeout)
+        if cbuild.return_code != 0:
+            history.append(f"dsl iter {attempt}: control did not compile -> cannot establish causality")
+            return False, "control_compile_failed"
+        cres = run_command(["forge", "test", "--offline", "--match-contract", f"^{control_contract}$"], cwd=str(worktree), timeout=timeout)
+        cclass = _classify_validation_run(cres.return_code, cres.stdout, cres.stderr, cres.timed_out)
+        history.append(f"dsl iter {attempt}: control (attack removed) -> {cclass}")
+        return cclass == "security_invariant_held_or_test_passed", cclass
+    finally:
+        # Remove the control file so the next iteration's exact-match treatment run
+        # and any later batch run never pick it up.
+        control_path.unlink(missing_ok=True)
 
 
 def _finalize_exploit(state, run_dir, hyp_slug, hypothesis, test_path, verdict, classification, result_summary, history) -> DynamicGenericOutput:

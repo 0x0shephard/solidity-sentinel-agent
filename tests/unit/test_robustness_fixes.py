@@ -108,20 +108,27 @@ def test_confidence_capped_without_executed_validation():
     class _Hyp:
         proof_status = "static_proof_complete"
 
-    # No executed validation run in state -> 0.95 candidate is capped to 0.85.
+    # A static-only proof is capped to 0.85 regardless of state.
     assert _calibrated_confidence(0.95, _Hyp(), {}) == 0.85
     # A value already under the cap is left untouched.
     assert _calibrated_confidence(0.60, _Hyp(), {}) == 0.60
 
-    # An executed validation that demonstrated the violation lifts the cap.
-    state = {
+    # A GLOBAL batch validation classification must NOT lift this hypothesis's cap
+    # (cross-hypothesis leak): only its own proof_status can.
+    leaky_state = {
         "last_outputs": {
             "dynamic.run_validation_artifacts": {
                 "data": {"classification": "security_invariant_violation_or_test_needs_review"}
             }
         }
     }
-    assert _calibrated_confidence(0.95, _Hyp(), state) == 0.95
+    assert _calibrated_confidence(0.95, _Hyp(), leaky_state) == 0.85
+
+    # Only THIS hypothesis's own executed PoC lifts the cap.
+    class _Executed:
+        proof_status = "executed_poc_confirmed"
+
+    assert _calibrated_confidence(0.95, _Executed(), {}) == 0.95
 
 
 # --- adversarial reviewer: guard counterevidence only valid for guard-class bugs ---

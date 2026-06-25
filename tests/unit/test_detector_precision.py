@@ -79,9 +79,17 @@ def test_confirmed_kept_with_semantic_proof():
 
 
 def test_confirmed_kept_with_executable_validation():
-    state = {"last_outputs": {"dynamic.run_validation_artifacts": {"data": {"classification": "security_invariant_violation_or_test_needs_review"}}}}
-    status, _ = _status_with_proof_gate("confirmed", _hyp("strong_local_path"), state)
+    # THIS hypothesis's own executed PoC keeps it confirmed.
+    status, _ = _status_with_proof_gate("confirmed", _hyp("executed_poc_confirmed"), {"last_outputs": {}})
     assert status == "confirmed"
+
+
+def test_confirmed_not_kept_by_other_hypothesis_validation():
+    # A GLOBAL batch validation result must NOT confirm a hypothesis that has no
+    # proof of its own (cross-hypothesis leak fix).
+    leaky = {"last_outputs": {"dynamic.run_validation_artifacts": {"data": {"classification": "security_invariant_violation_or_test_needs_review"}}}}
+    status, _ = _status_with_proof_gate("confirmed", _hyp("strong_local_path"), leaky)
+    assert status == "likely"
 
 
 def test_proof_gate_ignores_non_confirmed():

@@ -73,6 +73,14 @@ class Settings(BaseModel):
     # its own read/write code slice and a pre-state->calls->deltas->broken-equation
     # ->impact template, instead of one batched prompt over all invariants. More
     # focused (better novel bugs) at the cost of more LLM calls; bounded below.
+    # Blind evaluation: hide audit reports / findings / known-issue docs that ship
+    # in a target repo from every file tool, so the agent cannot read the answers.
+    # A real bug-bounty audit should never consult existing audit reports anyway.
+    blind_audit_eval: bool = Field(default=True)
+    # Blind RAG: drop historical findings whose protocol/source matches any of these
+    # terms (case-insensitive), so auditing a project cannot retrieve that project's
+    # OWN published findings from the brain. Set per-eval, e.g. "sentiment".
+    rag_exclude_terms: list[str] = Field(default_factory=list)
     invariant_reasoning_one_at_a_time: bool = Field(default=True)
     invariant_reasoning_max_invariants: int = Field(default=8, ge=0)
     invariant_reasoning_per_invariant: int = Field(default=2, ge=1)
@@ -140,6 +148,8 @@ def get_settings() -> Settings:
         exploit_loop_max_iterations=int(os.getenv("SENTINEL_EXPLOIT_LOOP_MAX_ITERATIONS", "3")),
         exploit_loop_max_hypotheses=int(os.getenv("SENTINEL_EXPLOIT_LOOP_MAX_HYPOTHESES", "3")),
         exploit_dsl_enabled=os.getenv("SENTINEL_EXPLOIT_DSL_ENABLED", "1") not in {"0", "false", "False"},
+        blind_audit_eval=os.getenv("SENTINEL_BLIND_AUDIT_EVAL", "1") not in {"0", "false", "False"},
+        rag_exclude_terms=split_csv("SENTINEL_RAG_EXCLUDE_TERMS", ""),
         invariant_reasoning_one_at_a_time=os.getenv("SENTINEL_INVARIANT_REASONING_ONE_AT_A_TIME", "1") not in {"0", "false", "False"},
         invariant_reasoning_max_invariants=int(os.getenv("SENTINEL_INVARIANT_REASONING_MAX_INVARIANTS", "8")),
         invariant_reasoning_per_invariant=int(os.getenv("SENTINEL_INVARIANT_REASONING_PER_INVARIANT", "2")),

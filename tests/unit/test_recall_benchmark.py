@@ -119,25 +119,60 @@ def test_mechanism_recall_is_stricter_than_keyword():
     assert report2.mechanism_recalled == 1
 
 
-def test_novel_recall_excludes_rag_assisted():
-    rag = Candidate(functions=["deposit"], files=["src/Vault.sol"], text="share inflation attack",
-                    source="findings", vulnerability_class="accounting_invariant", rag_assisted=True)
-    report = score_recall(_one_gt(), [rag])
+def test_novel_recall_is_origin_based_not_rag_based():
+    # A static-detector finding is NOT novel even with empty historical_matches
+    # (the old not-RAG definition wrongly called it novel).
+    detector = Candidate(functions=["deposit"], files=["src/Vault.sol"], text="share inflation attack",
+                         source="findings", vulnerability_class="accounting_invariant", origin="detector")
+    report = score_recall(_one_gt(), [detector])
     assert report.recalled == 1
-    assert report.novel_recalled == 0  # only a RAG-assisted candidate matched
+    assert report.novel_recalled == 0
 
-    novel = Candidate(functions=["deposit"], files=["src/Vault.sol"], text="share inflation attack",
-                      source="findings", vulnerability_class="accounting_invariant", rag_assisted=False)
-    report2 = score_recall(_one_gt(), [rag, novel])
-    assert report2.novel_recalled == 1  # a non-RAG candidate also found it
+    # Reasoned out by the LLM proposer with no detector equivalent -> novel.
+    reasoned = Candidate(functions=["deposit"], files=["src/Vault.sol"], text="share inflation attack",
+                         source="findings", vulnerability_class="accounting_invariant", origin="llm_proposer")
+    assert score_recall(_one_gt(), [reasoned]).novel_recalled == 1
+
+    # If a detector ALSO found it, novelty is disqualified.
+    assert score_recall(_one_gt(), [reasoned, detector]).novel_recalled == 0
+
+
+def test_novel_proof_requires_novel_and_executed():
+    reasoned_proven = Candidate(functions=["deposit"], files=["src/Vault.sol"], text="share inflation attack",
+                                source="findings", vulnerability_class="accounting_invariant",
+                                origin="invariant_reasoner", executed_proof=True)
+    report = score_recall(_one_gt(), [reasoned_proven])
+    assert report.novel_recalled == 1
+    assert report.novel_proof_recalled == 1
+    # novel but no proof -> not a novel-proof
+    reasoned_unproven = Candidate(functions=["deposit"], files=["src/Vault.sol"], text="share inflation attack",
+                                  source="findings", vulnerability_class="accounting_invariant", origin="llm_proposer")
+    assert score_recall(_one_gt(), [reasoned_unproven]).novel_proof_recalled == 0
+
+
+def test_mechanism_concepts_require_root_cause_terms():
+    from sentinel.evals.recall import GroundTruthFinding
+    gt = [GroundTruthFinding(id="H-1", severity="high", title="inflation", file_contains="Vault.sol",
+                             function="deposit", vulnerability_class="accounting_invariant",
+                             match_any=["inflation"], mechanism_concepts=["first depositor", "rounding"])]
+    # keyword matches (inflation) but the root-cause concepts are absent -> not mechanism-correct
+    weak = Candidate(functions=["deposit"], files=["src/Vault.sol"], text="share inflation attack",
+                     source="findings", vulnerability_class="accounting_invariant", origin="llm_proposer")
+    assert score_recall(gt, [weak]).mechanism_recalled == 0
+    # the actual root cause is described -> mechanism-correct
+    strong = Candidate(functions=["deposit"], files=["src/Vault.sol"],
+                       text="first depositor exploits rounding to cause share inflation",
+                       source="findings", vulnerability_class="accounting_invariant", origin="llm_proposer")
+    assert score_recall(gt, [strong]).mechanism_recalled == 1
 
 
 def test_render_markdown_includes_funnel():
     cands = [Candidate(functions=["deposit"], files=["src/Vault.sol"], text="share inflation attack",
-                       source="findings", vulnerability_class="accounting_invariant", executed_proof=True)]
+                       source="findings", vulnerability_class="accounting_invariant", executed_proof=True, origin="llm_proposer")]
     from sentinel.evals.recall import render_recall_markdown
     md = render_recall_markdown(score_recall(_one_gt(), cands))
     assert "Recall funnel" in md
-    assert "executed-proof" in md
+    assert "sound-proof" in md
+    assert "Novel-proof" in md
     assert "Mechanism-correct" in md
     assert "Novel" in md

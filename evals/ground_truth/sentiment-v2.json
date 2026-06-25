@@ -2,6 +2,9 @@
   "contest": "2024-08-sentiment-v2",
   "repo_path": "Test/protocol-v2",
   "source": "https://github.com/sherlock-audit/2024-08-sentiment-v2-judging (Sherlock audit, official findings)",
+  "rag_exclude_terms": [
+    "sentiment"
+  ],
   "notes": "Holdout protocol (lending: isolated base pools + ERC4626 SuperPools + oracle adapters). 3 High, 20 Medium. Several findings share a function, so match_any keywords are made distinct to avoid one hypothesis matching multiple findings.",
   "findings": [
     {
@@ -11,7 +14,17 @@
       "file_contains": "RedstoneOracle.sol",
       "function": "updatePrice",
       "vulnerability_class": "oracle",
-      "match_any": ["time travel", "time-travel", "replay", "back and forth", "validity period", "older price", "warp", "three_minutes", "revert to"]
+      "match_any": [
+        "time travel",
+        "time-travel",
+        "replay",
+        "back and forth",
+        "validity period",
+        "older price",
+        "warp",
+        "three_minutes",
+        "revert to"
+      ]
     },
     {
       "id": "H-2",
@@ -20,7 +33,16 @@
       "file_contains": "RiskModule.sol",
       "function": "_validateSeizedAssetValue",
       "vulnerability_class": "accounting",
-      "match_any": ["type(uint256).max", "type(uint).max", "uint256).max", "double count", "double-count", "replay", "getborrowsof", "seize more"]
+      "match_any": [
+        "type(uint256).max",
+        "type(uint).max",
+        "uint256).max",
+        "double count",
+        "double-count",
+        "replay",
+        "getborrowsof",
+        "seize more"
+      ]
     },
     {
       "id": "H-3",
@@ -29,7 +51,17 @@
       "file_contains": "Pool.sol",
       "function": "deposit",
       "vulnerability_class": "accounting",
-      "match_any": ["first deposit", "inflate", "inflation", "share price", "rounding down", "rounds down", "total supply is zero", "totalsupply == 0", "1 wei"]
+      "match_any": [
+        "first deposit",
+        "inflate",
+        "inflation",
+        "share price",
+        "rounding down",
+        "rounds down",
+        "total supply is zero",
+        "totalsupply == 0",
+        "1 wei"
+      ]
     },
     {
       "id": "M-1",
@@ -38,7 +70,15 @@
       "file_contains": "SuperPoolFactory.sol",
       "function": "deploySuperPool",
       "vulnerability_class": "erc20",
-      "match_any": ["safeapprove", "approve", "missing return", "no return value", "usdt", "boolean", "does not return"]
+      "match_any": [
+        "safeapprove",
+        "approve",
+        "missing return",
+        "no return value",
+        "usdt",
+        "boolean",
+        "does not return"
+      ]
     },
     {
       "id": "M-2",
@@ -47,7 +87,15 @@
       "file_contains": "PositionManager.sol",
       "function": "liquidate",
       "vulnerability_class": "accounting",
-      "match_any": ["liquidation fee", "unprofitable", "from the profit", "fee.*profit", "no incentive", "insolvency", "fee is calculated"]
+      "match_any": [
+        "liquidation fee",
+        "unprofitable",
+        "from the profit",
+        "fee.*profit",
+        "no incentive",
+        "insolvency",
+        "fee is calculated"
+      ]
     },
     {
       "id": "M-3",
@@ -56,7 +104,18 @@
       "file_contains": "SuperPoolFactory.sol",
       "function": "deploySuperPool",
       "vulnerability_class": "dos",
-      "match_any": ["frontrun", "front-run", "front run", "donat", "precompute", "known address", "create opcode", "min_burned_shares", "too few", "griefer"]
+      "match_any": [
+        "frontrun",
+        "front-run",
+        "front run",
+        "donat",
+        "precompute",
+        "known address",
+        "create opcode",
+        "min_burned_shares",
+        "too few",
+        "griefer"
+      ]
     },
     {
       "id": "M-4",
@@ -65,7 +124,15 @@
       "file_contains": "RiskEngine.sol",
       "function": "acceptLtvUpdate",
       "vulnerability_class": "oracle",
-      "match_any": ["98%", "oracle deviation", "deviation", "100% ltv", "exceed 100", "depeg", "max ltv"]
+      "match_any": [
+        "98%",
+        "oracle deviation",
+        "deviation",
+        "100% ltv",
+        "exceed 100",
+        "depeg",
+        "max ltv"
+      ]
     },
     {
       "id": "M-5",
@@ -74,7 +141,16 @@
       "file_contains": "SuperPool.sol",
       "function": "convertToShares",
       "vulnerability_class": "erc4626",
-      "match_any": ["erc4626", "erc-4626", "4626", "must not be inclusive", "convertto", "not compliant", "strictly compliant", "simulateaccrue"]
+      "match_any": [
+        "erc4626",
+        "erc-4626",
+        "4626",
+        "must not be inclusive",
+        "convertto",
+        "not compliant",
+        "strictly compliant",
+        "simulateaccrue"
+      ]
     },
     {
       "id": "M-6",
@@ -83,7 +159,16 @@
       "file_contains": "RedstoneOracle.sol",
       "function": "getValueInEth",
       "vulnerability_class": "oracle",
-      "match_any": ["stale_price_threshold", "stale price threshold", "3600", "constant threshold", "per token", "per-token", "different threshold", "heartbeat"]
+      "match_any": [
+        "stale_price_threshold",
+        "stale price threshold",
+        "3600",
+        "constant threshold",
+        "per token",
+        "per-token",
+        "different threshold",
+        "heartbeat"
+      ]
     },
     {
       "id": "M-7",
@@ -92,7 +177,15 @@
       "file_contains": "RedstoneOracle.sol",
       "function": "getValueInEth",
       "vulnerability_class": "oracle",
-      "match_any": ["updateprice is not called", "not called", "does not call updateprice", "outdated", "cached price", "stale read", "without updating"]
+      "match_any": [
+        "updateprice is not called",
+        "not called",
+        "does not call updateprice",
+        "outdated",
+        "cached price",
+        "stale read",
+        "without updating"
+      ]
     },
     {
       "id": "M-8",
@@ -101,7 +194,16 @@
       "file_contains": "SuperPool.sol",
       "function": "_supplyToPools",
       "vulnerability_class": "business_logic",
-      "match_any": ["poolcap", "pool cap", "base pool cap", "getassetsof", "free space", "available space", "reverts on deposit", "supplyamt"]
+      "match_any": [
+        "poolcap",
+        "pool cap",
+        "base pool cap",
+        "getassetsof",
+        "free space",
+        "available space",
+        "reverts on deposit",
+        "supplyamt"
+      ]
     },
     {
       "id": "M-9",
@@ -110,7 +212,14 @@
       "file_contains": "SuperPool.sol",
       "function": "convertToShares",
       "vulnerability_class": "accounting",
-      "match_any": ["bad debt", "shares per token", "inflated", "overflow", "muldiv overflow", "liquidatebaddebt"]
+      "match_any": [
+        "bad debt",
+        "shares per token",
+        "inflated",
+        "overflow",
+        "muldiv overflow",
+        "liquidatebaddebt"
+      ]
     },
     {
       "id": "M-10",
@@ -119,7 +228,14 @@
       "file_contains": "SuperPool.sol",
       "function": "deposit",
       "vulnerability_class": "access_control",
-      "match_any": ["pause", "whennotpaused", "togglepause", "pausable", "paused state", "cannot be paused"]
+      "match_any": [
+        "pause",
+        "whennotpaused",
+        "togglepause",
+        "pausable",
+        "paused state",
+        "cannot be paused"
+      ]
     },
     {
       "id": "M-11",
@@ -128,7 +244,15 @@
       "file_contains": "PositionManager.sol",
       "function": "toggleKnownAsset",
       "vulnerability_class": "business_logic",
-      "match_any": ["known asset", "toggleknownasset", "positionassets", "not removed", "still used as collateral", "removetoken", "unknown asset"]
+      "match_any": [
+        "known asset",
+        "toggleknownasset",
+        "positionassets",
+        "not removed",
+        "still used as collateral",
+        "removetoken",
+        "unknown asset"
+      ]
     },
     {
       "id": "M-12",
@@ -137,7 +261,15 @@
       "file_contains": "PositionManager.sol",
       "function": "_transferAssetsToLiquidator",
       "vulnerability_class": "business_logic",
-      "match_any": ["blacklist", "black list", "usdc", "frozen", "blocked transfer", "cannot receive", "liquidation revert"]
+      "match_any": [
+        "blacklist",
+        "black list",
+        "usdc",
+        "frozen",
+        "blocked transfer",
+        "cannot receive",
+        "liquidation revert"
+      ]
     },
     {
       "id": "M-13",
@@ -146,7 +278,16 @@
       "file_contains": "RiskModule.sol",
       "function": "getAssetValue",
       "vulnerability_class": "accounting",
-      "match_any": ["donat", "balanceof", "weighted average", "minreqassetvalue", "force.*liquidat", "virtual balance", "manipulat", "donation"]
+      "match_any": [
+        "donat",
+        "balanceof",
+        "weighted average",
+        "minreqassetvalue",
+        "force.*liquidat",
+        "virtual balance",
+        "manipulat",
+        "donation"
+      ]
     },
     {
       "id": "M-14",
@@ -155,7 +296,15 @@
       "file_contains": "Pool.sol",
       "function": "rebalanceBadDebt",
       "vulnerability_class": "accounting",
-      "match_any": ["first depositor", "100% utilization", "totaldepositassets", "minted 1:1", "socialized", "deposit after", "next depositor"]
+      "match_any": [
+        "first depositor",
+        "100% utilization",
+        "totaldepositassets",
+        "minted 1:1",
+        "socialized",
+        "deposit after",
+        "next depositor"
+      ]
     },
     {
       "id": "M-15",
@@ -164,7 +313,15 @@
       "file_contains": "Pool.sol",
       "function": "withdraw",
       "vulnerability_class": "slippage",
-      "match_any": ["slippage", "minimum amount out", "max shares in", "exchange rate", "burn more shares", "minamountout", "no slippage"]
+      "match_any": [
+        "slippage",
+        "minimum amount out",
+        "max shares in",
+        "exchange rate",
+        "burn more shares",
+        "minamountout",
+        "no slippage"
+      ]
     },
     {
       "id": "M-16",
@@ -173,7 +330,17 @@
       "file_contains": "RiskModule.sol",
       "function": "_getMinReqAssetValue",
       "vulnerability_class": "business_logic",
-      "match_any": ["isolated", "isolation", "risk tolerance", "another pool", "other pool", "ltv set by", "cross pool", "shared risk", "position level"]
+      "match_any": [
+        "isolated",
+        "isolation",
+        "risk tolerance",
+        "another pool",
+        "other pool",
+        "ltv set by",
+        "cross pool",
+        "shared risk",
+        "position level"
+      ]
     },
     {
       "id": "M-17",
@@ -182,7 +349,16 @@
       "file_contains": "Pool.sol",
       "function": "withdraw",
       "vulnerability_class": "accounting",
-      "match_any": ["bricked", "brick", "totaldepositshares == 0", "shares to zero", "zeroshares", "rounding up", "pool_zeroshares", "disable a pool"]
+      "match_any": [
+        "bricked",
+        "brick",
+        "totaldepositshares == 0",
+        "shares to zero",
+        "zeroshares",
+        "rounding up",
+        "pool_zeroshares",
+        "disable a pool"
+      ]
     },
     {
       "id": "M-18",
@@ -191,7 +367,17 @@
       "file_contains": "Pool.sol",
       "function": "simulateAccrue",
       "vulnerability_class": "accounting",
-      "match_any": ["precision loss", "low decimal", "low-decimal", "usdc", "usdt", "interestfee", "rounds to zero", "feeassets", "6 decimal"]
+      "match_any": [
+        "precision loss",
+        "low decimal",
+        "low-decimal",
+        "usdc",
+        "usdt",
+        "interestfee",
+        "rounds to zero",
+        "feeassets",
+        "6 decimal"
+      ]
     },
     {
       "id": "M-19",
@@ -200,7 +386,16 @@
       "file_contains": "SuperPool.sol",
       "function": "simulateAccrue",
       "vulnerability_class": "accounting",
-      "match_any": ["dead address", "dead shares", "donat", "before.*deposit", "interest distribution", "first deposit", "skew", "transfer.*superpool"]
+      "match_any": [
+        "dead address",
+        "dead shares",
+        "donat",
+        "before.*deposit",
+        "interest distribution",
+        "first deposit",
+        "skew",
+        "transfer.*superpool"
+      ]
     },
     {
       "id": "M-20",
@@ -209,7 +404,16 @@
       "file_contains": "SuperPool.sol",
       "function": "reorderDepositQueue",
       "vulnerability_class": "business_logic",
-      "match_any": ["queue order", "deposit queue", "withdraw queue", "reorder", "bad debt", "inflict loss", "move assets", "depositqueue"]
+      "match_any": [
+        "queue order",
+        "deposit queue",
+        "withdraw queue",
+        "reorder",
+        "bad debt",
+        "inflict loss",
+        "move assets",
+        "depositqueue"
+      ]
     },
     {
       "id": "M-21",
@@ -218,7 +422,17 @@
       "file_contains": "ChainlinkUsdOracle.sol",
       "function": "_getPriceWithSanityChecks",
       "vulnerability_class": "oracle",
-      "match_any": ["minanswer", "maxanswer", "min answer", "max answer", "circuit breaker", "flash crash", "price crash", "min/max", "aggregator bounds"]
+      "match_any": [
+        "minanswer",
+        "maxanswer",
+        "min answer",
+        "max answer",
+        "circuit breaker",
+        "flash crash",
+        "price crash",
+        "min/max",
+        "aggregator bounds"
+      ]
     },
     {
       "id": "M-22",
@@ -227,7 +441,16 @@
       "file_contains": "Pool.sol",
       "function": "borrow",
       "vulnerability_class": "business_logic",
-      "match_any": ["mindebt", "minborrow", "min debt", "min borrow", "dust", "too small to liquidate", "no incentive", "small position"]
+      "match_any": [
+        "mindebt",
+        "minborrow",
+        "min debt",
+        "min borrow",
+        "dust",
+        "too small to liquidate",
+        "no incentive",
+        "small position"
+      ]
     },
     {
       "id": "M-23",
@@ -236,7 +459,17 @@
       "file_contains": "Pool.sol",
       "function": "rebalanceBadDebt",
       "vulnerability_class": "accounting",
-      "match_any": ["non-liquidat", "unliquidat", "deflate", "share value", "overflow", "type(uint", "uint.max", "getborrowsof.*revert", "cannot be liquidated"]
+      "match_any": [
+        "non-liquidat",
+        "unliquidat",
+        "deflate",
+        "share value",
+        "overflow",
+        "type(uint",
+        "uint.max",
+        "getborrowsof.*revert",
+        "cannot be liquidated"
+      ]
     }
   ]
 }

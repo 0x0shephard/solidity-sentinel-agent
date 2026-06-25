@@ -18,7 +18,12 @@ only in that one assertion's message, so a setup revert / broken mock (which pri
 reason) can never trip it — keeping the oracle sound.
 
 **How to apply:** if you change the DSL assertion message, keep the token (or update both sides).
-A remaining open risk is *vacuous* breaks (assertion false because the attack did ~nothing, e.g.
-22592-gas run) — the token makes the failure visible but does not prove the invariant was
-meaningfully broken; rely on the counterevidence gate (executed proof must not auto-override it)
-and inspect the persisted `exploit-dsl-render-*.t.sol` + before/after values. Related: [[never-commit]].
+
+Since 2026-06-25 a DSL plan only confirms when a **differential control** passes: the rendered test
+is run twice — full (attack present) must FAIL with the token, and the CONTROL (`render_plan(...,
+include_attack=False)`, attack removed) must PASS. If the control also fails, the break is *vacuous*
+(assertion false regardless of the attack) and is rejected, not confirmed. Confirmation also requires
+the attack to call the hypothesis's affected function (`attack_calls_hit_function`). Free-form PoCs
+have no structured attack/control split, so a free-form assertion failure is `needs_review`, never
+`executed_poc_confirmed`. Proof attribution is per-hypothesis: reporting reads `hypothesis.proof_status`
+only, never the global batch `run_validation_artifacts` classification. Related: [[blind-eval]], [[never-commit]].

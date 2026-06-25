@@ -397,13 +397,14 @@ def test_author_and_run_exploit_confirms_when_invariant_breaks(monkeypatch, tmp_
         calls["n"] += 1
         if command[:2] == ["forge", "build"]:
             return CommandResult(command=command, cwd=str(cwd), return_code=0, stdout="Compiling", stderr="")
-        # forge test -> a failing assertion (invariant broke -> confirmed)
+        # forge test -> a failing assertion (free-form path; no differential control)
         return CommandResult(command=command, cwd=str(cwd), return_code=1, stdout="[FAIL: assertion failed] test_x()\n1 failed", stderr="")
 
     monkeypatch.setattr("sentinel.tools.dynamic.run_command", fake_run)
 
     out = ToolExecutor(build_default_registry()).execute("dynamic.author_and_run_exploit", {"repo_path": str(repo), "hypothesis": hyp.model_dump(mode="json")}, state)
-    assert out.data["verdict"] == "confirmed"
+    # Free-form has no control, so a failing assertion is a LEAD, not a confirmed proof.
+    assert out.data["verdict"] == "needs_review"
     assert out.data["classification"] == "security_invariant_violation_or_test_needs_review"
 
 
@@ -462,13 +463,147 @@ def test_author_and_run_exploit_uses_dsl_plan_when_available(monkeypatch, tmp_pa
     def fake_run(command, cwd, timeout=60, env=None):
         if command[:2] == ["forge", "build"]:
             return CommandResult(command=command, cwd=str(cwd), return_code=0, stdout="Compiling", stderr="")
+        joined = " ".join(command)
+        # Differential control: the CONTROL run (attack removed) holds; the treatment
+        # run (attack present) breaks the invariant -> the break is caused by the attack.
+        if "Control" in joined:
+            return CommandResult(command=command, cwd=str(cwd), return_code=0, stdout="1 passed; 0 failed; 0 skipped", stderr="")
         return CommandResult(command=command, cwd=str(cwd), return_code=1, stdout="[FAIL: assertion failed] test_exploit()\n0 passed; 1 failed; 0 skipped", stderr="")
 
     monkeypatch.setattr("sentinel.tools.dynamic.run_command", fake_run)
 
     out = ToolExecutor(build_default_registry()).execute("dynamic.author_and_run_exploit", {"repo_path": str(repo), "hypothesis": hyp.model_dump(mode="json")}, state)
+    # Confirmed ONLY because the differential control passed (causal proof).
     assert out.data["verdict"] == "confirmed"
     assert out.data["classification"] == "security_invariant_violation_or_test_needs_review"
-    # confirmed via the DSL phase, before any free-form fallback
     assert any("dsl iter 1: ran ->" in h for h in out.data["history"])
+    assert any("control (attack removed) -> security_invariant_held_or_test_passed" in h for h in out.data["history"])
     assert not any("unparseable" in h for h in out.data["history"])
+
+
+def test_author_and_run_exploit_rejects_vacuous_break(monkeypatch, tmp_path):
+    # A DSL plan whose assertion fails EVEN WITHOUT the attack (control also fails)
+    # is vacuous and must NOT confirm.
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "test").mkdir(parents=True)
+    (repo / "foundry.toml").write_text("[profile.default]\nsrc='src'\n", encoding="utf-8")
+    (repo / "src" / "Vault.sol").write_text(
+        "pragma solidity ^0.8.20; contract Vault { function withdraw() external {} }\n", encoding="utf-8")
+    (repo / "test" / "Base.t.sol").write_text(
+        "pragma solidity ^0.8.20;\nimport {Test} from \"forge-std/Test.sol\";\ncontract BaseTest is Test { function setUp() public {} }\n", encoding="utf-8")
+
+    state = initial_audit_state("exv", str(repo), "Find bugs", str(tmp_path / "runs" / "exv"))
+    state["use_llm_refiner"] = True
+    hyp = VulnerabilityHypothesis(
+        id="hyp-1", title="Withdraw breaks solvency", vulnerability_class="accounting",
+        affected_files=["src/Vault.sol"], affected_functions=["withdraw"],
+        evidence_summary="x", confidence=0.6,
+    )
+    state["hypotheses"] = [hyp]
+    monkeypatch.setattr("sentinel.tools.dynamic.shutil.which", lambda name: "/fake/forge")
+    monkeypatch.setattr("sentinel.tools.dynamic._detect_test_fixture", lambda repo_path, **k: {"name": "BaseTest", "import_path": "./Base.t.sol", "surface": "", "source": "contract BaseTest {}"})
+    monkeypatch.setattr("sentinel.tools.dynamic._copy_repo_for_validation", lambda repo_path, worktree: (worktree / "test").mkdir(parents=True, exist_ok=True))
+
+    plan_json = (
+        '{"actors":[{"name":"attacker","funds_wei":1}],'
+        '"attack_calls":[{"actor":"attacker","target":"","function":"withdraw","args":[]}],'
+        '"before":[{"name":"bal","expr":"address(this).balance"}],'
+        '"after":[{"name":"bal","expr":"address(this).balance"}],'
+        '"invariant":{"description":"d","assertion":"after_bal >= before_bal"}}'
+    )
+
+    class _PlanAuthor:
+        def author(self, prompt):
+            return "```solidity\npragma solidity ^0.8.20;\ncontract SentinelwithdrawExploit { function test_x() public {} }\n```"
+
+        def author_plan(self, prompt):
+            return plan_json
+
+    monkeypatch.setattr("sentinel.llm.provider.get_poc_author", lambda mock=False: _PlanAuthor())
+
+    def fake_run(command, cwd, timeout=60, env=None):
+        if command[:2] == ["forge", "build"]:
+            return CommandResult(command=command, cwd=str(cwd), return_code=0, stdout="Compiling", stderr="")
+        # BOTH treatment and control fail -> vacuous (failure not caused by the attack)
+        return CommandResult(command=command, cwd=str(cwd), return_code=1, stdout="[FAIL: assertion failed] t()\n0 passed; 1 failed; 0 skipped", stderr="")
+
+    monkeypatch.setattr("sentinel.tools.dynamic.run_command", fake_run)
+
+    out = ToolExecutor(build_default_registry()).execute("dynamic.author_and_run_exploit", {"repo_path": str(repo), "hypothesis": hyp.model_dump(mode="json")}, state)
+    assert out.data["verdict"] != "confirmed"
+    assert any("vacuous" in h.lower() or "control" in h.lower() for h in out.data["history"])
+
+
+def test_build_receiver_typing_resolves_instances_chains_and_arity(tmp_path):
+    from sentinel.tools.dynamic import _build_receiver_typing, _contract_signatures
+
+    (tmp_path / "src").mkdir()
+    # Orchestrator exposes Pool via a public getter; Pool has deposit(uint256,address).
+    (tmp_path / "src" / "Deploy.sol").write_text(
+        "pragma solidity ^0.8.20;\ncontract Deploy { Pool public pool; }\n", encoding="utf-8")
+    (tmp_path / "src" / "Pool.sol").write_text(
+        "pragma solidity ^0.8.20;\ncontract Pool {\n"
+        "  function deposit(uint256 a, address r) external returns (uint256) {}\n"
+        "  function totalAssets() external view returns (uint256) {}\n}\n",
+        encoding="utf-8")
+
+    fixture = {
+        "surface": "State variables available:\n  Deploy protocol\n",
+        "source": "contract BaseTest { Deploy protocol; }",
+    }
+    receiver_types, type_signatures = _build_receiver_typing(str(tmp_path), fixture)
+    # bare instance + getter chain both resolve to their concrete types
+    assert receiver_types.get("protocol") == "Deploy"
+    assert receiver_types.get("protocol.pool()") == "Pool"
+    # precise signatures (arity) extracted for the chain's type
+    assert type_signatures["Pool"]["deposit"] == {2}
+    assert type_signatures["Pool"]["totalAssets"] == {0}
+
+
+def test_build_receiver_typing_uses_artifact_abi_for_inherited_functions(tmp_path):
+    from sentinel.tools.dynamic import _build_receiver_typing
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "Vault.sol").write_text(
+        "pragma solidity ^0.8.20;\n"
+        "contract BaseVault { function deposit(uint256 assets, address receiver) public returns (uint256) {} }\n"
+        "contract Vault is BaseVault { function withdraw(uint256 assets) external {} }\n",
+        encoding="utf-8",
+    )
+    artifact_dir = tmp_path / "out" / "src" / "Vault.sol"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "Vault.json").write_text(
+        '{"abi":['
+        '{"type":"function","name":"deposit","inputs":[{"type":"uint256"},{"type":"address"}]},'
+        '{"type":"function","name":"withdraw","inputs":[{"type":"uint256"}]}'
+        ']}',
+        encoding="utf-8",
+    )
+
+    fixture = {
+        "surface": "State variables available:\n  Vault vault\n",
+        "source": "contract BaseTest { Vault vault; }",
+    }
+    receiver_types, type_signatures = _build_receiver_typing(str(tmp_path), fixture)
+
+    assert receiver_types["vault"] == "Vault"
+    assert type_signatures["Vault"]["deposit"] == {2}
+    assert type_signatures["Vault"]["withdraw"] == {1}
+
+
+def test_contract_signatures_extracts_public_external_only():
+    from sentinel.tools.dynamic import _contract_signatures
+
+    body = (
+        "contract C {\n"
+        "  function a(uint256 x) public {}\n"
+        "  function b() external view returns (uint256) {}\n"
+        "  function _hidden(uint256 x) internal {}\n"
+        "  uint256 public count;\n}\n"
+    )
+    sigs = _contract_signatures(body)
+    assert sigs["a"] == {1}
+    assert sigs["b"] == {0}
+    assert sigs["count"] == {0}  # public state-var getter
+    assert "_hidden" not in sigs  # internal excluded

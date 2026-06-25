@@ -28,7 +28,7 @@ from sentinel.schemas.rag import (
     RetrievalQualityGrade,
     TargetedRAGState,
 )
-from sentinel.schemas.research import VulnerabilityHypothesis
+from sentinel.schemas.research import ProofObligation, VulnerabilityHypothesis
 from sentinel.schemas.static import SourceEvidence, StaticDetection
 from sentinel.tools.base import RegisteredTool
 
@@ -538,6 +538,7 @@ def _hypotheses_from_invariant_candidates(static_facts: list[dict]) -> list[Vuln
                 graph_slice_ids=candidate.graph_slice_ids,
                 proof_packet_id=candidate.proof_packet_id,
                 proof_obligations=proof_obligations,
+                required_proof=(candidate.required_proof or None),
                 counterevidence=[fact for fact in candidate.local_facts if "counter" in fact.lower()],
                 proof_status=candidate.proof_status,
                 exploit_precondition_terms=list(dict.fromkeys([*candidate.suspicious_terms, *(candidate.local_facts[:3])])),
@@ -1398,6 +1399,16 @@ def _ground_proposal(index: int, proposal, ranges: list[dict], repo_path: str) -
         source_text=body[:1800],
         reason=(proposal.reasoning or proposal.title)[:300],
     )
+    # Carry the structured proof obligation (the reasoner fills these; the proposer
+    # leaves them empty) so the exploit author reasons from a concrete obligation.
+    obligation = ProofObligation(
+        pre_state=getattr(proposal, "pre_state", "") or "",
+        attack_sequence=list(getattr(proposal, "attack_sequence", []) or []),
+        deltas=list(getattr(proposal, "deltas", []) or []),
+        broken_equation=getattr(proposal, "broken_equation", "") or "",
+        impact=getattr(proposal, "impact", "") or "",
+    )
+    required_proof = (getattr(proposal, "required_proof", "") or obligation.broken_equation or "").strip() or None
     return VulnerabilityHypothesis(
         id=f"llm-hyp-{index}",
         title=proposal.title,
@@ -1414,6 +1425,8 @@ def _ground_proposal(index: int, proposal, ranges: list[dict], repo_path: str) -
         source_detection_ids=["llm_proposer"],
         proof_status="strong_local_path",
         status="needs_manual_review",
+        required_proof=required_proof,
+        proof_obligation=None if obligation.is_empty() else obligation,
     )
 
 
@@ -1804,6 +1817,40 @@ def reason_invariant_violations(inp: ProposeHypothesesInput, state) -> ProposeHy
     )
 
 
+def _invariant_source(candidate) -> str:
+    """Bucket an invariant candidate by where it came from: llm-inferred, graph,
+    semantic, or template. Used to stratify the reasoning budget so LLM-inferred
+    invariants (the novel-bug material, carrying structured proof obligations) are
+    not starved by a long list of template-mined ones."""
+    ids = " ".join(getattr(candidate, "detector_ids", []) or []).lower()
+    if "invariant_inferencer" in ids or str(getattr(candidate, "id", "")).startswith("llm-inv"):
+        return "llm"
+    if getattr(candidate, "graph_slice_ids", None):
+        return "graph"
+    if "semantic" in ids:
+        return "semantic"
+    return "template"
+
+
+def _stratify_invariants(candidates: list, cap: int) -> list:
+    """Round-robin select up to ``cap`` candidates across source buckets so each
+    source is represented. LLM-inferred and graph candidates lead the rotation so
+    they win early slots even when template-mined candidates dominate the list."""
+    if cap <= 0:
+        return []
+    buckets: dict[str, list] = {}
+    for candidate in candidates:
+        buckets.setdefault(_invariant_source(candidate), []).append(candidate)
+    # Novel-leaning sources first, then template, so small caps still reach them.
+    order = [src for src in ("llm", "graph", "semantic", "template") if src in buckets]
+    selected: list = []
+    while len(selected) < cap and any(buckets[src] for src in order):
+        for src in order:
+            if buckets[src] and len(selected) < cap:
+                selected.append(buckets[src].pop(0))
+    return selected
+
+
 def _reason_invariants_one_at_a_time(inp, state, ranges, objective: str, notes: list[str]) -> ProposeHypothesesOutput:
     """Reason over each invariant in its own focused pass (the novel-bug core).
 
@@ -1815,7 +1862,9 @@ def _reason_invariants_one_at_a_time(inp, state, ranges, objective: str, notes: 
     from sentinel.llm import provider as llm_provider
 
     settings = get_settings()
-    invariants = list(state.get("invariant_candidates", []))[: settings.invariant_reasoning_max_invariants]
+    # Stratify across sources (not the first N by append order) so LLM-inferred
+    # invariants are reasoned over even when template-mined ones fill the list.
+    invariants = _stratify_invariants(list(state.get("invariant_candidates", [])), settings.invariant_reasoning_max_invariants)
     per_invariant = settings.invariant_reasoning_per_invariant
 
     reasoner = llm_provider.get_invariant_reasoner(mock=False)

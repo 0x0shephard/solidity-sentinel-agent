@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 
 from pydantic import BaseModel, Field
@@ -71,24 +72,64 @@ class RepoCheckoutInput(RepoPathInput):
     ref: str
 
 
+# Blind-eval exclusions: directories/files that leak known answers (published audit
+# reports, findings, known-issue write-ups). Hidden from every file tool so the agent
+# discovers bugs rather than reading them — and the recall benchmark stays honest.
+_AUDIT_LEAK_DIRS = {
+    "audits", "audit", "reports", "report", "findings", "audit-reports",
+    "security-review", "security-reviews", "disclosures", "bug-bounty", "bugbounty",
+}
+_AUDIT_LEAK_NAME_RE = re.compile(
+    r"audit|finding|known[-_ ]?issue|vulnerab|security[-_ ]?review|disclosure|"
+    r"\bc4\b|code4rena|sherlock|spearbit|trail[-_ ]?of[-_ ]?bits|cantina|immunefi|zellic",
+    re.IGNORECASE,
+)
+_LEAK_DOC_SUFFIXES = {".md", ".txt", ".pdf", ".html", ".rst", ".json", ".csv", ".yaml", ".yml", ".docx"}
+
+
+def _is_audit_leak_path(rel: Path) -> bool:
+    """True for a repo-relative path that ships known audit findings (a leak).
+
+    A directory named ``audits/`` (etc.) is excluded wholesale; a doc file whose
+    name hints at an audit/finding write-up is excluded individually. Source and
+    tests are never matched (only doc suffixes), so the agent still sees the code.
+    """
+    parts = [p.lower() for p in rel.parts]
+    if any(p in _AUDIT_LEAK_DIRS for p in parts):
+        return True
+    if rel.suffix.lower() in _LEAK_DOC_SUFFIXES and _AUDIT_LEAK_NAME_RE.search(rel.name):
+        return True
+    return False
+
+
 def _safe_files(repo_path: str) -> list[Path]:
     """Enumerate regular files strictly inside the repo, never escaping via symlinks.
 
     Walks without following symlinked directories, skips symlinked files, and
     drops any path whose resolved location leaves the canonical repo root — so a
-    malicious ``ln -s /etc/passwd`` inside the target repo can't be read.
+    malicious ``ln -s /etc/passwd`` inside the target repo can't be read. When
+    ``blind_audit_eval`` is on (default), published audit-report/findings paths are
+    also hidden so the agent cannot read the answers.
 
     Args:
         repo_path: The repository root (relative or absolute).
     Returns:
         Regular-file ``Path``s under the original root (safe for ``relative_to``).
     """
+    from sentinel.config import get_settings
+
+    blind = get_settings().blind_audit_eval
     base = Path(repo_path)
     root_resolved = base.resolve()
     out: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
-        # Don't descend into .git or symlinked directories.
-        dirnames[:] = [d for d in dirnames if d != ".git" and not (Path(dirpath) / d).is_symlink()]
+        # Don't descend into .git, symlinked, or (in blind mode) audit-leak directories.
+        dirnames[:] = [
+            d for d in dirnames
+            if d != ".git"
+            and not (Path(dirpath) / d).is_symlink()
+            and not (blind and d.lower() in _AUDIT_LEAK_DIRS)
+        ]
         for name in filenames:
             path = Path(dirpath) / name
             if path.is_symlink():
@@ -99,6 +140,13 @@ def _safe_files(repo_path: str) -> list[Path]:
                 continue
             if resolved != root_resolved and root_resolved not in resolved.parents:
                 continue
+            if blind:
+                try:
+                    rel = path.relative_to(base)
+                except ValueError:
+                    rel = Path(name)
+                if _is_audit_leak_path(rel):
+                    continue
             out.append(path)
     return out
 
@@ -111,6 +159,19 @@ def _resolve_inside(repo_path: str, file_path: str) -> Path:
     return target
 
 
+def _blind_read_blocked(repo_path: str, target: Path) -> bool:
+    """Whether direct reads should hide this path in blind-audit mode."""
+    from sentinel.config import get_settings
+
+    if not get_settings().blind_audit_eval:
+        return False
+    try:
+        rel = target.relative_to(Path(repo_path).resolve())
+    except ValueError:
+        return True
+    return _is_audit_leak_path(rel)
+
+
 def list_files(inp: RepoListFilesInput, state) -> RepoListFilesOutput:
     root = Path(inp.repo_path)
     files = [str(path.relative_to(root)) for path in _safe_files(inp.repo_path)]
@@ -120,6 +181,14 @@ def list_files(inp: RepoListFilesInput, state) -> RepoListFilesOutput:
 
 def read_file(inp: RepoReadFileInput, state) -> RepoReadFileOutput:
     target = _resolve_inside(inp.repo_path, inp.file_path)
+    if _blind_read_blocked(inp.repo_path, target):
+        return RepoReadFileOutput(
+            status=ToolStatus.ERROR,
+            file_path=inp.file_path,
+            content="",
+            truncated=False,
+            line_count=0,
+        )
     raw = target.read_bytes()
     truncated = len(raw) > inp.max_bytes
     content = raw[: inp.max_bytes].decode("utf-8", errors="replace")

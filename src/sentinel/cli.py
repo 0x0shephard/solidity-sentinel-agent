@@ -206,9 +206,18 @@ def benchmark(
 
     gt, contest = load_ground_truth(ground_truth, include_low=include_low)
     if run_dir is None:
+        import os as _os
         from pathlib import Path as _Path
 
-        gt_repo = _json.loads(_Path(ground_truth).read_text(encoding="utf-8")).get("repo_path")
+        gt_data = _json.loads(_Path(ground_truth).read_text(encoding="utf-8"))
+        # Blind eval: the ground-truth file declares which project's own findings to
+        # hide from RAG, so a benchmark run can't retrieve its own answers. Applied
+        # unless the operator already set it explicitly.
+        exclude = gt_data.get("rag_exclude_terms")
+        if exclude and not _os.getenv("SENTINEL_RAG_EXCLUDE_TERMS"):
+            _os.environ["SENTINEL_RAG_EXCLUDE_TERMS"] = ",".join(exclude)
+            typer.echo(f"[blind eval] excluding own findings from RAG: {exclude}")
+        gt_repo = gt_data.get("repo_path")
         target = repo or gt_repo
         if not target:
             typer.echo("Provide --run-dir or --repo (or repo_path in the ground-truth file).")
@@ -269,8 +278,21 @@ def exploit_replay(
         selected = hyps[:3]
 
     _os.environ["SENTINEL_EXPLOIT_LOOP_MAX_ITERATIONS"] = str(iterations)
-    replay_dir = run_path / "exploit-replay"
-    state = initial_audit_state("exploit-replay", target_repo, "Replay exploit loop", str(replay_dir))
+    from datetime import datetime, timezone
+
+    from sentinel.config import get_settings
+    from sentinel.reliability.subprocess import run_command as _run_command
+
+    def _repo_commit(path: str) -> str:
+        res = _run_command(["git", "rev-parse", "HEAD"], cwd=path, timeout=15)
+        return res.stdout.strip() if res.return_code == 0 else "unknown"
+
+    settings = get_settings()
+    model = settings.model
+    commit = _repo_commit(target_repo)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    state = initial_audit_state("exploit-replay", target_repo, "Replay exploit loop", str(run_path / "exploit-replay"))
     state["use_llm_refiner"] = True
 
     executor = ToolExecutor(build_default_registry())
@@ -281,6 +303,11 @@ def exploit_replay(
 
     for raw in selected:
         hyp = VulnerabilityHypothesis.model_validate(raw)
+        # Immutable, independently-auditable artifact dir per attempt — earlier
+        # reproductions are never overwritten by a later replay of the same hypothesis.
+        attempt_dir = run_path / "exploit-replay" / f"{ts}-{hyp.id}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        state["run_dir"] = str(attempt_dir)
         typer.echo(f"\n=== {hyp.id}: {hyp.title[:80]} ({hyp.vulnerability_class}) ===")
         out = executor.execute(
             "dynamic.author_and_run_exploit",
@@ -288,10 +315,34 @@ def exploit_replay(
             state,
         )
         data = out.data or {}
+        # Persist full provenance so a verdict can be adjudicated later, not just trusted.
+        (attempt_dir / "replay-meta.json").write_text(
+            _json.dumps(
+                {
+                    "hypothesis_id": hyp.id,
+                    "title": hyp.title,
+                    "vulnerability_class": hyp.vulnerability_class,
+                    "model": model,
+                    "provider": settings.llm_provider,
+                    "repo": target_repo,
+                    "repo_commit": commit,
+                    "iterations": iterations,
+                    "timestamp": ts,
+                    "verdict": data.get("verdict"),
+                    "classification": data.get("classification"),
+                    "result_summary": data.get("result_summary"),
+                    "history": data.get("history", []),
+                    "hypothesis": hyp.model_dump(mode="json"),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         typer.echo(f"verdict: {data.get('verdict')} | classification: {data.get('classification')}")
         for line in data.get("history", []):
             typer.echo(f"  {line}")
-    typer.echo(f"\nArtifacts (renders + manifests): {replay_dir / 'artifacts'}")
+        typer.echo(f"  artifacts: {attempt_dir}")
 
 
 @eval_app.callback(invoke_without_command=True)

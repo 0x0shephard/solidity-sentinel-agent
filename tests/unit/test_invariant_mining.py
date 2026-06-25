@@ -418,3 +418,42 @@ def test_rank_hypotheses_prioritizes_semantic_candidates_over_detector_only():
     assert output.hypotheses[0].vulnerability_class == "access_control"
     assert output.hypotheses[0].source_detection_ids == ["semantic-signature", "semantic.signature_threshold_uniqueness"]
     assert output.hypotheses[0].status == "likely"
+
+
+# --- stratified invariant reasoning: LLM-inferred candidates are not starved ---
+
+def test_stratify_invariants_gives_llm_inferred_fair_share():
+    from sentinel.schemas.invariants import InvariantCandidate
+    from sentinel.tools.research import _invariant_source, _stratify_invariants
+
+    def _c(cid, detector_ids=None):
+        return InvariantCandidate(
+            id=cid, invariant_type="accounting", description="d",
+            recommended_validation_template="generic", confidence=0.4,
+            detector_ids=detector_ids or [],
+        )
+
+    # 10 template-mined + 2 LLM-inferred, appended AFTER (the real ordering).
+    template = [_c(f"tmpl-{i}", ["template_miner"]) for i in range(10)]
+    llm = [_c("llm-inv-1", ["invariant_inferencer"]), _c("llm-inv-2", ["invariant_inferencer"])]
+    candidates = [*template, *llm]
+
+    assert _invariant_source(template[0]) == "template"
+    assert _invariant_source(llm[0]) == "llm"
+
+    # The old [:8] slice would never reach the LLM ones; stratified selection does.
+    selected = _stratify_invariants(candidates, cap=8)
+    assert len(selected) == 8
+    ids = {c.id for c in selected}
+    assert "llm-inv-1" in ids and "llm-inv-2" in ids  # both LLM-inferred reached
+    # and LLM leads the rotation (first picked)
+    assert selected[0].id.startswith("llm-inv")
+
+
+def test_stratify_invariants_respects_cap_and_empty():
+    from sentinel.tools.research import _stratify_invariants
+    assert _stratify_invariants([], 8) == []
+    from sentinel.schemas.invariants import InvariantCandidate
+    one = InvariantCandidate(id="x", invariant_type="t", description="d", recommended_validation_template="g", confidence=0.3)
+    assert _stratify_invariants([one], 0) == []
+    assert len(_stratify_invariants([one], 8)) == 1

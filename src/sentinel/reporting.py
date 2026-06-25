@@ -122,33 +122,27 @@ def _status_with_evidence_gate(status: str, evidence: list[Evidence]) -> tuple[s
 
 
 def _has_validation_proof(hypothesis, state: AuditState) -> bool:
-    """Whether a finding has proof strong enough to be 'confirmed'.
+    """Whether THIS hypothesis has proof strong enough to be 'confirmed'.
 
-    Confirmation requires a complete static-dataflow proof (per-hypothesis
-    semantic validation set ``proof_status='static_proof_complete'``) or an
-    executable validation artifact that demonstrated the issue — not LLM or
-    heuristic reasoning alone.
+    Confirmation requires a per-hypothesis proof: semantic validation set
+    ``proof_status='static_proof_complete'`` on this hypothesis, or the exploit
+    loop set ``'executed_poc_confirmed'`` on it. We deliberately do NOT consult
+    the batch ``dynamic.run_validation_artifacts`` classification: that runs every
+    generated test together and emits one global verdict, so a PoC for hypothesis
+    A would otherwise raise hypothesis B to 'confirmed' (cross-hypothesis leak).
     """
-    if getattr(hypothesis, "proof_status", "") in {"static_proof_complete", "executed_poc_confirmed"}:
-        return True
-    run_output = (state.get("last_outputs", {}) or {}).get("dynamic.run_validation_artifacts", {}) or {}
-    classification = str((run_output.get("data") or {}).get("classification", ""))
-    return classification == "security_invariant_violation_or_test_needs_review"
+    return getattr(hypothesis, "proof_status", "") in {"static_proof_complete", "executed_poc_confirmed"}
 
 
 def _has_executed_validation_proof(hypothesis, state: AuditState) -> bool:
-    """True only when an executable validation run demonstrated the issue.
+    """True only when an executable PoC demonstrated THIS hypothesis's issue.
 
-    Stricter than :func:`_has_validation_proof`: a static-dataflow proof is enough
-    to *confirm* status, but only an executed PoC justifies near-certain
-    confidence on what is otherwise a mined/heuristic candidate.
+    Stricter than :func:`_has_validation_proof` (a static-dataflow proof confirms
+    status, but only an executed PoC lifts the confidence cap), and likewise
+    per-hypothesis: the global batch classification is never consulted, so one
+    hypothesis's executed PoC cannot lift another's confidence.
     """
-    # The execution-grounded loop sets this when a runnable PoC broke the invariant.
-    if getattr(hypothesis, "proof_status", "") == "executed_poc_confirmed":
-        return True
-    run_output = (state.get("last_outputs", {}) or {}).get("dynamic.run_validation_artifacts", {}) or {}
-    classification = str((run_output.get("data") or {}).get("classification", ""))
-    return classification == "security_invariant_violation_or_test_needs_review"
+    return getattr(hypothesis, "proof_status", "") == "executed_poc_confirmed"
 
 
 def _calibrated_confidence(raw: float, hypothesis, state: AuditState) -> float:
